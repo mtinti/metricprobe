@@ -1,0 +1,16 @@
+# Private material — must NEVER be tracked (the CI leak scan enforces this too).
+CLAUDE.private.md
+*.private.*
+
+# OS noise
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "metricprobe"
+version = "0.1.0.dev0"
+description = "Data arrival latency & completeness probes for database tables."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Michele Tinti" }]
+dependencies = [
+    "duckdb>=1.0",
+    "duckdb-engine>=0.13",
+    "pandas>=2.2",
+    "plotly>=5.24",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "sqlalchemy>=2.0",
+]
+
+[project.optional-dependencies]
+mssql = ["pyodbc>=5.1"]
+app = ["streamlit>=1.37"]
+export = ["kaleido>=1.0"]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.5",
+    # Pure-pip SQL Server driver for the CI equivalence job (no system ODBC setup);
+    # production connections use pyodbc via the `mssql` extra.
+    "pymssql>=2.3",
+]
+
+[project.scripts]
+metricprobe = "metricprobe.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/metricprobe"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "equivalence: compares DuckDB and SQL Server results; needs METRICPROBE_MSSQL_URL",
+]

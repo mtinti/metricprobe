@@ -1,0 +1,45 @@
+# Two parallel jobs on every PR and on main. Uses only the GitHub/Gitea-compatible
+# action subset (checkout, upload-artifact, plain `run:`); no setup-python — the
+# pinned ubuntu-24.04 image ships Python 3.12. Logic lives in Python files in the
+# repo; workflow steps only invoke Python with arguments.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m venv .venv
+      - run: .venv/bin/python -m pip install --upgrade pip
+      - run: .venv/bin/python -m pip install -e ".[dev]"
+      - run: .venv/bin/python scripts/scan_private_material.py
+      - run: .venv/bin/python -m ruff check .
+      - run: .venv/bin/python -m pytest -m "not equivalence"
+
+  equivalence:
+    # SQL Server container images exist for Linux x86-64 only (the sole platform
+    # Microsoft supports) — keep this runner pinned to an x86-64 Ubuntu image.
+    runs-on: ubuntu-24.04
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          # CI-only throwaway password for the ephemeral container; not a secret.
+          MSSQL_SA_PASSWORD: "Metricprobe1!"
+        ports:
+          - 1433:1433
+    env:
+      METRICPROBE_MSSQL_URL: "mssql+pymssql://sa:Metricprobe1!@localhost:1433/tempdb"
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m venv .venv
+      - run: .venv/bin/python -m pip install --upgrade pip
+      - run: .venv/bin/python -m pip install -e ".[dev]"
+      - run: .venv/bin/python scripts/wait_for_mssql.py
+      - run: .venv/bin/python -m pytest -m equivalence
