@@ -106,11 +106,14 @@ def catalog() -> dict[str, ScenarioPair]:
         ),
         ScenarioPair(
             name="sustained_collapse",
-            description="batches keep their cadence but the last 3 months carry ~10x fewer rows",
+            description="batches keep their cadence but the last 15 months carry ~10x "
+            "fewer rows — the collapse must be OLDER than the maturity horizon for "
+            "'volume: RED on mature months' and 'freshness: GREEN' to hold at once "
+            "(a 3-month tail can never satisfy both: mature implies stale)",
             expected_detection="volume: RED on mature collapsed months with freshness: GREEN",
             healthy=lambda: g.generate(BATCHY_BASE),
             unhealthy=lambda: g.generate(
-                g.sustained_collapse(BATCHY_BASE, last_k=3, factor=0.1)
+                g.sustained_collapse(BATCHY_BASE, last_k=15, factor=0.1)
             ),
         ),
     ]

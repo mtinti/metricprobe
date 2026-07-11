@@ -1,10 +1,12 @@
 """Step 4 golden tests: volume history + baselines + still-filling.
 
 Every check is tested in both directions via the healthy/unhealthy twins: it
-must fire on the pathology AND stay silent on the healthy twin. The freshness
-VERDICT for the collapse pair (updating: GREEN) lands with the freshness
-metric in Step 5; here the data-level premise (batches keep their cadence) is
-asserted directly."""
+must fire on the pathology AND stay silent on the healthy twin. The
+sustained-collapse acceptance case asserts volume=RED AND freshness=GREEN
+simultaneously (the freshness staleness core lands here for exactly that;
+its full golden suite is Step 5)."""
+
+import statistics
 
 import pandas as pd
 import pytest
@@ -13,8 +15,10 @@ from tests.synth import generator as g
 from tests.synth.scenarios import BATCHY_BASE, catalog
 
 from metricprobe.metrics.completion import assess_completion
+from metricprobe.metrics.freshness import assess_freshness
+from metricprobe.metrics.robust import robust_sigma_floor
 from metricprobe.metrics.volume import assess_volume
-from metricprobe.status import Check, ReasonCode, Severity, Status
+from metricprobe.status import Check, ReasonCode, Severity, Status, worst_severity
 
 AS_OF_MATURE = "2026-07-01"  # every scenario month is long mature by then
 
@@ -88,52 +92,167 @@ def test_no_uniqueness_check_without_key_cols():
 # --------------------------------------------------------- sustained collapse
 
 
-def test_sustained_collapse_pair():
+def test_sustained_collapse_pair_volume_red_and_freshness_green():
+    # THE acceptance case: volume=RED on mature collapsed months WHILE
+    # freshness=GREEN. Only satisfiable when the collapse is OLDER than the
+    # maturity horizon and loads continue to arrive: the catalog collapse
+    # spans the last 15 months, and as_of sits 3 days after the latest batch.
     pair = catalog()["sustained_collapse"]
-    as_of = "2026-08-01"  # the collapsed months (2025-04..06) are mature
+    as_of = "2025-07-24"  # last batch (2025-06's day-20 batch) is 2025-07-21
     config = table_config(load_batch_col="batch_id")
     canonical, unhealthy = _assess(pair.unhealthy(), config, as_of)
 
-    # (b) volume=RED with the specific collapse verdict, on MATURE months only
+    # (b) volume=RED with the specific collapse verdict, on the MATURE part
+    # of the collapse (2024-04..06 under the 365d horizon)
     collapse = [s for s in unhealthy.statuses if s.reason is ReasonCode.VOLUME_COLLAPSE]
     assert len(collapse) == 1 and collapse[0].severity is Severity.RED
-    for month in ("2025-04", "2025-05", "2025-06"):
+    for month in ("2024-04", "2024-05", "2024-06"):
         assert month in collapse[0].detail
 
-    # (a) baseline computed EXCLUDING the evaluation window: the collapse must
-    # not normalize itself — the baseline median stays at the healthy level
+    # freshness=GREEN: the feed is updating on its learned cadence
+    fresh = assess_freshness(canonical, config, pd.Timestamp(as_of))
+    assert worst_severity(fresh.statuses) is Severity.GREEN
+    assert fresh.days_since_last == pytest.approx(3, abs=1)
+
+    # (a) baseline computed EXCLUDING degraded recent history: the median
+    # stays at the healthy level (the 3 collapsed mature months out of 18
+    # cannot move a median)
     assert unhealthy.baseline_median == pytest.approx(2000, rel=0.05)
 
-    # the freshness premise: loads kept arriving on their normal cadence
-    # (batch epochs exist for every collapsed month; the freshness VERDICT
-    # test lands with the metric in Step 5)
-    batches = canonical.rows_for("month_batch")
-    collapsed = batches[batches["event_month"] >= "2025-04-01"]
-    assert collapsed["batch_id"].nunique() == 9  # 3 batches x 3 collapsed months
-
     _, healthy = _assess(pair.healthy(), config, as_of)
-    assert _reasons(healthy) == set()  # all-green twin
+    assert _reasons(healthy) == set()  # all-green twin (volume side)
+    healthy_canonical = probe(pair.healthy(), config, as_of)
+    healthy_fresh = assess_freshness(healthy_canonical, config, pd.Timestamp(as_of))
+    assert worst_severity(healthy_fresh.statuses) is Severity.GREEN
+
+
+def test_evaluation_window_exclusion_is_load_bearing():
+    # A case where INCLUDING the evaluation window would flip the verdict:
+    # 5 healthy + 5 collapsed months with a 5-month window. Excluded, the
+    # baseline median is 2000 and the collapse is RED; included, the median
+    # would sink to 1100 with a huge MAD and the collapse would vanish.
+    spec = g.TableSpec(
+        name="events", start_month="2024-01", n_months=10, rows_per_month=2000,
+        lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=74,
+    )
+    spec = g.sustained_collapse(spec, last_k=5, factor=0.1)
+    config = table_config(analysis={"evaluation_window_months": 5, "min_mature_months": 5})
+    _, assessment = _assess(g.generate(spec), config, "2025-12-01")  # all mature
+    assert [str(m) for m in assessment.baseline_months] == [
+        "2024-01", "2024-02", "2024-03", "2024-04", "2024-05",
+    ]
+    assert assessment.baseline_median == 2000
+    assert ReasonCode.VOLUME_COLLAPSE in _reasons(assessment)
+    # the counterfactual: an all-months median would be non-discriminating
+    all_volumes = [m.volume for m in assessment.months]
+    assert statistics.median(all_volumes) == pytest.approx(1100, rel=0.01)
 
 
 def test_mad_zero_fallback_on_perfectly_regular_volumes():
     # synthetic volumes are exactly constant, so MAD would be 0; the frozen
     # relative floor (5% of median) must apply instead of a zero band
-    _, assessment = _assess(catalog()["sustained_collapse"].healthy(), table_config(), "2026-08-01")
+    _, assessment = _assess(catalog()["sustained_collapse"].healthy(), table_config(), "2025-07-24")
     assert assessment.baseline_sigma == pytest.approx(0.05 * 2000)
 
 
-def test_minimum_history_for_volume_baselines():
+def test_minimum_history_hits_the_baseline_size_branch():
+    # maturity IS classifiable (8 mature months >= min_mature_months for
+    # completion), but the volume baseline — mature minus the 3-month
+    # evaluation window — has only 5 members < 6: the Step 4 branch.
     spec = g.TableSpec(
-        name="events", start_month="2025-01", n_months=4, rows_per_month=2000,
+        name="events", start_month="2024-01", n_months=8, rows_per_month=2000,
         lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=71,
     )
-    _, assessment = _assess(g.generate(spec), table_config(), "2025-06-01")
+    canonical = probe(g.generate(spec), table_config(), "2025-11-01")
+    completion = assess_completion(canonical, table_config(), pd.Timestamp("2025-11-01"))
+    assert completion.recommended_wait is not None  # maturity available
+    assessment = assess_volume(
+        canonical, table_config(), pd.Timestamp("2025-11-01"), completion
+    )
     insufficient = [
         s for s in assessment.statuses
         if s.check is Check.VOLUME and s.severity is Severity.INSUFFICIENT_HISTORY
     ]
-    assert insufficient
+    assert insufficient and "evaluation window" in insufficient[0].detail
     assert ReasonCode.VOLUME_OUTLIER not in _reasons(assessment)
+
+
+def test_empty_table_is_a_hard_red_not_a_crash():
+    empty = g.TableSpec(
+        name="events", start_month="2025-01", n_months=1, rows_per_month=0,
+        lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=75,
+    )
+    canonical, assessment = _assess(g.generate(empty), table_config(), "2025-06-01")
+    zero = [s for s in assessment.statuses if s.reason is ReasonCode.ZERO_ROW_MONTH]
+    assert zero and zero[0].severity is Severity.RED
+    assert assessment.months == []
+    assert int(canonical.global_row["row_count"]) == 0
+
+
+# ------------------------------------------------- hand-calculated boundaries
+# baseline volumes are exactly 2000/month, MAD = 0, so sigma floors at
+# 0.05 * 2000 = 100: amber edge = |dev| > 200, red edge = |dev| > 300.
+
+BOUNDARY = g.TableSpec(
+    name="events", start_month="2023-01", n_months=30, rows_per_month=2000,
+    lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=73,
+)
+
+
+def test_amber_red_boundaries_hand_calculated():
+    # idx 18 (2024-07): 2000*1.10  = 2200, dev exactly 200 -> NOT flagged
+    # idx 19 (2024-08): 2000*1.105 = 2210, dev 210 -> AMBER
+    # idx 20 (2024-09): 2000*1.155 = 2310, dev 310 -> RED
+    spec = BOUNDARY
+    spec = g.volume_spike(spec, 18, factor=1.10)
+    spec = g.volume_spike(spec, 19, factor=1.105)
+    spec = g.volume_spike(spec, 20, factor=1.155)
+    _, assessment = _assess(g.generate(spec), table_config(), AS_OF_MATURE)
+    outliers = {
+        s.detail.split(":")[0]: s.severity
+        for s in assessment.statuses
+        if s.reason is ReasonCode.VOLUME_OUTLIER
+    }
+    assert "2024-07" not in outliers  # exactly at the boundary is inside
+    assert outliers["2024-08"] is Severity.AMBER
+    assert outliers["2024-09"] is Severity.RED
+
+
+def test_one_low_month_is_an_outlier_two_are_a_collapse():
+    single = g.volume_drop(BOUNDARY, 29, factor=0.1)  # last mature month only
+    _, assessment = _assess(g.generate(single), table_config(), AS_OF_MATURE)
+    assert ReasonCode.VOLUME_OUTLIER in _reasons(assessment)
+    assert ReasonCode.VOLUME_COLLAPSE not in _reasons(assessment)
+
+    double = g.volume_drop(g.volume_drop(BOUNDARY, 28, factor=0.1), 29, factor=0.1)
+    _, assessment = _assess(g.generate(double), table_config(), AS_OF_MATURE)
+    collapse = [s for s in assessment.statuses if s.reason is ReasonCode.VOLUME_COLLAPSE]
+    assert collapse and "2025-05" in collapse[0].detail and "2025-06" in collapse[0].detail
+    # collapse months are not double-reported as outliers
+    assert ReasonCode.VOLUME_OUTLIER not in _reasons(assessment)
+
+
+def test_collapse_run_must_end_at_the_latest_mature_month():
+    # two consecutive low months followed by healthy ones: a PAST dip is
+    # outliers, not an ongoing collapse
+    spec = g.volume_drop(g.volume_drop(BOUNDARY, 24, factor=0.1), 25, factor=0.1)
+    _, assessment = _assess(g.generate(spec), table_config(), AS_OF_MATURE)
+    assert ReasonCode.VOLUME_COLLAPSE not in _reasons(assessment)
+    outliers = [s for s in assessment.statuses if s.reason is ReasonCode.VOLUME_OUTLIER]
+    assert len(outliers) == 2
+
+
+def test_a_calendar_gap_breaks_the_collapse_run():
+    # low April, MISSING May, low June: nonconsecutive low months must never
+    # read as a sustained collapse — they are a gap plus two outliers
+    spec = g.volume_drop(g.volume_drop(BOUNDARY, 27, factor=0.05), 29, factor=0.05)
+    spec = g.missing_month(spec, 28)
+    _, assessment = _assess(g.generate(spec), table_config(), "2026-08-01")
+    reasons = _reasons(assessment)
+    assert ReasonCode.VOLUME_GAP in reasons  # 2025-05
+    assert ReasonCode.VOLUME_COLLAPSE not in reasons
+    outliers = [s for s in assessment.statuses if s.reason is ReasonCode.VOLUME_OUTLIER]
+    assert len(outliers) == 2
 
 
 # ---------------------------------------------------------------- still-filling
@@ -171,6 +290,12 @@ def test_tautology_guard_immature_month_at_half_expectation_is_flagged():
     # expected band is centered on forecast x F (~1900), proving the month's
     # own count (~950) was never fed back into its own expectation
     assert june.expected_low > 1200
+    # band dispersion uses the MATURE final volumes (ALGORITHMS section 8):
+    # all mature volumes are exactly 2000 -> sigma floors at 100, so the band
+    # width is 2 * band_mads * F * 100 = 400 * F
+    fill = ((june.expected_low + june.expected_high) / 2) / unhealthy.forecast
+    expected_width = 2 * 2.0 * fill * robust_sigma_floor([2000] * 10)
+    assert june.expected_high - june.expected_low == pytest.approx(expected_width)
     # the inverted nowcast IS reported (observed / F ~ the true dropped volume)
     assert june.nowcast == pytest.approx(1000, rel=0.15)
     # ... and the label is "arrival deficit — cause unresolved", never collapse

@@ -29,6 +29,11 @@ def main() -> int:
             last_error = exc
             time.sleep(2)
     print(f"SQL Server never became ready: {last_error}", file=sys.stderr)
+    print(
+        "hint: if this runner is not Linux x86-64, the SQL Server container "
+        "cannot run (see scripts/assert_runner_arch.py)",
+        file=sys.stderr,
+    )
     return 1
 
 

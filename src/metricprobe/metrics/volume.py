@@ -80,6 +80,28 @@ def assess_volume(
     months = sorted(volumes)
     statuses: list[Status] = []
 
+    if not months:
+        # zero rows admitted: a hard failure, never a crash or a silent pass
+        statuses.append(
+            Status(
+                check=Check.VOLUME,
+                severity=Severity.RED,
+                reason=ReasonCode.ZERO_ROW_MONTH,
+                detail="no curve-eligible rows: the table is empty (or every row "
+                "was excluded) under the as_of watermark",
+            )
+        )
+        return VolumeAssessment(
+            months=[],
+            gaps=[],
+            baseline_months=[],
+            baseline_median=None,
+            baseline_sigma=None,
+            forecast=None,
+            duplicate_rows=None,
+            statuses=statuses,
+        )
+
     # ---- explicit gaps: interior months entirely absent
     gaps: list[pd.Period] = []
     if months:
@@ -167,6 +189,8 @@ def assess_volume(
         mature_months = [m for m in months if month_states[m] == "mature"]
         run: list[pd.Period] = []
         for month in mature_months:
+            if run and month != run[-1] + 1:
+                run = []  # a calendar gap breaks the run: "consecutive" months only
             if volumes[month] < red_low:
                 run.append(month)
             else:
@@ -207,6 +231,10 @@ def assess_volume(
     month_rows: list[MonthVolume] = []
     deficits: list[pd.Period] = []
     f_mature = completion.f_mature
+    # the frozen band dispersion population: MATURE final volumes (ALGORITHMS
+    # section 8). Whenever immature months exist the evaluation window is
+    # immature too (maturity is monotone in time), so this equals the baseline.
+    mature_volumes = [volumes[m] for m in months if month_states[m] == "mature"]
     for month in months:
         row = MonthVolume(month=month, volume=volumes[month], state=month_states[month])
         if (
@@ -217,11 +245,10 @@ def assess_volume(
             age_days = int((as_of - month_end(month)) / pd.Timedelta(days=1))
             grid_max = int(f_mature.index.max())
             fill = float(f_mature.loc[min(max(age_days, 0), grid_max)])
-            baseline_volumes = [volumes[m] for m in baseline]
             row.expected_low, row.expected_high = expected_fill_band(
                 forecast=forecast,
                 fill_fraction=fill,
-                mature_volumes=baseline_volumes,
+                mature_volumes=mature_volumes,
                 band_mads=analysis.expected_fill_band_mads,
             )
             row.nowcast = volumes[month] / fill if fill > 0 else None

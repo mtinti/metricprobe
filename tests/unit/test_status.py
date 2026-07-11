@@ -131,6 +131,7 @@ def test_wire_values_are_frozen_v1():
         "backtest_disagreement",
         "percentile_over_cap",
         "scan_budget_exceeded",
+        "scan_budget_unverifiable",
         "result_cell_cap_exceeded",
         "optional_table_absent",
         "join_not_unique",

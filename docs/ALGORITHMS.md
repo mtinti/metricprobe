@@ -146,8 +146,10 @@ it ties completion to volume counts from the ONE canonical aggregation.
   median of mature months' final volumes — NEVER the immature month's own
   count (tautology guard).
 - Band half-width includes the forecast dispersion, scaled by the fill
-  fraction: `sigma_band(t) = F_mature(t) * robust_sigma(mature final volumes)`
-  (zero-MAD fallback per section 1), giving
+  fraction: `sigma_band(t) = F_mature(t) * robust_sigma_floor(MATURE final
+  volumes)` (section 1). Note: whenever immature months exist, the evaluation
+  window (section 10) is itself immature — maturity is monotone in time — so
+  the mature set and the section-10 baseline coincide here. Giving
 
 ```
 band(t) = expected(t) ± expected_fill_band_mads * sigma_band(t)
@@ -192,3 +194,21 @@ Duplicates present iff duplicate_rows > 0.
   nowcast `observed / F_mature(age)` is reported but NEVER fed back into the
   expectation (tautology guard: a month at 50% of expectation must flag even
   though its own nowcast is self-consistent).
+
+## 11. Freshness (staleness core; full metric in Step 5)
+
+- Arrival epochs = distinct batch IDs when `load_batch_col` is configured
+  (canonical batch timestamp = MIN(load_time) within the batch, i.e. the
+  minimum over its per-month cells), else distinct load-time buckets. NEVER
+  per-row gaps: row timestamps measure row frequency, not feed cadence.
+- Requires `freshness_min_epochs` epochs, else INSUFFICIENT_EPOCHS.
+- Learned cadence = median of inter-epoch gaps; spread =
+  `max(robust_sigma(gaps), freshness_zero_mad_tolerance_days)` (perfectly
+  regular feeds use the configured fixed tolerance).
+- Staleness: `days_since_last_epoch > cadence + 3 * spread` => RED STALE_FEED,
+  `> cadence + 2 * spread` => AMBER (v1 algorithm constants mirroring the
+  volume defaults).
+- Freshness and volume are independent verdicts: a table can be
+  "updating: GREEN" and "volume: RED" simultaneously — the sustained-collapse
+  acceptance case requires exactly that, which is only satisfiable when the
+  collapse is OLDER than the maturity horizon while loads continue to arrive.

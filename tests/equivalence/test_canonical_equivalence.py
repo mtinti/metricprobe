@@ -170,38 +170,51 @@ def test_via_non_unique_lookup_aborts_on_both_dialects(duckdb_engine, mssql_engi
 
 
 def test_volume_assessment_matches_between_dialects(duckdb_engine, mssql_engine):
-    """Step 4 equivalence: sustained collapse + injected duplicate keys must
-    yield identical volume verdicts, baselines and still-filling rows from
-    both engines."""
-    from tests.synth.scenarios import BATCHY_BASE
-
+    """Step 4 equivalence: an ONGOING sustained collapse + injected duplicate
+    keys, probed MID-DATA so still-filling is live — identical volume verdicts,
+    baselines, expected bands, nowcasts, deficits, open-month rows and
+    freshness from both engines."""
+    from metricprobe.metrics.freshness import assess_freshness
     from metricprobe.metrics.volume import assess_volume
 
+    # a TRICKLE collapse: loads arrive within the month, so the OPEN month has
+    # rows (a batchy feed only loads after month end and can never show one)
+    trickle = g.TableSpec(
+        name="events", start_month="2023-01", n_months=30, rows_per_month=2000,
+        lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=77,
+    )
     df = g.inject_duplicate_keys(
-        g.generate(g.sustained_collapse(BATCHY_BASE, last_k=3, factor=0.1)),
+        g.generate(g.sustained_collapse(trickle, last_k=15, factor=0.1)),
         fraction=0.01,
         seed=9,
     )
-    as_of = pd.Timestamp("2026-08-01")
+    as_of = pd.Timestamp("2025-06-15")  # inside the last event month
     assessments = []
     for engine, database, schema in (
         (duckdb_engine, "memory", "main"),
         (mssql_engine, "tempdb", "dbo"),
     ):
-        config = _config(database, schema, key_cols=["row_id"])
+        config = _config(database, schema, key_cols=["row_id"], load_batch_col=None)
         g.load_via_sqlalchemy(df, engine, "events")
         canonical = run_canonical(engine, config, as_of)
         completion = assess_completion(canonical, config, as_of)
-        assessments.append(assess_volume(canonical, config, as_of, completion))
-    duck, mssql = assessments
+        volume = assess_volume(canonical, config, as_of, completion)
+        fresh = assess_freshness(canonical, config, as_of)
+        assessments.append((volume, fresh))
+    (duck, duck_fresh), (mssql, mssql_fresh) = assessments
     assert duck.statuses == mssql.statuses
     assert duck.baseline_median == mssql.baseline_median
     assert duck.baseline_sigma == mssql.baseline_sigma
     assert duck.duplicate_rows == mssql.duplicate_rows
-    assert duck.months == mssql.months
+    assert duck.months == mssql.months  # incl. expected bands, nowcasts, states
+    assert duck_fresh == mssql_fresh
     reasons = {s.reason for s in mssql.statuses}
-    assert ReasonCode.VOLUME_COLLAPSE in reasons
+    assert ReasonCode.VOLUME_COLLAPSE in reasons  # the mature part of the collapse
+    assert ReasonCode.ARRIVAL_DEFICIT in reasons  # the immature part
     assert ReasonCode.DUPLICATE_KEYS in reasons
+    states = {m.state for m in mssql.months}
+    assert "open" in states and "immature" in states and "mature" in states
+    assert any(m.deficit for m in mssql.months)
 
 
 def test_scan_budget_enforced_through_the_production_runner(mssql_engine):

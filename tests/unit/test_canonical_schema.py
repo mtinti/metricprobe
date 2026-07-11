@@ -16,7 +16,6 @@ from metricprobe.extract.canonical import (
     RESULT_COLUMNS,
     STAGING_COLUMNS,
     build_aggregation_query,
-    build_uniqueness_query,
     staging_sql,
 )
 
@@ -152,7 +151,7 @@ KEY_TYPES = {"settlement_id": "bigint", "leg": "varchar"}
 
 
 def _statements(config: TableConfig, dialect_name: str) -> dict[str, str]:
-    out = {
+    return {
         "staging": staging_sql(
             config, dialect_name, key_types=KEY_TYPES if config.key_cols else None
         ),
@@ -160,11 +159,6 @@ def _statements(config: TableConfig, dialect_name: str) -> dict[str, str]:
             build_aggregation_query(config, dialect_name).compile(dialect=_dialect(dialect_name))
         ),
     }
-    if config.key_cols:
-        out["uniqueness"] = str(
-            build_uniqueness_query(config, dialect_name).compile(dialect=_dialect(dialect_name))
-        )
-    return out
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
@@ -184,16 +178,41 @@ def test_compiled_sql_matches_snapshots(case, dialect):
 
 def test_only_staging_touches_the_target_table():
     # the scan budget is enforced by construction: ONE scan of the target table
-    # (the staging statement); aggregation and guard read only the temp table
+    # (the staging statement); the aggregation reads only the temp table
     for dialect in ("duckdb", "mssql"):
         statements = _statements(_config_batch_alt_keys(), dialect)
         assert statements["staging"].count("FROM demo_finance.dbo.settlements") == 1
         assert "demo_finance" not in statements["aggregation"]
-        assert "demo_finance" not in statements["uniqueness"]
         via = _statements(_config_via_composite(), dialect)
         assert via["staging"].count("FROM demo_health.dbo.episodes") == 1
         assert via["staging"].count("FROM demo_health.dbo.referrals") == 1
         assert "demo_health" not in via["aggregation"]
+
+
+def test_empty_grouping_set_row_carries_the_uniqueness_scalars():
+    # the frozen contract: the () row of the ONE canonical statement carries
+    # COUNT(*) vs COUNT(DISTINCT key_hash) — no separate patched-in query
+    for dialect in ("duckdb", "mssql"):
+        sql = _statements(_config_batch_alt_keys(), dialect)["aggregation"]
+        assert "UNION ALL" in sql
+        assert "count(DISTINCT" in sql or "count(distinct" in sql.lower()
+
+
+def test_scan_budget_verification_fails_closed():
+    from metricprobe.extract.canonical import ProbeAborted, verify_scan_budget
+    from metricprobe.status import ReasonCode
+
+    assert verify_scan_budget(3000, 1100, "p") == (3000, 3300)
+    with pytest.raises(ProbeAborted) as excinfo:
+        verify_scan_budget(3301, 1100, "p")
+    assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_EXCEEDED
+    # unmeasurable is an ABORT, never a silent unbudgeted run
+    with pytest.raises(ProbeAborted) as excinfo:
+        verify_scan_budget(None, 1100, "p")
+    assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_UNVERIFIABLE
+    with pytest.raises(ProbeAborted) as excinfo:
+        verify_scan_budget(3000, None, "p")
+    assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_UNVERIFIABLE
 
 
 def test_as_of_predicate_keeps_null_loads():

@@ -75,6 +75,7 @@ class ReasonCode(StrEnum):
     BACKTEST_DISAGREEMENT = "backtest_disagreement"
     PERCENTILE_OVER_CAP = "percentile_over_cap"
     SCAN_BUDGET_EXCEEDED = "scan_budget_exceeded"
+    SCAN_BUDGET_UNVERIFIABLE = "scan_budget_unverifiable"  # enforcement fails CLOSED
     RESULT_CELL_CAP_EXCEEDED = "result_cell_cap_exceeded"
     OPTIONAL_TABLE_ABSENT = "optional_table_absent"
     JOIN_NOT_UNIQUE = "join_not_unique"

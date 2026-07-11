@@ -483,9 +483,37 @@ def _dialect_instance(dialect: str):
     return sa.create_engine("duckdb:///:memory:").dialect
 
 
-def build_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
-    """GROUPING SETS over the staging table — touches the target table ZERO
-    times."""
+def _bucket_sums(staging):
+    """The aggregate columns shared by the grouped rows and the () branch.
+    COALESCE(SUM(..), 0): a SUM over zero rows is NULL, and reconciliation
+    arithmetic must survive an empty table."""
+
+    def total(col):
+        return sa.func.coalesce(sa.func.sum(col), 0)
+
+    return [
+        sa.func.count().label("row_count"),
+        total(staging.c.is_eligible).label("n_curve_eligible"),
+        total(staging.c.is_null_event_time).label("n_null_event_time"),
+        total(staging.c.is_null_load_time_only).label("n_null_load_time_only"),
+        total(staging.c.is_negative_clipped).label("n_negative_clipped"),
+        total(staging.c.is_negative_lag_excluded).label("n_negative_lag_excluded"),
+        total(staging.c.is_overflow).label("n_overflow"),
+        total(staging.c.is_join_unmatched).label("n_join_unmatched"),
+        sa.cast(sa.literal(0), sa.BigInteger()).label("n_other_exclusions"),
+        total(staging.c.is_base_row).label("n_base_rows"),
+        total(staging.c.is_ambiguous_base).label("n_ambiguous_base_rows"),
+        sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
+    ]
+
+
+def build_aggregation_query(table: TableConfig, dialect: str):
+    """ONE statement over the staging table (the target table is touched ZERO
+    times): the dimensional grouping sets UNION ALL the () global row, which
+    carries COUNT(*) vs COUNT(DISTINCT key_hash) — the canonical result's
+    empty grouping set holds the uniqueness scalars, per the frozen contract.
+    (Computing the DISTINCT inside the GROUPING SETS plan would spool per row;
+    the union branch is a plain single-pass aggregate.)"""
     staging = _staging_clause(dialect)
     month_key = staging.c.event_month
     lag_key = staging.c.lag_day
@@ -497,25 +525,22 @@ def build_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
         + sa.func.grouping(lag_key) * GROUPING_WEIGHTS["lag_day"]
         + sa.func.grouping(epoch_key) * GROUPING_WEIGHTS["load_epoch_day"]
     )
+    batch_key = staging.c.batch_id
     if table.load_batch_col:
-        batch_key = staging.c.batch_id
         sets.append([month_key, batch_key])
         grouping_id = grouping_id + sa.func.grouping(batch_key) * GROUPING_WEIGHTS["batch_id"]
     else:
-        batch_key = staging.c.batch_id
         grouping_id = grouping_id + GROUPING_WEIGHTS["batch_id"]
+    alt_key = staging.c.alt_value
     if table.group_by_alt:
-        alt_key = staging.c.alt_value
         sets.append([alt_key])
         grouping_id = grouping_id + sa.func.grouping(alt_key) * GROUPING_WEIGHTS["alt_value"]
     else:
-        alt_key = staging.c.alt_value
         grouping_id = grouping_id + GROUPING_WEIGHTS["alt_value"]
-    sets.append([])  # the () set carrying the global scalars
 
     select_batch = batch_key if table.load_batch_col else sa.func.max(batch_key)
     select_alt = alt_key if table.group_by_alt else sa.func.max(alt_key)
-    return (
+    grouped = (
         sa.select(
             grouping_id.label("grouping_id"),
             month_key.label("event_month"),
@@ -523,39 +548,38 @@ def build_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
             epoch_key.label("load_epoch_day"),
             select_batch.label("batch_id"),
             select_alt.label("alt_value"),
-            sa.func.count().label("row_count"),
-            sa.func.sum(staging.c.is_eligible).label("n_curve_eligible"),
-            sa.func.sum(staging.c.is_null_event_time).label("n_null_event_time"),
-            sa.func.sum(staging.c.is_null_load_time_only).label("n_null_load_time_only"),
-            sa.func.sum(staging.c.is_negative_clipped).label("n_negative_clipped"),
-            sa.func.sum(staging.c.is_negative_lag_excluded).label("n_negative_lag_excluded"),
-            sa.func.sum(staging.c.is_overflow).label("n_overflow"),
-            sa.func.sum(staging.c.is_join_unmatched).label("n_join_unmatched"),
-            sa.cast(sa.literal(0), sa.BigInteger()).label("n_other_exclusions"),
-            sa.func.sum(staging.c.is_base_row).label("n_base_rows"),
-            sa.func.sum(staging.c.is_ambiguous_base).label("n_ambiguous_base_rows"),
-            sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
+            *_bucket_sums(staging),
             sa.cast(sa.null(), sa.BigInteger()).label("distinct_keys"),
             sa.func.min(staging.c.load_time).label("min_load_time"),
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))
+    )
+    if table.key_cols:
+        distinct_keys = sa.func.count(sa.distinct(staging.c.key_hash))
+    else:
+        distinct_keys = sa.cast(sa.null(), sa.BigInteger())
+    global_row = sa.select(
+        sa.literal(GROUPING_SET_IDS["global"]).label("grouping_id"),
+        sa.cast(sa.null(), sa.Date()).label("event_month"),
+        sa.cast(sa.null(), sa.Integer()).label("lag_day"),
+        sa.cast(sa.null(), sa.Date()).label("load_epoch_day"),
+        sa.cast(sa.null(), sa.String()).label("batch_id"),
+        sa.cast(sa.null(), sa.String()).label("alt_value"),
+        *_bucket_sums(staging),
+        distinct_keys.label("distinct_keys"),
+        sa.func.min(staging.c.load_time).label("min_load_time"),
+    ).select_from(staging)
+    # the union is wrapped so the row bound applies to a PLAIN select: mssql
+    # silently drops .limit() on a compound select (no TOP/FETCH rendered)
+    compound = grouped.union_all(global_row).subquery("canonical")
+    return (
+        sa.select(*[compound.c[name] for name in RESULT_COLUMNS])
+        .order_by(compound.c.grouping_id)
         # server-side bound: the database never returns unbounded rows; the
         # runner still enforces the per-set cell cap while streaming
-        .limit(table.analysis.result_cell_cap * len(sets) + 1)
+        .limit(table.analysis.result_cell_cap * (len(sets) + 1) + 1)
     )
-
-
-def build_uniqueness_query(table: TableConfig, dialect: str) -> sa.Select:
-    """The distinct-count uniqueness guard over the STAGED key hashes — the
-    target table is not touched again."""
-    if not table.key_cols:
-        raise ValueError(f"probe {table.probe_name!r} has no key_cols configured")
-    staging = _staging_clause(dialect)
-    return sa.select(
-        sa.func.count().label("total_rows"),
-        sa.func.count(sa.distinct(staging.c.key_hash)).label("distinct_keys"),
-    ).select_from(staging)
 
 
 def drop_staging_sql(dialect: str) -> str:
@@ -695,19 +719,40 @@ class CanonicalResult:
         return rows.iloc[0]
 
 
+def verify_scan_budget(
+    target_reads: int | None, pages: int | None, probe_name: str
+) -> tuple[int, int]:
+    """Fail-CLOSED budget verification for mssql: if either the measured reads
+    (STATISTICS IO capture) or the table size (dm_db_partition_stats) is
+    unavailable, the probe ABORTS as unverifiable rather than silently running
+    unbudgeted. Exceeding the budget aborts with its own reason code."""
+    if pages is None:  # 0 is valid: an empty table has a 0-read, 0-budget scan
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
+            f"probe {probe_name!r}: cannot read the target table's page count "
+            "(sys.dm_db_partition_stats — the login may need VIEW DATABASE STATE); "
+            "the scan budget cannot be verified, refusing to run unbudgeted",
+        )
+    if target_reads is None:
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
+            f"probe {probe_name!r}: no STATISTICS IO output captured from the "
+            "driver; the scan budget cannot be verified, refusing to run unbudgeted",
+        )
+    budget = 3 * pages
+    check_scan_budget(target_reads, budget, probe_name)
+    return target_reads, budget
+
+
 def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
-    """Execute stage -> aggregate -> guard -> drop on one connection; abort on
-    scan-budget, cell-cap or join-uniqueness violations."""
+    """Execute stage -> aggregate (incl. the () uniqueness row) -> drop on one
+    connection; abort on scan-budget, cell-cap or join-uniqueness violations."""
     dialect = engine.dialect.name
     cap = table.analysis.result_cell_cap
     counts: dict[int, int] = {}
     rows = []
-    guard_distinct = None
     target_reads = budget = None
     with engine.connect() as conn:
-        # scan-budget enforcement (mssql): only the staging statement touches
-        # the target table(s), so its STATISTICS IO carries the whole cost —
-        # the aggregation and the distinct-count guard read the scratch table
         key_types = _key_column_types(conn, table, dialect) if table.key_cols else None
         messages: list[str] = []
         pages = None
@@ -720,14 +765,6 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
         )
         _harvest_cursor_messages(staging_result, messages)
         try:
-            if pages is not None:
-                target_tables = {table.table}
-                if table.event_time_via is not None:
-                    target_tables.add(table.event_time_via.table)
-                target_reads = _target_reads_from(messages, target_tables)
-                if target_reads is not None:
-                    budget = 3 * pages
-                    check_scan_budget(target_reads, budget, table.probe_name)
             result = conn.execute(build_aggregation_query(table, dialect))
             keys = result.keys()
             for row in result:
@@ -740,16 +777,21 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                         f"result_cell_cap={cap}",
                     )
                 rows.append(tuple(row))
-            if table.key_cols:
-                guard_row = conn.execute(build_uniqueness_query(table, dialect)).one()
-                guard_distinct = int(guard_row.distinct_keys)
+            _harvest_cursor_messages(result, messages)
+            if dialect == "mssql":
+                # ALL statements are counted (staging + aggregation with its
+                # distinct-count branch); only staging touches the targets by
+                # construction, but any regression that re-reads them is caught
+                target_tables = {table.table}
+                if table.event_time_via is not None:
+                    target_tables.add(table.event_time_via.table)
+                target_reads, budget = verify_scan_budget(
+                    _target_reads_from(messages, target_tables), pages, table.probe_name
+                )
         finally:
             conn.exec_driver_sql(drop_staging_sql(dialect))
     frame = pd.DataFrame(rows, columns=list(keys))
     frame["event_month"] = pd.to_datetime(frame["event_month"])
-    if guard_distinct is not None:
-        global_mask = frame["grouping_id"] == GROUPING_SET_IDS["global"]
-        frame.loc[global_mask, "distinct_keys"] = guard_distinct
     result = CanonicalResult(
         frame=frame, target_logical_reads=target_reads, scan_budget_reads=budget
     )
