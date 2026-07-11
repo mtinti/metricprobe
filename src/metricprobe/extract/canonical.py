@@ -50,11 +50,12 @@ The staging query carries `(load_time <= :as_of OR load_time IS NULL)` — the
 bare `<=` would silently delete the NULL-load bucket reconciliation requires.
 
 The via-join uniqueness guard piggybacks on the staging pass: the lookup side
-is wrapped with COUNT(*) OVER (PARTITION BY join keys) and a second layer
-carries MAX(dup) OVER () — the GLOBAL lookup-side worst key — on every joined
-row, so MAX(lookup_dup) > 1 aborts the probe (JOIN_NOT_UNIQUE) even when the
-duplicated key is not referenced by any base row (the uniqueness contract
-covers the lookup table itself).
+is wrapped with COUNT(*) OVER (PARTITION BY join keys) and joined FULL OUTER,
+so EVERY lookup row is staged (joined to a base row or as a guard-only
+artifact with is_probe_row = 0). MAX(lookup_dup) is therefore the whole
+lookup table's worst key and JOIN_NOT_UNIQUE aborts the probe even when the
+duplicated key is not referenced by any base row — the uniqueness contract
+covers the lookup table itself.
 """
 
 from __future__ import annotations
@@ -72,10 +73,12 @@ from metricprobe.status import ReasonCode
 
 # v2: the scan-budget accounting formulas changed (row-linear scratch bound,
 # enforced spool bound) — ALGORITHMS.md section 15 records the history.
-# v3: the staged lookup_dup carries the GLOBAL lookup-side max duplication
-# (a second window layer), so JOIN_NOT_UNIQUE fires on duplicate lookup keys
-# even when no current base row references them
-CANONICAL_SCHEMA_VERSION = 3
+# v3: the staged lookup_dup carried the GLOBAL lookup-side max via a second
+# window layer. v4 replaces that with a FULL OUTER join: lookup-only rows are
+# staged as guard-only artifacts (is_probe_row = 0, excluded from row_count
+# and every bucket), so JOIN_NOT_UNIQUE fires on duplicate lookup keys even
+# when NO base row — admitted or otherwise — references them
+CANONICAL_SCHEMA_VERSION = 4
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -115,6 +118,7 @@ STAGING_COLUMNS = (
     "is_base_row",
     "is_ambiguous_base",
     "is_compare_mismatch",
+    "is_probe_row",  # 0 for lookup-only artifact rows of the FULL OUTER join
     "lookup_dup",
     "key_hash",
     "load_time",
@@ -347,6 +351,14 @@ def build_staging_select(
     base = _table_clause(
         table.database, table.table_schema, table.table, sorted(base_columns), dialect
     )
+    if via:
+        # the marker distinguishes probe-table rows after the FULL OUTER
+        # join below: lookup-only rows carry NULL here and contribute to NO
+        # bucket, only to the lookup-uniqueness guard
+        base = sa.select(
+            *[base.c[column] for column in sorted(base_columns)],
+            sa.literal(1).label("mp_base_marker"),
+        ).subquery("b")
     load = base.c[table.load_time]
 
     lk = None
@@ -356,7 +368,7 @@ def build_staging_select(
             via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
         )
         partition = [lookup.c[pair.lookup_col] for pair in via.on]
-        lk_inner = (
+        lk = (
             sa.select(
                 *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
                 sa.literal(1).label("lk_matched"),
@@ -366,26 +378,25 @@ def build_staging_select(
                 sa.func.row_number()
                 .over(partition_by=partition, order_by=partition)
                 .label("lk_rn"),
-            ).subquery("lk_inner")
+            ).subquery("lk")
         )
-        # the GLOBAL max duplication over the whole lookup side, carried on
-        # every joined row: the uniqueness contract covers the lookup table
-        # itself, so duplicate keys that no base row references must still
-        # surface (window nesting is illegal, hence the second layer)
-        lk = sa.select(
-            *lk_inner.c,
-            sa.func.max(lk_inner.c.lk_dup).over().label("lk_maxdup"),
-        ).subquery("lk")
         event = lk.c[f"lk_{via.column}"]
-        matched = lk.c.lk_matched.is_not(None)
+        is_probe = base.c.mp_base_marker.is_not(None)
+        matched = sa.and_(is_probe, lk.c.lk_matched.is_not(None))
+        # FULL OUTER: every lookup row reaches staging at least once (joined
+        # or alone), so MAX(lookup_dup) is the WHOLE lookup side's worst key
+        # — duplicate lookup keys abort even when no admitted base row (or
+        # no base row at all) references them
         source = base.outerjoin(
             lk,
             sa.and_(
                 *[base.c[pair.base_col] == lk.c[f"lk_{pair.lookup_col}"] for pair in via.on]
             ),
+            full=True,
         )
     else:
         event = base.c[table.event_time]
+        is_probe = sa.true()
         matched = sa.true()
         source = base
 
@@ -436,25 +447,34 @@ def build_staging_select(
                 f"probe {table.probe_name!r}: declared types required for key "
                 f"column(s) {missing} (the hash type tag)"
             )
-        key_hash = KeyHash(
+        key_expr = KeyHash(
             [key_types[key] for key in table.key_cols],
             *[base.c[key] for key in table.key_cols],
-        ).label("key_hash")
+        )
+        if via:
+            # lookup-only rows would hash their all-NULL base columns and
+            # pollute the distinct-key count: only probe rows get a hash
+            key_expr = sa.case((is_probe, key_expr), else_=sa.null())
+        key_hash = key_expr.label("key_hash")
     else:
         key_hash = sa.cast(sa.null(), sa.String()).label("key_hash")
     if via:
-        unmatched_flag = flag(lk.c.lk_matched.is_(None))
-        # staged as the GLOBAL lookup-side max: MAX(lookup_dup) in the result
-        # is then the whole lookup table's worst key, joined-or-not (v3)
-        lookup_dup = lk.c.lk_maxdup
+        unmatched_flag = flag(sa.and_(is_probe, lk.c.lk_matched.is_(None)))
+        # per-row duplication: with the FULL OUTER join every lookup row is
+        # staged, so MAX(lookup_dup) is the global lookup-side worst key (v4)
+        lookup_dup = lk.c.lk_dup
         # pre-join base count: unmatched rows plus the FIRST match per base row
-        base_row_flag = flag(sa.or_(lk.c.lk_matched.is_(None), lk.c.lk_rn == 1))
-        ambiguous_flag = flag(sa.and_(lk.c.lk_rn == 1, lk.c.lk_dup > 1))
+        base_row_flag = flag(
+            sa.and_(is_probe, sa.or_(lk.c.lk_matched.is_(None), lk.c.lk_rn == 1))
+        )
+        ambiguous_flag = flag(sa.and_(is_probe, lk.c.lk_rn == 1, lk.c.lk_dup > 1))
+        probe_row_flag = flag(is_probe)
     else:
         unmatched_flag = sa.cast(sa.literal(0), sa.Integer())
         lookup_dup = sa.cast(sa.null(), sa.Integer())
         base_row_flag = sa.cast(sa.literal(1), sa.Integer())
         ambiguous_flag = sa.cast(sa.literal(0), sa.Integer())
+        probe_row_flag = sa.cast(sa.literal(1), sa.Integer())
 
     if table.compare_event_time:
         compare = base.c[table.compare_event_time]
@@ -484,6 +504,7 @@ def build_staging_select(
             base_row_flag.label("is_base_row"),
             ambiguous_flag.label("is_ambiguous_base"),
             compare_mismatch.label("is_compare_mismatch"),
+            probe_row_flag.label("is_probe_row"),
             lookup_dup.label("lookup_dup"),
             key_hash,
             load.label("load_time"),
@@ -537,7 +558,10 @@ def _bucket_sums(staging):
         return sa.func.coalesce(sa.func.sum(col), 0)
 
     return [
-        sa.func.count().label("row_count"),
+        # PROBE-TABLE rows only: the FULL OUTER join's lookup-only artifact
+        # rows (is_probe_row = 0) exist solely for the uniqueness guard and
+        # must not inflate row_count or the reconciliation equation
+        total(staging.c.is_probe_row).label("row_count"),
         total(staging.c.is_eligible).label("n_curve_eligible"),
         total(staging.c.is_null_event_time).label("n_null_event_time"),
         total(staging.c.is_null_load_time_only).label("n_null_load_time_only"),
@@ -692,15 +716,22 @@ def _key_column_types(conn, table: TableConfig, dialect: str) -> dict[str, str]:
             "WHERE table_catalog = :c AND table_schema = :s AND table_name = :t"
         )
         params = {"c": table.database, "s": table.table_schema, "t": table.table}
-    types = {name: data_type for name, data_type in conn.execute(sa.text(sql), params)}
-    missing = [key for key in table.key_cols or () if key not in types]
+    # identifiers are case-insensitive under the usual collations: a config
+    # naming RowID as rowid still resolves in the generated SQL, so the
+    # metadata match must fold case too — the returned map is keyed by the
+    # CONFIGURED spelling (which the SQL builders use throughout)
+    types = {
+        name.casefold(): data_type
+        for name, data_type in conn.execute(sa.text(sql), params)
+    }
+    missing = [key for key in table.key_cols or () if key.casefold() not in types]
     if missing:
         raise ProbeAborted(
             ReasonCode.MISSING_TABLE,
             f"probe {table.probe_name!r}: key column(s) {missing} not found in "
             f"{table.database}.{table.table_schema}.{table.table}",
         )
-    return types
+    return {key: types[key.casefold()] for key in table.key_cols or ()}
 
 
 def _install_message_capture(conn, messages: list[str]) -> bool:

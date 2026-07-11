@@ -508,28 +508,30 @@ def test_mssql_store_sweeps_are_isolated_and_types_are_frozen(mssql_engine):
         )
 
     run_id = f"eqv-{uuid.uuid4().hex[:12]}"
-    # ---- C1: a decoy table the LIKE pattern would match via the _ wildcard
-    with store.engine.begin() as conn:
-        conn.exec_driver_sql(
-            "IF OBJECT_ID('dbo.mpx_audit_foreign') IS NOT NULL "
-            "DROP TABLE dbo.mpx_audit_foreign"
-        )
-        conn.exec_driver_sql(
-            "CREATE TABLE dbo.mpx_audit_foreign (run_id varchar(64), payload int)"
-        )
-        conn.exec_driver_sql(
-            f"INSERT INTO dbo.mpx_audit_foreign VALUES ('{run_id}', 42)"
-        )
-    assert "mpx_audit_foreign" not in store._data_tables()
-    store.abort_run(run_id)  # unknown names -> sweeps all metricprobe tables
+    # ---- foreign tables: neither a LIKE-wildcard cousin (mpx_...) nor a
+    # table LITERALLY named mp_something is metricprobe-owned — only tables
+    # recorded in the ownership catalog may ever be swept
+    for decoy in ("mpx_audit_foreign", "mp_foreign_business"):
+        with store.engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"IF OBJECT_ID('dbo.{decoy}') IS NOT NULL DROP TABLE dbo.{decoy}"
+            )
+            conn.exec_driver_sql(
+                f"CREATE TABLE dbo.{decoy} (run_id varchar(64), payload int)"
+            )
+            conn.exec_driver_sql(f"INSERT INTO dbo.{decoy} VALUES ('{run_id}', 42)")
+        assert decoy not in store._data_tables()
+    store.abort_run(run_id)  # unknown names -> sweeps all CATALOGED tables
     store.prune(keep=0)
     with store.engine.connect() as conn:
-        survivors = conn.exec_driver_sql(
-            "SELECT COUNT(*) FROM dbo.mpx_audit_foreign"
-        ).scalar()
-    assert survivors == 1  # the foreign row is untouched
+        for decoy in ("mpx_audit_foreign", "mp_foreign_business"):
+            survivors = conn.exec_driver_sql(
+                f"SELECT COUNT(*) FROM dbo.{decoy}"
+            ).scalar()
+            assert survivors == 1, decoy  # the foreign row is untouched
     with store.engine.begin() as conn:
-        conn.exec_driver_sql("DROP TABLE dbo.mpx_audit_foreign")
+        for decoy in ("mpx_audit_foreign", "mp_foreign_business"):
+            conn.exec_driver_sql(f"DROP TABLE dbo.{decoy}")
 
     # ---- C2: a takeover invalidates the original writer's commit
     meta = make_meta(run_id)
@@ -567,4 +569,43 @@ def test_mssql_store_sweeps_are_isolated_and_types_are_frozen(mssql_engine):
     assert float(read_back["cadence_median_days"].iloc[0]) == 7.5
     assert not isinstance(read_back["cadence_median_days"].iloc[0], str)
     assert int(read_back["epoch_count"].iloc[0]) == 9
+
+    # numeric-looking batch ids first, textual later: both survive as text
+    third_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    third = make_meta(third_id, run_at="2026-07-01T08:00:00")
+    store.begin_run(third)
+    numeric_ids = _typed(
+        "batch_runs", pd.DataFrame({"probe": ["p"], "batch_id": [20240101], "rows": [5]})
+    )
+    store.write_table(third_id, "batch_runs", stamp(numeric_ids, third))
+    store.commit_run(third_id, {**dataclasses.asdict(third), "stages": {}})
+    fourth_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    fourth = make_meta(fourth_id, run_at="2026-07-01T09:00:00")
+    store.begin_run(fourth)
+    text_ids = _typed(
+        "batch_runs",
+        pd.DataFrame({"probe": ["p"], "batch_id": ["2024-02-run1"], "rows": [7]}),
+    )
+    store.write_table(fourth_id, "batch_runs", stamp(text_ids, fourth))
+    store.commit_run(fourth_id, {**dataclasses.asdict(fourth), "stages": {}})
+    assert store.read_table(fourth_id, "batch_runs")["batch_id"].iloc[0] == "2024-02-run1"
+
+    # ---- the physical-schema version marker refuses cross-version appends
+    with store.engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"UPDATE dbo.{MssqlStore.META_TABLE} SET meta_value = '2' "
+            "WHERE meta_key = 'snapshot_schema_version'"
+        )
+    with pytest.raises(RuntimeError, match="snapshot schema v2"):
+        MssqlStore(url, schema="dbo")
+    from metricprobe.store import SNAPSHOT_SCHEMA_VERSION
+
+    with store.engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                f"UPDATE dbo.{MssqlStore.META_TABLE} SET meta_value = :v "
+                "WHERE meta_key = 'snapshot_schema_version'"
+            ),
+            {"v": str(SNAPSHOT_SCHEMA_VERSION)},
+        )
     store.prune(keep=0)  # clean up

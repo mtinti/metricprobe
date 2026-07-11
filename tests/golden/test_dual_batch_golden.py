@@ -178,6 +178,20 @@ def test_dual_via_asserts_lookup_uniqueness_itself():
     finally:
         engine.dispose()
     assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+    # and the degenerate corner: duplicated lookup keys that match NO base
+    # row still abort (the FULL OUTER guard stages every lookup row)
+    disjoint = pd.DataFrame(
+        {"id": [-77, -77], "referral_date": [pd.Timestamp("2024-01-01")] * 2}
+    )
+    engine = sa.create_engine("duckdb:///:memory:")
+    try:
+        g.load_via_sqlalchemy(base, engine, "events")
+        g.load_via_sqlalchemy(disjoint, engine, "referrals")
+        with pytest.raises(ProbeAborted) as excinfo:
+            run_dual_lag(engine, via_config, pd.Timestamp(AS_OF))
+    finally:
+        engine.dispose()
+    assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
 
 
 def test_dual_delta_histogram_is_the_exact_offset():

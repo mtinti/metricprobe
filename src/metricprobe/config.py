@@ -51,8 +51,12 @@ from sqlalchemy.engine import make_url
 
 # v2: StoreConfig.mssql_schema, freshness_amber_mads/freshness_red_mads,
 # per-column resolution REQUIRED for the time roles, delivery query-secret
-# rejection (v1 configs without resolution no longer validate)
-CONFIG_SCHEMA_VERSION = 2
+# rejection (v1 configs without resolution no longer validate).
+# v3: compare_event_time joined the required-resolution set, connection_url
+# restricted to the supported dialects (mssql/duckdb), non-finite analysis
+# thresholds rejected, mssql_url validated — v2 configs can be rejected under
+# these rules, so the version moved with them
+CONFIG_SCHEMA_VERSION = 3
 
 
 class ConfigError(Exception):
@@ -125,20 +129,26 @@ class AnalysisParams(_Model):
     """All analysis parameters, explicit with versioned defaults (v1 values are
     pinned by test_analysis_defaults_are_frozen_v1)."""
 
+    # float thresholds reject inf/NaN (allow_inf_nan=False): an infinite
+    # tolerance or MAD multiplier would silently disable a required verdict
     training_cutoff_days: int = Field(default=365, gt=0)
     lag_cap_days: int = Field(default=365, gt=0)
-    clock_skew_tolerance_days: float = Field(default=1.0, ge=0)
-    negative_lag_red_fraction: float = Field(default=0.001, gt=0, le=1)
+    clock_skew_tolerance_days: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    negative_lag_red_fraction: float = Field(
+        default=0.001, gt=0, le=1, allow_inf_nan=False
+    )
     min_mature_months: int = Field(default=6, gt=0)
     evaluation_window_months: int = Field(default=3, gt=0)
     freshness_bucket: Literal["day", "hour"] = "day"
     freshness_min_epochs: int = Field(default=5, gt=0)
-    freshness_zero_mad_tolerance_days: float = Field(default=1.0, gt=0)
-    freshness_amber_mads: float = Field(default=2.0, gt=0)
-    freshness_red_mads: float = Field(default=3.0, gt=0)
-    volume_amber_mads: float = Field(default=2.0, gt=0)
-    volume_red_mads: float = Field(default=3.0, gt=0)
-    expected_fill_band_mads: float = Field(default=2.0, gt=0)
+    freshness_zero_mad_tolerance_days: float = Field(
+        default=1.0, gt=0, allow_inf_nan=False
+    )
+    freshness_amber_mads: float = Field(default=2.0, gt=0, allow_inf_nan=False)
+    freshness_red_mads: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    volume_amber_mads: float = Field(default=2.0, gt=0, allow_inf_nan=False)
+    volume_red_mads: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    expected_fill_band_mads: float = Field(default=2.0, gt=0, allow_inf_nan=False)
     parity_tolerance: int = Field(default=0, ge=0)
     result_cell_cap: int = Field(default=100_000, gt=0)
 
@@ -426,9 +436,16 @@ class ProbeConfig(_Model):
     @classmethod
     def _url_parses(cls, value: str) -> str:
         try:
-            make_url(value)
+            backend = make_url(value).get_backend_name()
         except Exception as exc:
             raise ValueError(f"connection_url is not a valid SQLAlchemy URL: {exc}") from exc
+        # extraction compiles mssql or duckdb SQL — any other dialect would
+        # silently receive duckdb-flavoured statements
+        if backend not in ("mssql", "duckdb"):
+            raise ValueError(
+                f"connection_url uses unsupported dialect {backend!r}; "
+                "supported: mssql, duckdb"
+            )
         return value
 
     @model_validator(mode="after")

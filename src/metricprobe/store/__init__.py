@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -30,8 +31,10 @@ import sqlalchemy as sa
 from metricprobe.config import StoreConfig, expand_env
 
 # v2: rows persist the canonical v2 / dual v2 cell shapes, probe_runs carries
-# the stable read-accounting columns, percentile frames carry lag_resolution
-SNAPSHOT_SCHEMA_VERSION = 2
+# the stable read-accounting columns, percentile frames carry lag_resolution.
+# v3: FROZEN physical column types (TYPED_COLUMNS incl. string casts for
+# identifier columns) and the mssql store's version marker + ownership catalog
+SNAPSHOT_SCHEMA_VERSION = 3
 
 STAMP_COLUMNS = (
     "run_id",
@@ -146,6 +149,12 @@ class ParquetStore:
         if staging.exists() or self._committed(meta.run_id).exists():
             raise FileExistsError(f"run {meta.run_id!r} already exists")
         staging.mkdir(parents=True)
+        # a fresh PER-WRITER token: commit_run publishes only a staging area
+        # this process created (a replacement writer writes its own token)
+        token = uuid.uuid4().hex
+        (staging / ".mp_claim").write_text(token, encoding="utf-8")
+        self._claims = getattr(self, "_claims", {})
+        self._claims[meta.run_id] = token
 
     def write_table(self, run_id: str, name: str, frame: pd.DataFrame) -> None:
         staging = self._staging(run_id)
@@ -161,9 +170,19 @@ class ParquetStore:
         if not staging.exists():
             raise FileNotFoundError(f"run {run_id!r} has no open staging area")
         _require_manifest(manifest)
+        claim_file = staging / ".mp_claim"
+        own_token = getattr(self, "_claims", {}).get(run_id)
+        if not claim_file.exists() or claim_file.read_text(
+            encoding="utf-8"
+        ) != own_token:
+            raise RuntimeError(
+                f"run {run_id!r}: staging claim lost to another writer; "
+                "refusing to commit"
+            )
         tmp = staging / "manifest.json.tmp"
         tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(staging / "manifest.json")
+        claim_file.unlink()
         staging.rename(self._committed(run_id))
         self._registration(run_id).unlink(missing_ok=True)
 
@@ -206,6 +225,8 @@ class MssqlStore:
     MANIFEST_TABLE = "mp_run_manifest"
     STAGING_TABLE = "mp_run_staging"
     REGISTRATION_TABLE = "mp_run_registration"
+    CATALOG_TABLE = "mp_store_catalog"  # tables THIS store created and owns
+    META_TABLE = "mp_store_meta"
 
     def __init__(self, url: str, schema: str):
         self.engine = sa.create_engine(url)
@@ -221,7 +242,8 @@ class MssqlStore:
                 f"IF OBJECT_ID('{self.schema}.{self.STAGING_TABLE}') IS NULL "
                 f"CREATE TABLE {self.schema}.{self.STAGING_TABLE} ("
                 "run_id varchar(64) NOT NULL PRIMARY KEY, "
-                "claimed_at varchar(40) NOT NULL)"
+                "claimed_at varchar(40) NOT NULL, "
+                "claim_token varchar(64) NOT NULL)"
             )
             conn.exec_driver_sql(
                 f"IF OBJECT_ID('{self.schema}.{self.REGISTRATION_TABLE}') IS NULL "
@@ -229,7 +251,59 @@ class MssqlStore:
                 "run_id varchar(64) NOT NULL PRIMARY KEY, "
                 "meta nvarchar(max) NOT NULL)"
             )
-        self._staged: dict[str, list[str]] = {}
+            conn.exec_driver_sql(
+                f"IF OBJECT_ID('{self.schema}.{self.CATALOG_TABLE}') IS NULL "
+                f"CREATE TABLE {self.schema}.{self.CATALOG_TABLE} ("
+                "table_name varchar(128) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql(
+                f"IF OBJECT_ID('{self.schema}.{self.META_TABLE}') IS NULL "
+                f"CREATE TABLE {self.schema}.{self.META_TABLE} ("
+                "meta_key varchar(64) NOT NULL PRIMARY KEY, "
+                "meta_value varchar(64) NOT NULL)"
+            )
+        self._verify_physical_schema_version()
+        self._staged: dict[str, dict] = {}
+
+    def _verify_physical_schema_version(self) -> None:
+        """The physical column types to_sql() froze belong to ONE snapshot
+        schema version. Appending under a different version would silently
+        coerce values (v2 varchar swallowing v3 numbers), so a mismatch —
+        or a pre-marker store with existing runs — refuses loudly."""
+        with self.engine.begin() as conn:
+            marker = conn.execute(
+                sa.text(
+                    f"SELECT meta_value FROM {self.schema}.{self.META_TABLE} "
+                    "WHERE meta_key = 'snapshot_schema_version'"
+                )
+            ).scalar()
+            if marker is None:
+                committed = conn.execute(
+                    sa.text(f"SELECT COUNT(*) FROM {self.schema}.{self.MANIFEST_TABLE}")
+                ).scalar_one()
+                if committed:
+                    raise RuntimeError(
+                        f"store schema {self.schema!r} holds committed runs but no "
+                        "physical-schema version marker (it predates "
+                        f"snapshot schema v{SNAPSHOT_SCHEMA_VERSION}); its column "
+                        "types cannot be trusted — migrate the data or point "
+                        "the store at a fresh schema"
+                    )
+                conn.execute(
+                    sa.text(
+                        f"INSERT INTO {self.schema}.{self.META_TABLE} "
+                        "(meta_key, meta_value) VALUES "
+                        "('snapshot_schema_version', :version)"
+                    ),
+                    {"version": str(SNAPSHOT_SCHEMA_VERSION)},
+                )
+            elif int(marker) != SNAPSHOT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"store schema {self.schema!r} was written under snapshot "
+                    f"schema v{marker}; this build writes "
+                    f"v{SNAPSHOT_SCHEMA_VERSION} — migrate the data or point "
+                    "the store at a fresh schema"
+                )
 
     def register_run(self, meta: RunMeta) -> None:
         """Same durable pre-stage record as the parquet store (upserted: a
@@ -278,25 +352,29 @@ class MssqlStore:
     def begin_run(self, meta: RunMeta) -> None:
         """The staging claim is a SERVER-SIDE primary-key insert: two processes
         can never stage the same run_id, so an abort can never touch another
-        writer's rows. claimed_at doubles as this writer's claim TOKEN —
-        commit_run refuses when the claim it releases is not its own."""
+        writer's rows. The claim carries a fresh PER-WRITER token (never a
+        value derivable from the run's identity, which a legitimate resume
+        REUSES) — commit_run refuses when the claim it releases is not its
+        own."""
         validate_run_id(meta.run_id)
         if any(m["run_id"] == meta.run_id for m in self.list_runs()):
             raise FileExistsError(f"run {meta.run_id!r} already exists")
+        token = uuid.uuid4().hex
         try:
             with self.engine.begin() as conn:
                 conn.execute(
                     sa.text(
                         f"INSERT INTO {self.schema}.{self.STAGING_TABLE} "
-                        "(run_id, claimed_at) VALUES (:run_id, :claimed_at)"
+                        "(run_id, claimed_at, claim_token) "
+                        "VALUES (:run_id, :claimed_at, :token)"
                     ),
-                    {"run_id": meta.run_id, "claimed_at": meta.run_at},
+                    {"run_id": meta.run_id, "claimed_at": meta.run_at, "token": token},
                 )
         except sa.exc.IntegrityError as exc:
             raise FileExistsError(
                 f"run {meta.run_id!r} is already staged by another writer"
             ) from exc
-        self._staged[meta.run_id] = {"claim": meta.run_at, "names": []}
+        self._staged[meta.run_id] = {"claim": token, "names": []}
 
     def write_table(self, run_id: str, name: str, frame: pd.DataFrame) -> None:
         if run_id not in self._staged:
@@ -305,6 +383,17 @@ class MssqlStore:
         frame.to_sql(
             f"mp_{name}", self.engine, schema=self.schema, if_exists="append", index=False
         )
+        # record ownership: sweeping deletes only ever touch CATALOGED tables,
+        # never a foreign table that merely shares the mp_ prefix
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    f"INSERT INTO {self.schema}.{self.CATALOG_TABLE} (table_name) "
+                    f"SELECT :name WHERE NOT EXISTS (SELECT 1 FROM "
+                    f"{self.schema}.{self.CATALOG_TABLE} WHERE table_name = :name)"
+                ),
+                {"name": f"mp_{name}"},
+            )
         self._staged[run_id]["names"].append(name)
 
     def commit_run(self, run_id: str, manifest: dict) -> None:
@@ -326,9 +415,9 @@ class MssqlStore:
             released = conn.execute(
                 sa.text(
                     f"DELETE FROM {self.schema}.{self.STAGING_TABLE} "
-                    "WHERE run_id = :run_id AND claimed_at = :claim"
+                    "WHERE run_id = :run_id AND claim_token = :token"
                 ),
-                {"run_id": run_id, "claim": self._staged[run_id]["claim"]},
+                {"run_id": run_id, "token": self._staged[run_id]["claim"]},
             )
             if released.rowcount != 1:
                 # our claim is gone (another writer aborted/took over this
@@ -400,24 +489,33 @@ class MssqlStore:
             )
 
     def _data_tables(self) -> list[str]:
-        # 'mp[_]%' escapes the LIKE underscore WILDCARD (bare 'mp_%' also
-        # matches names like mpx_audit) and the Python-side prefix check
-        # guards the guard: sweeping deletes must never see a foreign table
+        # ONLY tables this store recorded creating (the ownership catalog):
+        # a foreign table named mp_anything is invisible to sweeping deletes.
+        # Intersected with the live schema so a manually dropped table cannot
+        # error a sweep.
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                sa.text(
-                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                    "WHERE TABLE_SCHEMA = :s AND TABLE_NAME LIKE 'mp[_]%'"
-                ),
-                {"s": self.schema},
-            ).scalars()
-            return [
-                name
-                for name in rows
-                if name.startswith("mp_")
-                and name
-                not in (self.MANIFEST_TABLE, self.STAGING_TABLE, self.REGISTRATION_TABLE)
-            ]
+            cataloged = set(
+                conn.execute(
+                    sa.text(f"SELECT table_name FROM {self.schema}.{self.CATALOG_TABLE}")
+                ).scalars()
+            )
+            existing = set(
+                conn.execute(
+                    sa.text(
+                        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                        "WHERE TABLE_SCHEMA = :s"
+                    ),
+                    {"s": self.schema},
+                ).scalars()
+            )
+        infrastructure = {
+            self.MANIFEST_TABLE,
+            self.STAGING_TABLE,
+            self.REGISTRATION_TABLE,
+            self.CATALOG_TABLE,
+            self.META_TABLE,
+        }
+        return sorted((cataloged & existing) - infrastructure)
 
     def prune(self, keep: int) -> list[str]:
         """Same retention contract as the parquet store."""

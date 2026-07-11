@@ -387,3 +387,12 @@ def test_short_three_month_collapse_with_a_configured_horizon():
         probe(pair.healthy(), config, as_of), config, pd.Timestamp(as_of)
     )
     assert worst_severity(healthy_fresh.statuses) is Severity.GREEN
+
+
+def test_key_column_metadata_match_is_case_insensitive():
+    # identifiers resolve case-insensitively in SQL, so a column created as
+    # OrderRef configured as orderref must probe, not abort as missing
+    df = catalog()["duplicate_keys"].healthy().rename(columns={"row_id": "OrderRef"})
+    config = table_config(key_cols=["orderref"])
+    _, assessment = _assess(df, config, AS_OF_MATURE)
+    assert assessment.duplicate_rows == 0

@@ -37,6 +37,11 @@ import numpy as np
 import pandas as pd
 
 
+def _require_finite(value: float, what: str) -> None:
+    if not math.isfinite(value):
+        raise ValueError(f"{what} must be finite, got {value}")
+
+
 @dataclass(frozen=True)
 class LognormalLag:
     """Lag-days ~ Lognormal(mu, sigma): gradual trickle arrivals."""
@@ -45,6 +50,8 @@ class LognormalLag:
     sigma: float
 
     def __post_init__(self) -> None:
+        _require_finite(self.mu, "LognormalLag mu")
+        _require_finite(self.sigma, "LognormalLag sigma")
         if self.sigma <= 0:
             raise ValueError("LognormalLag sigma must be > 0")
 
@@ -62,6 +69,9 @@ class StepBatches:
     def __post_init__(self) -> None:
         if not self.schedule:
             raise ValueError("StepBatches schedule must not be empty")
+        for day, fraction in self.schedule:
+            _require_finite(day, "StepBatches day")
+            _require_finite(fraction, "StepBatches fraction")
         if any(day < 0 for day, _ in self.schedule):
             raise ValueError("StepBatches days must be >= 0 (measured from month end)")
         for _, fraction in self.schedule:
@@ -91,6 +101,10 @@ class TableSpec:
     seed: int = 0
 
     def __post_init__(self) -> None:
+        if self.dual_offset_days is not None:
+            _require_finite(self.dual_offset_days, "dual_offset_days")
+        for index, factor in self.volume_overrides.items():
+            _require_finite(factor, f"volume override for month {index}")
         if self.n_months < 1:
             raise ValueError("n_months must be >= 1")
         if self.rows_per_month < 0:
@@ -116,6 +130,14 @@ def generate(spec: TableSpec) -> pd.DataFrame:
 def _month_frame(spec: TableSpec, index: int, period: pd.Period) -> pd.DataFrame:
     multiplier = spec.volume_overrides.get(index, 1.0)
     n = round(spec.rows_per_month * multiplier)
+    # BEFORE any array allocation: a month bigger than the row-id stride
+    # would collide with the next month's ids (ids 0..n-1 fit exactly when
+    # n == stride, so only n > stride overflows)
+    if n > _ROW_ID_STRIDE:
+        raise ValueError(
+            f"month {period} draws {n} rows > the {_ROW_ID_STRIDE} row-id "
+            "stride; row ids would collide across months"
+        )
     # separate per-purpose streams: a different n only truncates/extends each
     # sequence, so volume twins retain byte-identical rows (prefix property)
     rng_event = np.random.default_rng([spec.seed, index, 0])
@@ -137,14 +159,6 @@ def _month_frame(spec: TableSpec, index: int, period: pd.Period) -> pd.DataFrame
         arrival = pd.DatetimeIndex(batch_times[choice])
         batch_id = [f"{period}-run{c}" for c in choice]
 
-    # row ids are unique BY CONSTRUCTION only under the fixed stride: a month
-    # that overflows it would silently collide with the next month's ids and
-    # corrupt every duplicate-key expectation — fail loudly instead
-    if n >= _ROW_ID_STRIDE:
-        raise ValueError(
-            f"month {period} draws {n} rows >= the {_ROW_ID_STRIDE} row-id "
-            "stride; row ids would collide across months"
-        )
     frame = pd.DataFrame({"row_id": index * _ROW_ID_STRIDE + np.arange(n), "event_time": event})
     if spec.dual_offset_days is not None:
         frame["source_insert_time"] = arrival

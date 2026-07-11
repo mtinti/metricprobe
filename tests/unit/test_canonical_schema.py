@@ -24,11 +24,11 @@ SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
 def test_schema_version_is_pinned():
     # v2: the scan-budget accounting formulas changed (ALGORITHMS section 15);
-    # v3: staged lookup_dup carries the GLOBAL lookup-side max duplication;
+    # v3: windowed global lookup max; v4: FULL OUTER lookup guard;
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 3
+    assert CANONICAL_SCHEMA_VERSION == 4
 
 
 def test_grouping_ids_are_frozen():
@@ -88,6 +88,7 @@ def test_result_columns_are_frozen():
         "is_base_row",
         "is_ambiguous_base",
         "is_compare_mismatch",
+        "is_probe_row",
         "lookup_dup",
         "key_hash",
         "load_time",

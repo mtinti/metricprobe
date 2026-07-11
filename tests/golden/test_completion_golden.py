@@ -294,6 +294,25 @@ def test_via_lookup_duplicates_abort_even_when_unreferenced():
     assert "0 base rows are ambiguous" in excinfo.value.detail
 
 
+def test_via_lookup_duplicates_abort_with_zero_matched_base_rows():
+    """The degenerate corner: EVERY admitted base row is unmatched (the
+    duplicated lookup keys join to nothing at all) — the FULL OUTER guard
+    still stages the lookup rows and the probe still refuses."""
+    _, base, lookup = _via_frames()
+    disjoint = pd.DataFrame(
+        {
+            "id": [99_999_999, 99_999_999],  # duplicated, matches NO base row
+            "site": [0, 0],
+            "referral_date": [pd.Timestamp("2024-01-01")] * 2,
+        }
+    )
+    with pytest.raises(ProbeAborted) as excinfo:
+        _probe_via(
+            base, disjoint, _via_config([{"base_col": "referral_id", "lookup_col": "id"}])
+        )
+    assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+
+
 def test_via_percentiles_match_generator_expectations():
     df, base, lookup = _via_frames()
     config = _via_config([{"base_col": "referral_id", "lookup_col": "id"}])

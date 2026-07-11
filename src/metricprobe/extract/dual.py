@@ -5,9 +5,11 @@ Same execution shape as the canonical pass: stage one scan of narrow derived
 columns into a session temp table, aggregate with GROUPING SETS, drop. The
 scan budget is verified fail-closed on mssql exactly like the main pass.
 
-FROZEN DUAL SCHEMA (v3 — v1 lacked the lookup-uniqueness guard columns and
-used the pages-only scratch budget; v2's guard saw only joined lookup rows,
-v3 stages the GLOBAL lookup-side max duplication). Grouping columns and GROUPING() weights:
+FROZEN DUAL SCHEMA (v4 — v1 lacked the lookup-uniqueness guard columns and
+used the pages-only scratch budget; v2's guard saw only joined lookup rows;
+v3 staged a windowed global max; v4 uses the main pass's FULL OUTER shape:
+every lookup row is staged, guard-only artifact rows carry is_probe_row = 0).
+Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
     1 = (event_month, lag_day)   source-side completion curves, where lag_day
@@ -54,7 +56,7 @@ from metricprobe.extract.canonical import (
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 3
+DUAL_SCHEMA_VERSION = 4
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -71,6 +73,7 @@ DUAL_STAGING_COLUMNS = (
     "is_negative_lag_excluded",
     "is_overflow",
     "is_delta_row",
+    "is_probe_row",  # 0 for lookup-only artifact rows of the FULL OUTER join
     "lookup_dup",
 )
 
@@ -125,6 +128,13 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
     base = _table_clause(
         table.database, table.table_schema, table.table, sorted(base_columns), dialect
     )
+    if via:
+        # same FULL OUTER shape as the main pass: lookup-only rows exist only
+        # for the uniqueness guard and contribute to no bucket
+        base = sa.select(
+            *[base.c[column] for column in sorted(base_columns)],
+            sa.literal(1).label("mp_base_marker"),
+        ).subquery("b")
     load = base.c[table.load_time]
     source = base.c[table.source_insert_time]
     if via:
@@ -133,38 +143,38 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
         )
         partition = [lookup.c[pair.lookup_col] for pair in via.on]
-        lk_inner = sa.select(
+        lk = sa.select(
             *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
             sa.func.count().over(partition_by=partition).label("lk_dup"),
-        ).subquery("lk_inner")
-        # the GLOBAL lookup-side max duplication on every joined row, exactly
-        # like the main pass: the contract covers the lookup table itself
-        lk = sa.select(
-            *lk_inner.c,
-            sa.func.max(lk_inner.c.lk_dup).over().label("lk_maxdup"),
         ).subquery("lk")
         event = lk.c[f"lk_{via.column}"]
-        lookup_dup = lk.c.lk_maxdup
+        is_probe = base.c.mp_base_marker.is_not(None)
+        probe_row_flag = sa.case((is_probe, 1), else_=0)
+        lookup_dup = lk.c.lk_dup
         source_from = base.outerjoin(
             lk,
             sa.and_(
                 *[base.c[pair.base_col] == lk.c[f"lk_{pair.lookup_col}"] for pair in via.on]
             ),
+            full=True,
         )
     else:
         event = base.c[table.event_time]
+        is_probe = sa.true()  # folds away inside and_(); never used in a CASE
+        probe_row_flag = sa.cast(sa.literal(1), sa.Integer())
         lookup_dup = sa.cast(sa.null(), sa.Integer())
         source_from = base
 
     lag = DateDiffDay(event, source)
-    both = sa.and_(event.is_not(None), source.is_not(None))
-    is_null_event = event.is_(None)  # via: includes unmatched/NULL-column rows
-    is_null_source_only = sa.and_(event.is_not(None), source.is_(None))
+    both = sa.and_(is_probe, event.is_not(None), source.is_not(None))
+    # via: includes unmatched/NULL-column rows (probe rows only)
+    is_null_event = sa.and_(is_probe, event.is_(None))
+    is_null_source_only = sa.and_(is_probe, event.is_not(None), source.is_(None))
     is_negative_excluded = sa.and_(both, lag < -tolerance)
     is_eligible = sa.and_(both, lag >= -tolerance)
     is_clipped = sa.and_(both, lag >= -tolerance, lag < 0)
     is_overflow = sa.and_(is_eligible, lag > cap)
-    is_delta_row = sa.and_(source.is_not(None), load.is_not(None))
+    is_delta_row = sa.and_(is_probe, source.is_not(None), load.is_not(None))
 
     def flag(condition):
         return sa.case((condition, 1), else_=0)
@@ -195,6 +205,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             flag(is_negative_excluded).label("is_negative_lag_excluded"),
             flag(is_overflow).label("is_overflow"),
             flag(is_delta_row).label("is_delta_row"),
+            probe_row_flag.label("is_probe_row"),
             lookup_dup.label("lookup_dup"),
         )
         .select_from(source_from)
@@ -244,7 +255,8 @@ def build_dual_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
             month_key.label("event_month"),
             lag_key.label("lag_day"),
             delta_key.label("delta_day"),
-            sa.func.count().label("row_count"),
+            # probe-table rows only, exactly like the main pass
+            total(staging.c.is_probe_row).label("row_count"),
             total(staging.c.is_source_eligible).label("n_source_eligible"),
             total(staging.c.is_null_event_time).label("n_null_event_time"),
             total(staging.c.is_null_source_only).label("n_null_source_only"),

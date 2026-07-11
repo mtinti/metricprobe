@@ -392,7 +392,27 @@ def test_row_id_stride_overflow_fails_loudly():
         name="huge", start_month="2024-01", n_months=2, rows_per_month=2,
         lag_model=generator.LognormalLag(mu=1.0, sigma=0.5),
         volume_overrides={0: 6_000_000},  # 12M rows > the 10M stride
+        # (exactly 10M would be LEGAL: ids 0..9_999_999 stay inside the block)
         seed=1,
     )
     with pytest.raises(ValueError, match="stride"):
         generator.generate(spec)
+
+
+def test_non_finite_generator_parameters_are_rejected():
+    # NaN/inf parameters would silently generate NaT timestamps
+    from tests.synth import generator
+
+    nan = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        generator.StepBatches(schedule=((nan, 1.0),))
+    with pytest.raises(ValueError, match="finite"):
+        generator.LognormalLag(mu=nan, sigma=0.5)
+    with pytest.raises(ValueError, match="finite"):
+        generator.LognormalLag(mu=1.0, sigma=float("inf"))
+    with pytest.raises(ValueError, match="finite"):
+        generator.TableSpec(
+            name="x", start_month="2024-01", n_months=1, rows_per_month=1,
+            lag_model=generator.LognormalLag(mu=1.0, sigma=0.5),
+            dual_offset_days=float("inf"),
+        )

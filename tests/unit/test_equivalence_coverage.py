@@ -33,7 +33,6 @@ from sqlalchemy.sql.expression import ClauseElement, FunctionElement
 from tests.synth.scenarios import catalog
 
 import metricprobe.metrics as metrics_package
-from metricprobe import cli, config, discover, store
 from metricprobe.extract import canonical, dual
 from metricprobe.status import Check
 
@@ -73,37 +72,88 @@ COVERAGE: dict[str, str] = {
     "construct:TimeBucket": "test_censoring_overflow_and_hour_bucket_match",
     "construct:KeyHash": "test_empty_table_and_null_keys_match",
     "construct:GroupingSetsClause": "test_canonical_pass_matches_between_duckdb_and_mssql",
-    # ---- functions/methods with dialect branches (source contains "mssql")
-    "dialect_branch:canonical._datediff_mssql":
+    # ---- dialect code (functions mentioning mssql; ALL methods of
+    # classes mentioning mssql — derived by walking the whole package)
+    "dialect_branch:extract.canonical._datediff_mssql":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:canonical._month_floor_mssql":
+    "dialect_branch:extract.canonical._month_floor_mssql":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:canonical._time_bucket_mssql":
+    "dialect_branch:extract.canonical._time_bucket_mssql":
         "test_censoring_overflow_and_hour_bucket_match",
-    "dialect_branch:canonical._key_hash_mssql": "test_empty_table_and_null_keys_match",
-    "dialect_branch:canonical._key_column_types": "test_empty_table_and_null_keys_match",
-    "dialect_branch:canonical._table_clause":
+    "dialect_branch:extract.canonical._key_hash_mssql":
+        "test_empty_table_and_null_keys_match",
+    "dialect_branch:extract.canonical._key_column_types":
+        "test_empty_table_and_null_keys_match",
+    "dialect_branch:extract.canonical._table_clause":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:canonical.staging_table_name":
+    "dialect_branch:extract.canonical.staging_table_name":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:canonical.staging_sql":
+    "dialect_branch:extract.canonical.staging_sql":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:canonical._dialect_instance":
+    "dialect_branch:extract.canonical._dialect_instance":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:canonical.run_canonical":
+    "dialect_branch:extract.canonical.build_aggregation_query":
         "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_branch:dual.dual_staging_table_name":
+    "dialect_branch:extract.canonical.run_canonical":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:extract.canonical.CanonicalResult.rows_for":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:extract.canonical.CanonicalResult.global_row":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:extract.canonical._install_message_capture":
+        "test_scan_budget_enforced_through_the_production_runner",
+    "dialect_branch:extract.canonical._mssql_target_pages":
+        "test_scan_budget_enforced_through_the_production_runner",
+    "dialect_branch:extract.canonical._mssql_staging_pages":
+        "test_scan_budget_enforced_through_the_production_runner",
+    "dialect_branch:extract.canonical.verify_scan_budget":
+        "test_scan_budget_refusals_through_the_production_runner",
+    "dialect_branch:extract.dual.dual_staging_table_name":
         "test_step5_metrics_match_between_dialects",
-    "dialect_branch:dual.dual_staging_sql": "test_step5_metrics_match_between_dialects",
-    "dialect_branch:dual.run_dual_lag": "test_dual_via_matches_between_dialects",
+    "dialect_branch:extract.dual.dual_staging_sql":
+        "test_step5_metrics_match_between_dialects",
+    "dialect_branch:extract.dual.run_dual_lag":
+        "test_dual_via_matches_between_dialects",
     "dialect_branch:store.open_store": "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.__init__":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.register_run":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.registration":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.staging_claim":
+        "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
+    "dialect_branch:store.MssqlStore.begin_run":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.write_table":
+        "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
+    "dialect_branch:store.MssqlStore.commit_run":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.abort_run":
+        "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
+    "dialect_branch:store.MssqlStore.list_runs":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.read_table":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.prune":
+        "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
+    "dialect_branch:store.MssqlStore._data_tables":
+        "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
+    "dialect_branch:store.MssqlStore._verify_physical_schema_version":
+        "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
     "dialect_branch:cli._engine_for":
         "test_scan_budget_enforced_through_the_production_runner",
     "dialect_branch:cli._table_exists":
         "test_missing_table_detection_matches_between_dialects",
     "dialect_branch:config.StoreConfig._mssql_needs_url":
         "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:config.ProbeConfig._cross_checks":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
     "dialect_branch:discover.scan_columns": "test_discover_matches_between_dialects",
+    "dialect_branch:discover.ColumnInfo.is_datetime":
+        "test_discover_matches_between_dialects",
+    "dialect_branch:discover.ColumnInfo.resolution":
+        "test_discover_matches_between_dialects",
     # ---- behaviors beyond single constructs
     "behavior:via_join_composite_unmatched":
         "test_via_join_and_alt_grouping_match_between_dialects",
@@ -152,10 +202,26 @@ def _metric_entry_points() -> dict[str, set[str]]:
     return modules
 
 
+def _all_package_modules():
+    """EVERY module in the metricprobe package (walked, never hard-coded):
+    new dialect-touching code cannot land outside the gate's sight."""
+    import metricprobe
+
+    return [
+        importlib.import_module(info.name)
+        for info in pkgutil.walk_packages(metricprobe.__path__, prefix="metricprobe.")
+        # __main__ executes the CLI on import
+        if not info.name.endswith("__main__")
+    ]
+
+
 def _dialect_branch_functions() -> set[str]:
-    """<module>.<qualname> of every function or method whose SOURCE branches
-    on "mssql" — a new dialect branch anywhere demands a case, not just a new
-    module."""
+    """<module>.<qualname> of every function whose source mentions mssql
+    (case-insensitive), plus EVERY method of a class whose source mentions
+    mssql (e.g. MssqlStore: its methods run dialect-specific SQL without
+    spelling the word) — a new dialect branch or store method anywhere
+    demands an equivalence case."""
+
     def _source(obj) -> str:
         try:
             return inspect.getsource(obj)
@@ -163,17 +229,27 @@ def _dialect_branch_functions() -> set[str]:
             return ""
 
     items = set()
-    for module in (canonical, dual, store, cli, config, discover):
-        short = module.__name__.rsplit(".", 1)[-1]
+    for module in _all_package_modules():
+        short = module.__name__.removeprefix("metricprobe.")
         for name, obj in vars(module).items():
             if getattr(obj, "__module__", None) != module.__name__:
                 continue
             if inspect.isfunction(obj):
-                if '"mssql"' in _source(obj):
+                if "mssql" in _source(obj).lower():
                     items.add(f"{short}.{name}")
             elif inspect.isclass(obj):
-                for method_name, method in vars(obj).items():
-                    if inspect.isfunction(method) and '"mssql"' in _source(method):
+                class_is_dialect = "mssql" in _source(obj).lower()
+                for method_name, member in vars(obj).items():
+                    if isinstance(member, property) and member.fget:
+                        method = member.fget
+                    elif inspect.isfunction(member):
+                        method = member
+                    else:
+                        continue
+                    if getattr(method, "__module__", None) != module.__name__:
+                        continue  # pydantic/base-class machinery
+                    src = _source(method)  # "" for generated code (dataclass)
+                    if src and (class_is_dialect or "mssql" in src.lower()):
                         items.add(f"{short}.{name}.{method_name}")
     return items
 

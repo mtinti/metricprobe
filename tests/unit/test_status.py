@@ -150,9 +150,9 @@ def test_component_versions_are_pinned():
     from metricprobe.cli import COMPONENT_VERSIONS
 
     assert COMPONENT_VERSIONS == {
-        "config": 2,  # v2: mssql_schema, freshness MADs, required resolution
+        "config": 3,  # v3: compare resolution, dialect whitelist, finite params
         "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
-        "canonical": 3,  # v3: staged lookup_dup is the GLOBAL lookup max
-        "dual": 3,  # v3: same global lookup-uniqueness guard as the main pass
-        "snapshot": 2,  # v2: canonical v2 cells, stable probe_runs, grain labels
+        "canonical": 4,  # v4: FULL OUTER lookup guard (is_probe_row artifacts)
+        "dual": 4,  # v4: same FULL OUTER lookup guard as the main pass
+        "snapshot": 3,  # v3: frozen physical types, version marker, catalog
     }

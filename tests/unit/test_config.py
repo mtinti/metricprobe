@@ -512,3 +512,26 @@ def test_resolution_is_required_for_time_roles_and_labels_the_grain():
     )
     assert dual.tables[0].lag_resolution == "datetime"
     assert dual.tables[0].dual_lag_resolution == "datetime"
+
+
+def test_connection_url_dialect_whitelist():
+    # extraction compiles mssql or duckdb SQL only; other dialects would
+    # silently receive duckdb-flavoured statements
+    for bad in ["postgresql://localhost/demo", "sqlite:///demo.db"]:
+        with pytest.raises(ValidationError, match="unsupported dialect"):
+            ProbeConfig.model_validate(minimal_config(connection_url=bad))
+    for ok_url in ["duckdb:///:memory:", "mssql+pymssql://localhost/demo"]:
+        assert ProbeConfig.model_validate(minimal_config(connection_url=ok_url))
+
+
+def test_non_finite_analysis_params_rejected():
+    # volume_red_mads=inf would make RED unreachable; clock_skew inf would
+    # clip every negative lag: both must be invalid configs
+    for field in ["volume_red_mads", "volume_amber_mads", "freshness_red_mads",
+                  "clock_skew_tolerance_days", "expected_fill_band_mads",
+                  "freshness_zero_mad_tolerance_days"]:
+        for bad in [float("inf"), float("nan")]:
+            with pytest.raises(ValidationError):
+                ProbeConfig.model_validate(
+                    minimal_config(tables=[minimal_table(analysis={field: bad})])
+                )

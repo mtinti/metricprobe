@@ -130,6 +130,8 @@ def _combined_digest(configs: list[ProbeConfig]) -> str:
 
 
 def _parse_window(args, as_of: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
+    if args.year and args.window:
+        raise ConfigError("pass either --window or --year, not both")
     if args.year:
         start = pd.Timestamp(year=args.year, month=1, day=1)
         return start, start + pd.DateOffset(years=1)
@@ -137,6 +139,8 @@ def _parse_window(args, as_of: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp
     if not window.endswith("m"):
         raise ConfigError(f"--window must look like '24m', got {window!r}")
     months = int(window[:-1])
+    if months < 1:
+        raise ConfigError(f"--window must cover at least one month, got {window!r}")
     return as_of - pd.DateOffset(months=months), as_of
 
 
@@ -383,9 +387,17 @@ READ_COLUMNS = ("target_logical_reads", "scan_budget_reads", "scratch_logical_re
 # run's freshness cadence) would otherwise freeze a varchar that silently
 # turns later numbers into strings. Unlisted columns are strings.
 TYPED_COLUMNS: dict[str, dict[str, str]] = {
-    "statuses": {"status_schema_version": "Int64"},
+    "statuses": {
+        "status_schema_version": "Int64",
+        # None-able / free-form text: an all-None or numeric-looking first
+        # frame must not freeze a non-text physical column
+        "reason": "string",
+        "detail": "string",
+    },
     "probe_runs": {
         "duration_seconds": "Float64",
+        "extraction_started": "string",
+        "extraction_finished": "string",
         **dict.fromkeys(READ_COLUMNS, "Int64"),
     },
     "population_buckets": {
@@ -404,6 +416,7 @@ TYPED_COLUMNS: dict[str, dict[str, str]] = {
         "distinct_keys": "Int64",
     },
     "completion_summary": {
+        "complete_back_to": "string",
         "learned_wait": "Int64",
         "horizon": "Int64",
         "recommended_wait": "Int64",
@@ -414,6 +427,7 @@ TYPED_COLUMNS: dict[str, dict[str, str]] = {
         "p99_mean": "Float64", "p99_std": "Float64",
     },
     "volume_summary": {
+        "gaps": "string",
         "baseline_median": "Float64",
         "baseline_sigma": "Float64",
         "forecast": "Float64",
@@ -430,12 +444,15 @@ TYPED_COLUMNS: dict[str, dict[str, str]] = {
     "month_lag_cells": {"lag_day": "Int64", "row_count": "Int64"},
     "epoch_cells": {"row_count": "Int64"},
     "freshness": {
+        "last_epoch": "string",
         "epoch_count": "Int64",
         "cadence_median_days": "Float64",
         "cadence_sigma_days": "Float64",
         "days_since_last": "Float64",
     },
-    "batch_runs": {"rows": "Int64"},
+    # batch ids are USER DATA: numeric-looking ids must never freeze a
+    # numeric physical column that later textual ids cannot enter
+    "batch_runs": {"rows": "Int64", "batch_id": "string"},
     "batch_months": {
         "runs": "Int64",
         "null_batch_rows": "Int64",
@@ -453,7 +470,8 @@ TYPED_COLUMNS: dict[str, dict[str, str]] = {
     "dual_percentiles": {"pct": "Int64", "days": "Int64", "over_cap": "boolean"},
     "dual_delta": {"delta_day": "Int64", "row_count": "Int64"},
     "compare_mismatch": {"mismatches": "Int64"},
-    "parity_months": {"left_count": "Int64", "right_count": "Int64", "diff": "Int64"},
+    "parity_months": {"left_count": "Int64", "right_count": "Int64", "diff": "Int64",
+                      "verdict": "string"},
 }
 
 
@@ -657,8 +675,10 @@ def cmd_run(args) -> int:
         print(f"metricprobe: {error}", file=sys.stderr)
         return 1
     run_at = _wall()
-    as_of = pd.Timestamp(args.as_of) if args.as_of else run_at
     try:
+        # pd raises DateParseError (a ValueError) on malformed --as-of: a
+        # usage error must exit 1, never escape as a traceback
+        as_of = pd.Timestamp(args.as_of) if args.as_of else run_at
         window_start, window_end = _parse_window(args, as_of)
     except (ConfigError, ValueError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
@@ -745,7 +765,8 @@ def cmd_run(args) -> int:
                 print(
                     f"metricprobe: run {args.run_id!r} still holds a staging "
                     f"claim ({claim}); another writer may be active. If that "
-                    "writer is dead, remove its staging claim and retry",
+                    "writer is dead, run `metricprobe abort --config ... "
+                    f"--run-id {args.run_id}` and retry",
                     file=sys.stderr,
                 )
                 return 1
@@ -859,6 +880,35 @@ def cmd_discover(args) -> int:
     return 0
 
 
+def cmd_abort(args) -> int:
+    """Explicit cleanup for a crashed writer: releases the staging claim and
+    sweeps the run's partial rows so `--resume-from` can proceed. Deliberately
+    a SEPARATE, human-invoked command — the resume path itself must never
+    silently take over a claim that may belong to a live writer."""
+    try:
+        configs = [load_config(path) for path in args.config]
+        compose_campaign(configs)
+        validate_run_id(args.run_id)
+        store = open_store(configs[0].store)
+        if any(m["run_id"] == args.run_id for m in store.list_runs()):
+            print(
+                f"metricprobe: run {args.run_id!r} is committed; abort never "
+                "touches committed runs",
+                file=sys.stderr,
+            )
+            return 1
+        claim = store.staging_claim(args.run_id)
+        store.abort_run(args.run_id)
+        if claim is None:
+            print(f"run {args.run_id!r}: no staging claim was held; nothing to release")
+        else:
+            print(f"run {args.run_id!r}: staging claim released ({claim})")
+    except (ConfigError, ValueError) as error:
+        print(f"metricprobe: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _unimplemented(command: str, step: str):
     def handler(args) -> int:
         print(f"metricprobe {command}: lands in {step}", file=sys.stderr)
@@ -899,6 +949,15 @@ def main(argv=None) -> int:
         "(repeatable)",
     )
     discover.set_defaults(handler=cmd_discover)
+
+    abort = commands.add_parser(
+        "abort",
+        help="release a crashed run's staging claim and delete its partial "
+        "state (committed runs are never touched)",
+    )
+    abort.add_argument("--config", action="append", required=True, help="YAML config")
+    abort.add_argument("--run-id", required=True)
+    abort.set_defaults(handler=cmd_abort)
 
     for command, step in (
         ("report", "Step 9"),

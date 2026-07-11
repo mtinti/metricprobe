@@ -516,10 +516,26 @@ def test_resume_refuses_while_a_staging_claim_exists(tmp_path, demo_db):
         run_cli("--config", config, "--resume-from", "analysis", "--run-id", "r-crashed")
         == 1
     )
-    # cleanup releases the claim; the resume then proceeds
-    store.abort_run("r-crashed")
+    # the DOCUMENTED cleanup path is the abort command, not an internal API:
+    # it releases the claim so the resume can proceed
+    assert main(["abort", "--config", config, "--run-id", "r-crashed"]) == 0
     assert store.staging_claim("r-crashed") is None
     assert (
         run_cli("--config", config, "--resume-from", "analysis", "--run-id", "r-crashed")
         == 0
     )
+    # abort never touches a committed run
+    assert main(["abort", "--config", config, "--run-id", "r-crashed"]) == 1
+    assert len(store.list_runs()) >= 1
+
+
+def test_window_and_as_of_usage_errors_are_exit_1(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    # zero/negative windows never analyse anything: refused
+    assert run_cli("--config", config, "--as-of", AS_OF, "--window", "0m") == 1
+    assert run_cli("--config", config, "--as-of", AS_OF, "--window", "-3m") == 1
+    # --window and --year are alternatives, never silently ranked
+    assert run_cli("--config", config, "--as-of", AS_OF,
+                   "--window", "12m", "--year", "2024") == 1
+    # a malformed --as-of is a usage error, not a traceback
+    assert run_cli("--config", config, "--as-of", "not-a-date") == 1
