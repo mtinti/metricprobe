@@ -43,6 +43,7 @@ from metricprobe.extract.canonical import (
     _mssql_staging_pages,
     _mssql_target_pages,
     _scratch_reads_from,
+    _staged_row_count,
     _table_clause,
     _target_reads_from,
     verify_scan_budget,
@@ -325,6 +326,7 @@ def run_dual_lag(
                 ),
                 staging_pages,
                 3,  # grouping sets: month_src_lag, delta, ()
+                _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"]),
                 table.probe_name,
             )
     frame = pd.DataFrame(rows, columns=list(keys))

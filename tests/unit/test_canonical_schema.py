@@ -222,16 +222,17 @@ def test_scratch_budget_counts_the_guard_and_fails_closed():
     from metricprobe.extract.canonical import ProbeAborted, verify_scratch_budget
     from metricprobe.status import ReasonCode
 
-    # 4 branches (month_lag, epoch, month_batch, global/distinct) + 1 spare
-    assert verify_scratch_budget(11_300, 2_800, 4, "p") == (11_300, 14_000)
+    # 4 branches (month_lag, epoch, month_batch, global/distinct) + 1 spare,
+    # x 2800 pages, plus the 6/row sort-spool allowance over 1000 staged rows
+    assert verify_scratch_budget(11_300, 2_800, 4, 1000, "p") == (11_300, 20_000)
     with pytest.raises(ProbeAborted) as excinfo:
-        verify_scratch_budget(14_001, 2_800, 4, "p")
+        verify_scratch_budget(20_001, 2_800, 4, 1000, "p")
     assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_EXCEEDED
     with pytest.raises(ProbeAborted) as excinfo:
-        verify_scratch_budget(None, 2_800, 4, "p")
+        verify_scratch_budget(None, 2_800, 4, 1000, "p")
     assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_UNVERIFIABLE
     with pytest.raises(ProbeAborted) as excinfo:
-        verify_scratch_budget(11_300, None, 4, "p")
+        verify_scratch_budget(11_300, None, 4, 1000, "p")
     assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_UNVERIFIABLE
 
 

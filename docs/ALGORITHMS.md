@@ -301,11 +301,14 @@ SCAN_BUDGET_UNVERIFIABLE; exceeded => SCAN_BUDGET_EXCEEDED):
    materialization, worktables and workfiles. This is where the aggregation
    branches and the COUNT(DISTINCT key_hash) uniqueness guard run, so the
    guard's reads are COUNTED and enforced here:
-   `scratch_reads <= (branches + 1) x staging pages`, where branches is the
-   by-construction number of staging scans (one per grouping set plus the ()
-   global/distinct branch) and +1 is margin. Measured (180k-row fixture):
-   staging ~2.8k pages, scratch ~11.3k reads = 4.0 branches — the bound is
-   tight, not decorative.
+   `scratch_reads <= (branches + 1) x staging_pages + 6 x staged_rows`,
+   where branches is the by-construction number of staging scans (one per
+   grouping set plus the () global/distinct branch), +1 is margin, and the
+   row-linear term covers sort/spool WORKTABLE activity, which scales with
+   rows, not pages (the Step 7 audit measured up to ~2.6 reads/row on
+   sort-heavy plans such as hour-bucket epochs; a pure pages bound
+   false-aborted legitimate probes). The bound is a tripwire against
+   pathological plans, not decoration.
 
 The staging statement's own worktable spool (the via-join uniqueness window
 functions) is row-proportional and therefore measured and REPORTED

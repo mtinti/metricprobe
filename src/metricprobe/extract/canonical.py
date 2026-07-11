@@ -813,29 +813,49 @@ def verify_scan_budget(
     return target_reads, budget
 
 
+SCRATCH_ROW_ALLOWANCE = 6  # sort/spool worktable reads per staged row (measured <=2.6)
+
+
 def verify_scratch_budget(
-    scratch_reads: int | None, staging_pages: int | None, branches: int, probe_name: str
+    scratch_reads: int | None,
+    staging_pages: int | None,
+    branches: int,
+    staged_rows: int,
+    probe_name: str,
 ) -> tuple[int, int]:
     """The SCRATCH ledger (ALGORITHMS.md section 15): the aggregation and the
     distinct-count guard read the probe's own staging materialization, never
     the target. Their reads are COUNTED and enforced against the
-    by-construction bound (branches + 1) x staging pages — each aggregation
-    branch scans staging once, plus one spare scan of margin. Fail-closed."""
+    by-construction bound: one scan per aggregation branch (+1 spare) PLUS
+    sort/spool worktable activity, which is linear in the staged rows (the
+    Step 7 audit measured up to ~2.6 reads/row on sort-heavy plans such as
+    hour-bucket epochs; 6/row is the tripwire). Fail-closed."""
     if staging_pages is None or scratch_reads is None:
         raise ProbeAborted(
             ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
             f"probe {probe_name!r}: the scratch-read ledger (staging pages or "
             "STATISTICS IO) is unmeasurable; refusing to run unbudgeted",
         )
-    budget = (branches + 1) * max(staging_pages, 1)
+    budget = (branches + 1) * max(staging_pages, 1) + SCRATCH_ROW_ALLOWANCE * max(staged_rows, 0)
     if scratch_reads > budget:
         raise ProbeAborted(
             ReasonCode.SCAN_BUDGET_EXCEEDED,
             f"probe {probe_name!r}: {scratch_reads} scratch logical reads exceed "
-            f"the by-construction bound of {budget} "
-            f"({branches} aggregation branches + 1 spare, x {staging_pages} pages)",
+            f"the bound of {budget} ({branches} branches + 1 spare, x "
+            f"{staging_pages} pages, + {SCRATCH_ROW_ALLOWANCE}/row x {staged_rows} rows)",
         )
     return scratch_reads, budget
+
+
+def _staged_row_count(rows: list[tuple], keys, global_id: int) -> int:
+    """Total staged rows, read from the () grouping-set row already fetched."""
+    key_list = list(keys)
+    gid_index = key_list.index("grouping_id")
+    count_index = key_list.index("row_count")
+    for row in rows:
+        if row[gid_index] == global_id:
+            return int(row[count_index])
+    return 0
 
 
 def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
@@ -898,6 +918,7 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                 ),
                 staging_pages,
                 aggregation_branch_count(table),
+                _staged_row_count(rows, keys, GROUPING_SET_IDS["global"]),
                 table.probe_name,
             )
             # the staging statement's own worktable spool (the via uniqueness
