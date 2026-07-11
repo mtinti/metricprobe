@@ -51,6 +51,7 @@ def catalog() -> dict[str, ScenarioPair]:
     """All named pathology pairs. Month indexes target MATURE months (well before
     the end of history) unless the pathology is specifically about recency."""
     spike_month = 18  # 2024-07: mature under default horizons
+    drop_month = 15  # 2024-04
     gap_month = 12  # 2024-01
     pairs = [
         ScenarioPair(
@@ -59,6 +60,13 @@ def catalog() -> dict[str, ScenarioPair]:
             expected_detection="volume: RED/AMBER on the spiked month (median±MAD outlier)",
             healthy=lambda: g.generate(TRICKLE_BASE),
             unhealthy=lambda: g.generate(g.volume_spike(TRICKLE_BASE, spike_month, factor=6.0)),
+        ),
+        ScenarioPair(
+            name="volume_drop",
+            description="one mature month at ~10% of its normal volume",
+            expected_detection="volume: RED/AMBER on the dropped month (median±MAD outlier)",
+            healthy=lambda: g.generate(TRICKLE_BASE),
+            unhealthy=lambda: g.generate(g.volume_drop(TRICKLE_BASE, drop_month, factor=0.1)),
         ),
         ScenarioPair(
             name="missing_month",

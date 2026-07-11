@@ -14,8 +14,12 @@ Lag models
 Dual timestamps: with TableSpec.dual_offset_days set, the lag model produces
 source_insert_time and load_time follows it by exactly that offset.
 
-Determinism: every month uses its own RNG stream seeded by (seed, month_index),
+Determinism: every month uses its own RNG streams seeded by (seed, month_index),
 so healthy/unhealthy twins share byte-identical rows in unaffected months.
+Within a month, event times and the arrival process draw from SEPARATE streams:
+changing a month's row count only truncates/extends the sequence (NumPy fills
+sequentially), so a volume twin's retained rows keep identical event times AND
+lags — the pathology is purely "fewer/more rows", never resampled arrivals.
 
 All timestamps are floored to whole seconds so values survive SQL Server
 DATETIME's 3.33 ms rounding unchanged in equivalence tests.
@@ -24,6 +28,7 @@ DATETIME's 3.33 ms rounding unchanged in equivalence tests.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from statistics import NormalDist
@@ -59,6 +64,10 @@ class StepBatches:
             raise ValueError("StepBatches schedule must not be empty")
         if any(day < 0 for day, _ in self.schedule):
             raise ValueError("StepBatches days must be >= 0 (measured from month end)")
+        for _, fraction in self.schedule:
+            # zero would silently produce no physical batch for that entry
+            if not 0 < fraction <= 1:
+                raise ValueError(f"each StepBatches fraction must be in (0, 1], got {fraction}")
         total = sum(fraction for _, fraction in self.schedule)
         if abs(total - 1.0) > 1e-9:
             raise ValueError(f"StepBatches fractions must sum to 1, got {total}")
@@ -103,20 +112,23 @@ def generate(spec: TableSpec) -> pd.DataFrame:
 def _month_frame(spec: TableSpec, index: int, period: pd.Period) -> pd.DataFrame:
     multiplier = spec.volume_overrides.get(index, 1.0)
     n = round(spec.rows_per_month * multiplier)
-    rng = np.random.default_rng([spec.seed, index])  # independent per-month stream
+    # separate per-purpose streams: a different n only truncates/extends each
+    # sequence, so volume twins retain byte-identical rows (prefix property)
+    rng_event = np.random.default_rng([spec.seed, index, 0])
+    rng_arrival = np.random.default_rng([spec.seed, index, 1])
     start = period.start_time
     month_end = (period + 1).start_time
     length_days = (month_end - start) / pd.Timedelta(days=1)
 
-    event = (start + pd.to_timedelta(rng.uniform(0, length_days, n), unit="D")).floor("s")
+    event = (start + pd.to_timedelta(rng_event.uniform(0, length_days, n), unit="D")).floor("s")
     batch_id: list[str] | None = None
     if isinstance(spec.lag_model, LognormalLag):
-        lag_days = rng.lognormal(spec.lag_model.mu, spec.lag_model.sigma, n)
+        lag_days = rng_arrival.lognormal(spec.lag_model.mu, spec.lag_model.sigma, n)
         arrival = (event + pd.to_timedelta(lag_days, unit="D")).floor("s")
     else:
         days = np.array([day for day, _ in spec.lag_model.schedule])
         fractions = np.array([fraction for _, fraction in spec.lag_model.schedule])
-        choice = rng.choice(len(days), size=n, p=fractions / fractions.sum())
+        choice = rng_arrival.choice(len(days), size=n, p=fractions / fractions.sum())
         batch_times = (month_end + pd.to_timedelta(days, unit="D")).floor("s")
         arrival = pd.DatetimeIndex(batch_times[choice])
         batch_id = [f"{period}-run{c}" for c in choice]
@@ -139,18 +151,31 @@ def expected_days_to_percentiles(
     spec: TableSpec,
     percentiles: tuple[int, ...] = (50, 90, 95, 99),
     timestamp: str = "load",
+    grain: str = "day",
 ) -> dict[str, dict[int, float]]:
     """Days-to-pXX per event month, derived from the generating parameters alone.
 
+    grain="day" (the default) matches the production metric's DATEDIFF(day)
+    semantics — lag_day = calendar-day boundaries crossed between event_time and
+    load_time — and returns the smallest INTEGER day whose day-grain CDF reaches
+    the percentile. This is the oracle golden tests must consume. With events
+    uniform in time, the within-day position u~U(0,1) is independent of the
+    continuous lag, so P(lag_day <= d) = integral of F_continuous over [d, d+1]
+    (trickle); for batches the day lag is exactly month_days + floor(day_b) -
+    event_day_index, giving the discrete closed form in _day_quantile.
+
+    grain="continuous" returns the continuous elapsed-days quantile: lognormal
+    closed form, or the StepBatches mixture CDF
+        F(t) = sum_b fraction_b * clamp((t - day_b) / month_len, 0, 1)
+    inverted numerically — still parameter-derived, never fitted to data.
+
     timestamp="load" is the local-arrival curve (includes the dual offset when
     configured); "source" is the source-side curve and requires dual timestamps.
-    For StepBatches the lag CDF is the closed form
-        F(t) = sum_b fraction_b * clamp((t - day_b) / month_len, 0, 1)
-    (events uniform over the month, batch at month_end + day_b), inverted
-    numerically — still parameter-derived, never fitted to generated data.
     """
     if timestamp not in ("load", "source"):
         raise ValueError("timestamp must be 'load' or 'source'")
+    if grain not in ("day", "continuous"):
+        raise ValueError("grain must be 'day' or 'continuous'")
     if timestamp == "source" and spec.dual_offset_days is None:
         raise ValueError("source percentiles require dual_offset_days")
     offset = spec.dual_offset_days or 0.0 if timestamp == "load" else 0.0
@@ -163,11 +188,12 @@ def expected_days_to_percentiles(
             if not 0 < pct < 100:
                 raise ValueError(f"percentile {pct} outside (0, 100)")
             q = pct / 100
-            if isinstance(spec.lag_model, LognormalLag):
-                base = spec.lag_model.quantile(q)
+            if grain == "day":
+                values[pct] = _day_quantile(spec.lag_model, length_days, offset, q)
+            elif isinstance(spec.lag_model, LognormalLag):
+                values[pct] = spec.lag_model.quantile(q) + offset
             else:
-                base = _step_quantile(spec.lag_model.schedule, length_days, q)
-            values[pct] = base + offset
+                values[pct] = _step_quantile(spec.lag_model.schedule, length_days, q) + offset
         out[str(period)] = values
     return out
 
@@ -191,12 +217,66 @@ def _step_quantile(
     return hi
 
 
+def _day_quantile(
+    model: LognormalLag | StepBatches, length_days: float, offset: float, q: float
+) -> int:
+    """Smallest integer day d with P(lag_day <= d) >= q under DATEDIFF semantics."""
+    if isinstance(model, StepBatches):
+        # batch date = date(month_end + day_b + offset); event day index k uniform
+        # over {0..D-1}; lag_day = D + floor(day_b + offset) - k, hence
+        # P(lag_day <= d) = clamp((d - floor(day_b + offset)) / D, 0, 1) per batch
+        floors = [(math.floor(day + offset), fraction) for day, fraction in model.schedule]
+
+        def day_cdf(d: int) -> float:
+            return sum(
+                fraction * min(max((d - fd) / length_days, 0.0), 1.0) for fd, fraction in floors
+            )
+
+        upper = max(fd for fd, _ in floors) + math.ceil(length_days)
+    else:
+
+        def day_cdf(d: int) -> float:
+            return _lognormal_day_cdf(model, offset, d)
+
+        # F_day(d) >= F_continuous(d - offset), so the shifted continuous quantile
+        # is an upper bound for the day-grain one
+        upper = math.ceil(model.quantile(q) + offset) + 1
+
+    for d in range(upper + 1):
+        if day_cdf(d) >= q:
+            return d
+    return upper  # unreachable by construction; keeps the type checker honest
+
+
+def _lognormal_day_cdf(model: LognormalLag, offset: float, d: int) -> float:
+    """P(lag_day <= d) = integral of the continuous lognormal CDF (shifted by the
+    dual offset) over [d, d+1], via trapezoid on 128 panels (error << 1e-4)."""
+    lo, hi = d - offset, d + 1 - offset
+    lo = max(lo, 0.0)  # the CDF is 0 at t <= 0, contributing nothing
+    if hi <= 0:
+        return 0.0
+    normal = NormalDist()
+    xs = [lo + (hi - lo) * i / 128 for i in range(129)]
+    ys = [0.0 if x <= 0 else normal.cdf((math.log(x) - model.mu) / model.sigma) for x in xs]
+    return (sum(ys) - 0.5 * (ys[0] + ys[-1])) * (hi - lo) / 128
+
+
 # ------------------------------------------------------- volume-plan injectors
 # These return a NEW spec (frozen dataclasses), leaving the healthy twin intact.
 
 
 def volume_spike(spec: TableSpec, month_index: int, factor: float = 6.0) -> TableSpec:
     """One month at `factor` times its normal volume."""
+    if factor <= 1:
+        raise ValueError("a volume spike factor must be > 1")
+    return _with_override(spec, {month_index: factor})
+
+
+def volume_drop(spec: TableSpec, month_index: int, factor: float = 0.1) -> TableSpec:
+    """One month at `factor` of its normal volume (a one-month drop, as opposed
+    to the multi-month sustained_collapse)."""
+    if not 0 < factor < 1:
+        raise ValueError("a volume drop factor must be in (0, 1); use missing_month for 0")
     return _with_override(spec, {month_index: factor})
 
 
@@ -208,6 +288,8 @@ def missing_month(spec: TableSpec, month_index: int) -> TableSpec:
 def sustained_collapse(spec: TableSpec, last_k: int = 3, factor: float = 0.1) -> TableSpec:
     """Loads keep arriving on their normal cadence, but the last `last_k` months
     carry ~`factor` of the historical volume."""
+    if not 0 < factor < 1:
+        raise ValueError("a collapse factor must be in (0, 1); use missing_month for 0")
     return _with_override(spec, {spec.n_months - i: factor for i in range(1, last_k + 1)})
 
 
