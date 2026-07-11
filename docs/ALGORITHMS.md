@@ -212,3 +212,59 @@ Duplicates present iff duplicate_rows > 0.
   "updating: GREEN" and "volume: RED" simultaneously — the sustained-collapse
   acceptance case requires exactly that, which is only satisfiable when the
   collapse is OLDER than the maturity horizon while loads continue to arrive.
+
+## 12. Batch metrics (when load_batch_col is configured)
+
+From the (event_month, batch_id) cells; a batch's canonical timestamp is
+MIN(load_time) within the batch — the minimum over its per-month cells, since
+a batch can span cohorts.
+
+- `rows_per_run(b)` = the batch's row count summed over its month cells.
+- `runs_per_month(m)` = distinct batches touching event month m.
+- **Batch-level completion** for month m: order its batches by canonical
+  timestamp T_b; `F_m(T) = sum(rows of batches with T_b <= T) / final_m` —
+  cumulative and WEIGHTED BY BATCH ROW COUNTS (a bulk run moves the curve by
+  its size, a straggler by its size, never one-run-one-vote).
+  `batch_days_to_p(m, p)` = the smallest integer day d (measured from
+  MONTH END, day-grain; negative for in-month batches) such that a batch at
+  month_end + d brings F_m to >= p.
+
+## 13. Parity (two NAMED probes)
+
+Exact parity compares the WATERMARKED per-month population: the curve-eligible
+counts (rows with non-NULL load_time <= as_of and a defined event month).
+NULL-load rows are query-time counts, reported separately and informationally,
+never inside the exact diff.
+
+- Candidate months = the UNION of both sides' observed MATURE months (common
+  mature population by TIME, so a month missing from one side is still a
+  candidate): present on both sides -> compare counts; present on exactly one
+  side -> RED PARITY_ONE_SIDED_MONTH (an explicit diff, never silently
+  dropped). |left - right| > parity_tolerance -> RED PARITY_MISMATCH.
+- Zero-tolerance parity is sound ONLY under VERIFIED prerequisites, checked
+  per run; any failure or unverifiability yields INDETERMINATE with the
+  failing prerequisite as the reason code, never a false mismatch:
+    * uniqueness configured (key_cols) AND zero duplicates on BOTH sides
+      (PARITY_PREREQ_UNIQUENESS),
+    * read_uncommitted disabled on both configs
+      (PARITY_PREREQ_READ_UNCOMMITTED),
+    * negative-lag excess below threshold on both sides
+      (PARITY_PREREQ_NEGATIVE_LAG — the backdating proxy).
+
+## 14. Dual lag and the raw-vs-corrected side-stat
+
+- Dual lag runs as ONE additional pass (per the budget: main + dual = 2 scans
+  <= 3x): the same staging/aggregation shape over (event_month, src_lag_day)
+  — src_lag_day = DATEDIFF(day, event_time, source_insert_time), with the
+  SAME clip/cap/overflow policy as section 6 — plus (delta_day) with
+  delta_day = DATEDIFF(day, source_insert_time, load_time), the per-row
+  upstream-vs-local split, and the () global buckets. Rows with NULL
+  source_insert_time (event present) form their own reported bucket
+  `n_null_source_only`; the dual reconciliation
+  `total = source_eligible + null_event + null_source_only + negative_excluded`
+  must hold.
+- Source-side curves/percentiles reuse the section 2 formulas verbatim.
+- `compare_event_time` side-stat: among curve-eligible rows, count per event
+  month where DATEDIFF(day, event_time, compare_event_time) != 0 or the
+  compare column is NULL (`n_compare_mismatch`, aggregated in the main pass —
+  no extra scan).

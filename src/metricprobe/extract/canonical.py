@@ -103,6 +103,7 @@ STAGING_COLUMNS = (
     "is_join_unmatched",
     "is_base_row",
     "is_ambiguous_base",
+    "is_compare_mismatch",
     "lookup_dup",
     "key_hash",
     "load_time",
@@ -126,6 +127,7 @@ RESULT_COLUMNS = (
     "n_other_exclusions",  # reserved, 0 in v1 — part of the reconciliation contract
     "n_base_rows",  # pre-join base count (via probes); == row_count otherwise
     "n_ambiguous_base_rows",  # base rows matching >1 lookup rows (via probes)
+    "n_compare_mismatch",  # raw-vs-corrected side-stat (compare_event_time)
     "max_lookup_dup",
     "distinct_keys",
     "min_load_time",
@@ -323,6 +325,8 @@ def build_staging_select(
         base_columns.add(table.load_batch_col)
     if table.group_by_alt:
         base_columns.add(table.group_by_alt)
+    if table.compare_event_time:
+        base_columns.add(table.compare_event_time)
     for key in table.key_cols or ():
         base_columns.add(key)
     via = table.event_time_via
@@ -423,6 +427,17 @@ def build_staging_select(
         base_row_flag = sa.cast(sa.literal(1), sa.Integer())
         ambiguous_flag = sa.cast(sa.literal(0), sa.Integer())
 
+    if table.compare_event_time:
+        compare = base.c[table.compare_event_time]
+        # among curve-eligible rows: dates differ at day grain, or compare NULL
+        compare_mismatch = flag(
+            sa.and_(
+                is_eligible,
+                sa.or_(compare.is_(None), DateDiffDay(event, compare) != 0),
+            )
+        )
+    else:
+        compare_mismatch = sa.cast(sa.literal(0), sa.Integer())
     return (
         sa.select(
             month_key,
@@ -439,6 +454,7 @@ def build_staging_select(
             unmatched_flag.label("is_join_unmatched"),
             base_row_flag.label("is_base_row"),
             ambiguous_flag.label("is_ambiguous_base"),
+            compare_mismatch.label("is_compare_mismatch"),
             lookup_dup.label("lookup_dup"),
             key_hash,
             load.label("load_time"),
@@ -503,6 +519,7 @@ def _bucket_sums(staging):
         sa.cast(sa.literal(0), sa.BigInteger()).label("n_other_exclusions"),
         total(staging.c.is_base_row).label("n_base_rows"),
         total(staging.c.is_ambiguous_base).label("n_ambiguous_base_rows"),
+        total(staging.c.is_compare_mismatch).label("n_compare_mismatch"),
         sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
     ]
 

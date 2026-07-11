@@ -64,14 +64,36 @@ class MonthCurve:
                          for d in grid])
 
 
-def build_month_curves(canonical: CanonicalResult, lag_cap: int) -> dict[pd.Period, MonthCurve]:
-    rows = canonical.rows_for("month_lag")
+def curves_from_cells(cells: pd.DataFrame, lag_cap: int) -> dict[pd.Period, MonthCurve]:
+    """Month curves from any (event_month, lag_day, row_count) cell frame —
+    shared by the main pass and the dual-lag source-side pass."""
     curves: dict[pd.Period, MonthCurve] = {}
-    for month_ts, group in rows.groupby("event_month"):
+    for month_ts, group in cells.groupby("event_month"):
         month = pd.Period(month_ts, freq="M")
         counts = group.set_index(group["lag_day"].astype(int))["row_count"].sort_index()
         curves[month] = MonthCurve(month=month, counts=counts, lag_cap=lag_cap)
     return curves
+
+
+def build_month_curves(canonical: CanonicalResult, lag_cap: int) -> dict[pd.Period, MonthCurve]:
+    return curves_from_cells(canonical.rows_for("month_lag"), lag_cap)
+
+
+def complete_back_to(assessment: CompletionAssessment, as_of: pd.Timestamp) -> pd.Timestamp | None:
+    """The headline date: as_of - recommended_wait — "months ending on or
+    before this date are expected >= 95% complete". None when the wait was
+    refused. Deliberately DISTINCT from the maturity horizon."""
+    if assessment.recommended_wait is None:
+        return None
+    return (as_of - pd.Timedelta(days=assessment.recommended_wait)).normalize()
+
+
+def compare_mismatch_by_month(canonical: CanonicalResult) -> dict[pd.Period, int]:
+    """The compare_event_time side-stat (ALGORITHMS.md section 14): per event
+    month, curve-eligible rows whose raw and corrected event dates differ."""
+    cells = canonical.rows_for("month_lag")
+    grouped = cells.groupby("event_month")["n_compare_mismatch"].sum()
+    return {pd.Period(ts, freq="M"): int(count) for ts, count in grouped.items()}
 
 
 def days_to_percentile(curve: MonthCurve, pct: float) -> Percentile:

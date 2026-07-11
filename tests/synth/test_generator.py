@@ -284,6 +284,16 @@ def test_inject_negative_lags():
     assert (lags == 3 * 86_400).all()
 
 
+def test_inject_null_source_insert():
+    from tests.synth.generator import inject_null_source_insert
+
+    spec = dataclasses.replace(TRICKLE, dual_offset_days=2.0)
+    df = generate(spec)
+    out = inject_null_source_insert(df, 0.04, seed=1)
+    assert out["source_insert_time"].isna().sum() == round(0.04 * len(df))
+    assert df["source_insert_time"].notna().all()  # input never mutated
+
+
 def test_inject_nulls():
     df = generate(TRICKLE)
     null_event = inject_null_event_time(df, 0.03, seed=1)

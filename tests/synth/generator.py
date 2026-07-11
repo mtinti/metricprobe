@@ -364,6 +364,13 @@ def inject_null_load_time(df: pd.DataFrame, fraction: float, seed: int = 0) -> p
     return out
 
 
+def inject_null_source_insert(df: pd.DataFrame, fraction: float, seed: int = 0) -> pd.DataFrame:
+    """NULL out source_insert_time on a sample (dual-timestamp tables only)."""
+    out = df.copy()
+    out.loc[out.index[_sample(df, fraction, seed, 707)], "source_insert_time"] = pd.NaT
+    return out
+
+
 # ------------------------------------------------------------------------ loaders
 
 

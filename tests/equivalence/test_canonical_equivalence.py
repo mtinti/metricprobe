@@ -39,6 +39,7 @@ INT_COLUMNS = (
     "n_other_exclusions",
     "n_base_rows",
     "n_ambiguous_base_rows",
+    "n_compare_mismatch",
     "distinct_keys",
 )
 
@@ -236,3 +237,73 @@ def test_scan_budget_enforced_through_the_production_runner(mssql_engine):
         ).scalar_one()
     assert result.scan_budget_reads == 3 * pages
     assert result.target_logical_reads <= result.scan_budget_reads
+
+
+def test_step5_metrics_match_between_dialects(duckdb_engine, mssql_engine):
+    """Dual lag, batch metrics, freshness and the compare side-stat computed
+    from the same batchy dual-timestamp dataset on both engines."""
+    from metricprobe.extract.dual import run_dual_lag
+    from metricprobe.metrics.batch import assess_batch
+    from metricprobe.metrics.completion import compare_mismatch_by_month
+    from metricprobe.metrics.dual_lag import assess_dual_lag
+    from metricprobe.metrics.freshness import assess_freshness
+
+    spec = dataclasses.replace(SPEC, dual_offset_days=2.0, seed=64)
+    df = g.inject_raw_vs_corrected(g.generate(spec), fraction=0.05, shift_days=-35, seed=1)
+    results = []
+    for engine, database, schema in (
+        (duckdb_engine, "memory", "main"),
+        (mssql_engine, "tempdb", "dbo"),
+    ):
+        config = _config(
+            database,
+            schema,
+            source_insert_time="source_insert_time",
+            compare_event_time="event_time_raw",
+        )
+        g.load_via_sqlalchemy(df, engine, "events")
+        canonical = run_canonical(engine, config, AS_OF)
+        dual = run_dual_lag(engine, config, AS_OF)
+        results.append(
+            {
+                "batch": assess_batch(canonical, config),
+                "dual": assess_dual_lag(dual, config, AS_OF),
+                "fresh": assess_freshness(canonical, config, AS_OF),
+                "compare": compare_mismatch_by_month(canonical),
+            }
+        )
+    duck, mssql = results
+    assert duck["batch"].months == mssql["batch"].months
+    assert duck["batch"].rows_per_run == mssql["batch"].rows_per_run
+    assert duck["dual"].source_percentiles == mssql["dual"].source_percentiles
+    assert duck["dual"].delta_histogram.equals(mssql["dual"].delta_histogram)
+    assert duck["dual"].n_null_source_only == mssql["dual"].n_null_source_only
+    assert duck["fresh"] == mssql["fresh"]
+    assert duck["compare"] == mssql["compare"]
+    assert sum(duck["compare"].values()) > 0  # the side-stat actually fired
+
+
+def test_parity_matches_between_dialects(duckdb_engine, mssql_engine):
+    from metricprobe.metrics.parity import ParitySide, assess_parity
+    from metricprobe.metrics.volume import assess_volume
+
+    df = g.generate(dataclasses.replace(SPEC, seed=65))
+    right_df = df[df["event_time"].dt.to_period("M") != "2024-02"].reset_index(drop=True)
+    outcomes = []
+    for engine, database, schema in (
+        (duckdb_engine, "memory", "main"),
+        (mssql_engine, "tempdb", "dbo"),
+    ):
+        sides = []
+        for name, frame in (("events_a", df), ("events_b", right_df)):
+            config = _config(database, schema, table=name, probe_name=f"{name}_probe")
+            g.load_via_sqlalchemy(frame, engine, name)
+            canonical = run_canonical(engine, config, AS_OF)
+            completion = assess_completion(canonical, config, AS_OF)
+            volume = assess_volume(canonical, config, AS_OF, completion)
+            sides.append(ParitySide(config, canonical, completion, volume))
+        outcomes.append(assess_parity(*sides))
+    duck, mssql = outcomes
+    assert duck.rows == mssql.rows
+    assert duck.statuses == mssql.statuses
+    assert any(s.reason is ReasonCode.PARITY_ONE_SIDED_MONTH for s in mssql.statuses)

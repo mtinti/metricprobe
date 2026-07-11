@@ -58,6 +58,7 @@ def test_result_columns_are_frozen():
         "n_other_exclusions",
         "n_base_rows",
         "n_ambiguous_base_rows",
+        "n_compare_mismatch",
         "max_lookup_dup",
         "distinct_keys",
         "min_load_time",
@@ -77,6 +78,7 @@ def test_result_columns_are_frozen():
         "is_join_unmatched",
         "is_base_row",
         "is_ambiguous_base",
+        "is_compare_mismatch",
         "lookup_dup",
         "key_hash",
         "load_time",
@@ -108,6 +110,7 @@ def _config_batch_alt_keys() -> TableConfig:
             "load_batch_col": "batch_run",
             "group_by_alt": "region",
             "key_cols": ["settlement_id", "leg"],
+            "compare_event_time": "settled_on_raw",
         }
     )
 
@@ -255,3 +258,73 @@ def test_scan_budget_check_aborts_with_reason_code():
     with pytest.raises(ProbeAborted) as excinfo:
         check_scan_budget(target_reads=3301, budget_reads=3300, probe_name="p")
     assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_EXCEEDED
+
+# ------------------------------------------------------------- dual-lag pass
+
+
+def test_dual_schema_is_frozen():
+    from metricprobe.extract.dual import (
+        DUAL_GROUPING_SET_IDS,
+        DUAL_GROUPING_WEIGHTS,
+        DUAL_RESULT_COLUMNS,
+    )
+
+    assert DUAL_GROUPING_WEIGHTS == {"event_month": 4, "lag_day": 2, "delta_day": 1}
+    assert DUAL_GROUPING_SET_IDS == {"month_src_lag": 1, "delta": 6, "global": 7}
+    assert DUAL_RESULT_COLUMNS == (
+        "grouping_id",
+        "event_month",
+        "lag_day",
+        "delta_day",
+        "row_count",
+        "n_source_eligible",
+        "n_null_event_time",
+        "n_null_source_only",
+        "n_negative_clipped",
+        "n_negative_lag_excluded",
+        "n_overflow",
+        "n_delta_rows",
+    )
+
+
+def _config_dual() -> TableConfig:
+    return TableConfig.model_validate(
+        {
+            "probe_name": "orders_dual",
+            "database": "demo_retail",
+            "schema": "dbo",
+            "table": "orders",
+            "event_time": "order_date",
+            "load_time": "loaded_at",
+            "source_insert_time": "src_inserted_at",
+        }
+    )
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "mssql"])
+def test_dual_sql_matches_snapshots(dialect):
+    from metricprobe.extract.dual import build_dual_aggregation_query, dual_staging_sql
+
+    statements = {
+        "staging": dual_staging_sql(_config_dual(), dialect),
+        "aggregation": str(
+            build_dual_aggregation_query(_config_dual(), dialect).compile(
+                dialect=_dialect(dialect)
+            )
+        ),
+    }
+    for kind, compiled in statements.items():
+        path = SNAPSHOT_DIR / f"dual_{kind}_{dialect}.sql"
+        if os.environ.get("UPDATE_SNAPSHOTS"):
+            path.write_text(compiled + "\n")
+        assert compiled + "\n" == path.read_text()
+    # the dual pass reads the target exactly once, in its staging statement
+    assert statements["staging"].count("FROM demo_retail.dbo.orders") == 1
+    assert "demo_retail" not in statements["aggregation"]
+
+
+def test_dual_requires_source_and_direct_event_time():
+    from metricprobe.extract.dual import build_dual_staging_select
+
+    with pytest.raises(ValueError, match="source_insert_time"):
+        build_dual_staging_select(_config_basic(), "duckdb")

@@ -39,3 +39,13 @@ def probe(df: pd.DataFrame, config: TableConfig, as_of: str | pd.Timestamp) -> C
         return run_canonical(engine, config, pd.Timestamp(as_of))
     finally:
         engine.dispose()
+
+
+def probe_dual(df: pd.DataFrame, config: TableConfig, as_of: str | pd.Timestamp):
+    from metricprobe.extract.dual import run_dual_lag
+
+    engine = engine_with(df, config.table)
+    try:
+        return run_dual_lag(engine, config, pd.Timestamp(as_of))
+    finally:
+        engine.dispose()
