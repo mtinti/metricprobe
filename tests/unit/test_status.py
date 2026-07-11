@@ -1,6 +1,6 @@
 """Step 2 tests: the typed result/status model — severities with frozen
-precedence, reason codes, and the CLI reduction to exit codes — defined and
-tested before any metric exists."""
+precedence, reason codes, and the full CLI reduction to exit codes 0/1/2 —
+defined and tested before any metric exists."""
 
 import pytest
 from pydantic import ValidationError
@@ -44,10 +44,7 @@ def test_worst_severity_follows_precedence():
     assert worst_severity([]) is Severity.GREEN
 
 
-def test_exit_codes():
-    # Exit 0 = ran, no RED: green/amber/indeterminate/insufficient/skipped all 0.
-    assert exit_code_for([]) == 0
-    assert exit_code_for([s(Severity.GREEN)]) == 0
+def test_exit_codes_full_reduction():
     non_red = [
         s(Severity.AMBER),
         s(Severity.INDETERMINATE),
@@ -55,63 +52,88 @@ def test_exit_codes():
         s(Severity.SKIPPED),
         s(Severity.GREEN),
     ]
+    # Exit 0 = ran, no RED: green/amber/indeterminate/insufficient/skipped all 0.
+    assert exit_code_for([]) == 0
+    assert exit_code_for([s(Severity.GREEN)]) == 0
     assert exit_code_for(non_red) == 0
     # Exit 2 = ran successfully, at least one data-health RED.
     assert exit_code_for(non_red + [s(Severity.RED)]) == 2
+    # Exit 1 = execution error; it dominates everything, because nothing
+    # partial becomes visible — even REDs found before the failure.
+    assert exit_code_for(non_red, execution_error=True) == 1
+    assert exit_code_for(non_red + [s(Severity.RED)], execution_error=True) == 1
+    assert exit_code_for([], execution_error=True) == 1
 
 
 def test_non_green_requires_reason_code():
     with pytest.raises(ValidationError, match="reason"):
         Status(check=Check.VOLUME, severity=Severity.RED)
+
+
+def test_green_must_not_carry_a_reason_code():
+    with pytest.raises(ValidationError, match="green"):
+        Status(check=Check.VOLUME, severity=Severity.GREEN, reason=ReasonCode.MISSING_TABLE)
     assert Status(check=Check.VOLUME, severity=Severity.GREEN).reason is None
 
 
-def test_status_round_trips_for_snapshots():
+def test_status_round_trips_over_the_wire():
     status = Status(
         check=Check.PARITY,
         severity=Severity.INDETERMINATE,
-        reason=ReasonCode.PARITY_PREREQUISITE_FAILED,
+        reason=ReasonCode.PARITY_PREREQ_READ_UNCOMMITTED,
         detail="read_uncommitted enabled on one side",
     )
-    assert Status.model_validate(status.model_dump()) == status
+    # snapshots serialize to JSON, so the JSON-mode dump is the wire format
+    assert Status.model_validate(status.model_dump(mode="json")) == status
 
 
-def test_reason_codes_are_frozen_v1():
+def test_wire_values_are_frozen_v1():
+    # These are the SERIALIZED values stored in snapshots; changing any of them
+    # is a schema change and must bump STATUS_SCHEMA_VERSION.
     assert STATUS_SCHEMA_VERSION == 1
-    assert {code.name for code in ReasonCode} == {
-        "MISSING_TABLE",
-        "ZERO_ROW_MONTH",
-        "VOLUME_GAP",
-        "VOLUME_OUTLIER",
-        "VOLUME_COLLAPSE",
-        "ARRIVAL_DEFICIT",
-        "DUPLICATE_KEYS",
-        "NEGATIVE_LAG_EXCESS",
-        "STALE_FEED",
-        "PARITY_MISMATCH",
-        "PARITY_ONE_SIDED_MONTH",
-        "PARITY_PREREQUISITE_FAILED",
-        "INSUFFICIENT_MATURE_MONTHS",
-        "INSUFFICIENT_EPOCHS",
-        "BACKTEST_DISAGREEMENT",
-        "PERCENTILE_OVER_CAP",
-        "SCAN_BUDGET_EXCEEDED",
-        "RESULT_CELL_CAP_EXCEEDED",
-        "OPTIONAL_TABLE_ABSENT",
-        "JOIN_NOT_UNIQUE",
-        "JOIN_UNMATCHED_ROWS",
-        "RECONCILIATION_MISMATCH",
+    assert {severity.value for severity in Severity} == {
+        "red",
+        "amber",
+        "indeterminate",
+        "insufficient_history",
+        "skipped",
+        "green",
     }
-
-
-def test_checks_are_frozen_v1():
-    assert {check.name for check in Check} == {
-        "VOLUME",
-        "COMPLETION",
-        "FRESHNESS",
-        "UNIQUENESS",
-        "PARITY",
-        "DUAL_LAG",
-        "BATCH",
-        "RECONCILIATION",
+    assert {check.value for check in Check} == {
+        "volume",
+        "completion",
+        "freshness",
+        "uniqueness",
+        "parity",
+        "dual_lag",
+        "batch",
+        "reconciliation",
+    }
+    assert {code.value for code in ReasonCode} == {
+        "missing_table",
+        "zero_row_month",
+        "volume_gap",
+        "volume_outlier",
+        "volume_collapse",
+        "arrival_deficit",
+        "duplicate_keys",
+        "negative_lag_excess",
+        "stale_feed",
+        "parity_mismatch",
+        "parity_one_sided_month",
+        # parity prerequisites are SPECIFIC codes: the contract requires the
+        # failing prerequisite as the reason, never a generic bucket
+        "parity_prereq_uniqueness",
+        "parity_prereq_read_uncommitted",
+        "parity_prereq_negative_lag",
+        "insufficient_mature_months",
+        "insufficient_epochs",
+        "backtest_disagreement",
+        "percentile_over_cap",
+        "scan_budget_exceeded",
+        "result_cell_cap_exceeded",
+        "optional_table_absent",
+        "join_not_unique",
+        "join_unmatched_rows",
+        "reconciliation_mismatch",
     }

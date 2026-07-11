@@ -6,18 +6,22 @@ path, retention) and DeliveryConfig (remotes, refs, worktree, token env-var
 NAMES — never token values).
 
 Contract highlights
-  * Unknown fields are REJECTED at every level (typo safety).
+  * Unknown fields are REJECTED at every level (typo safety); required string
+    fields reject blank/whitespace-only values.
   * schema_version is required and must match CONFIG_SCHEMA_VERSION.
   * Every probe entry needs a unique probe_name, a full table locator
     (database.schema.table) and EXACTLY ONE of event_time XOR event_time_via.
-    The join spec uses `join_on` (not `on`: YAML 1.1 parses a bare `on` key as
-    boolean true, the same foot-gun GitHub Actions lives with).
+    The join spec is the documented {join_table, on: [{base_col, lookup_col}],
+    column} shape; because YAML 1.1 parses a bare `on` key as boolean true, a
+    before-validator normalizes that (and accepts `join_on` as an alias).
   * All analysis parameters are explicit with versioned defaults; validation
     enforces training_cutoff_days >= lag_cap_days so the training cohort covers
     the modeled lag support.
-  * config_digest() hashes the secret-redacted canonical form: URL passwords
-    are masked before hashing, so a credential rotation does not change the
-    digest and the digest can be stored publicly.
+  * config_digest() hashes the secret-redacted canonical form: URL userinfo and
+    secret-named query parameters (password/pwd/token/..., raw or
+    percent-encoded) are masked before hashing, so credential rotation does not
+    change the digest and the digest can be stored publicly. Delivery remote
+    URLs must not embed credentials at all — that is what token_env is for.
   * The YAML loader expands ${ENV_VAR} references and fails loudly, naming
     every undefined variable.
 """
@@ -30,10 +34,19 @@ import os
 import re
 import zoneinfo
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import unquote_plus
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy.engine import make_url
 
 CONFIG_SCHEMA_VERSION = 1
@@ -44,24 +57,65 @@ class ConfigError(Exception):
     or validation failures surfaced through the loader."""
 
 
+def _not_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+NonBlankStr = Annotated[str, AfterValidator(_not_blank)]
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
 class JoinKey(_Model):
-    base_col: str = Field(min_length=1)
-    lookup_col: str = Field(min_length=1)
+    base_col: NonBlankStr
+    lookup_col: NonBlankStr
 
 
 class JoinSpec(_Model):
-    """event_time_via: borrow the event time from a related table. The lookup
-    side must be unique on the join key (asserted at probe time, Step 3)."""
+    """event_time_via: borrow the event time from a related table, in the
+    documented shape {join_table, on, column}. The lookup side must be unique
+    on the join key (asserted at probe time, Step 3)."""
 
-    database: str = Field(min_length=1)
-    table_schema: str = Field(min_length=1, alias="schema")
-    table: str = Field(min_length=1)
-    join_on: tuple[JoinKey, ...] = Field(min_length=1)
-    column: str = Field(min_length=1)
+    join_table: NonBlankStr  # full "database.schema.table" locator
+    on: tuple[JoinKey, ...] = Field(min_length=1)
+    column: NonBlankStr
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_on_key(cls, data):
+        if isinstance(data, dict):
+            # YAML 1.1 parses a bare `on:` mapping key as boolean true
+            if True in data:
+                data = {("on" if key is True else key): value for key, value in data.items()}
+            if "join_on" in data and "on" not in data:
+                data = dict(data)
+                data["on"] = data.pop("join_on")
+        return data
+
+    @model_validator(mode="after")
+    def _locator_shape(self) -> JoinSpec:
+        parts = self.join_table.split(".")
+        if len(parts) != 3 or not all(part.strip() for part in parts):
+            raise ValueError(
+                f'join_table {self.join_table!r} must be a full "database.schema.table" locator'
+            )
+        return self
+
+    @property
+    def database(self) -> str:
+        return self.join_table.split(".")[0]
+
+    @property
+    def table_schema(self) -> str:
+        return self.join_table.split(".")[1]
+
+    @property
+    def table(self) -> str:
+        return self.join_table.split(".")[2]
 
 
 class AnalysisParams(_Model):
@@ -103,20 +157,19 @@ class TableConfig(_Model):
     """One probe entry. A table can be probed multiple times under different
     probe_names (variants are first-class in snapshots, dashboards, figures)."""
 
-    probe_name: str = Field(min_length=1)
-    database: str = Field(min_length=1)
-    table_schema: str = Field(min_length=1, alias="schema")
-    table: str = Field(min_length=1)
-    event_time: str | None = None
+    probe_name: NonBlankStr
+    database: NonBlankStr
+    table_schema: NonBlankStr = Field(alias="schema")
+    table: NonBlankStr
+    event_time: NonBlankStr | None = None
     event_time_via: JoinSpec | None = None
-    load_time: str = Field(min_length=1)
-    source_insert_time: str | None = None
-    load_batch_col: str | None = None
-    group_by_alt: str | None = None
-    key_cols: tuple[str, ...] | None = Field(default=None, min_length=1)
-    compare_event_time: str | None = None
-    parity_with: str | None = None
-    expected_cadence_days: float | None = Field(default=None, gt=0)
+    load_time: NonBlankStr
+    source_insert_time: NonBlankStr | None = None
+    load_batch_col: NonBlankStr | None = None
+    group_by_alt: NonBlankStr | None = None
+    key_cols: tuple[NonBlankStr, ...] | None = Field(default=None, min_length=1)
+    compare_event_time: NonBlankStr | None = None
+    parity_with: NonBlankStr | None = None
     optional: bool = False
     proxy: bool = False
     expect_batchy: bool = False
@@ -152,6 +205,35 @@ class TableConfig(_Model):
         return self
 
 
+# minute, hour, day-of-month, month, day-of-week (0-7, both 0 and 7 = Sunday)
+_CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+_CRON_PART = re.compile(r"^(\*|\d+(?:-\d+)?)(?:/\d+)?$")
+
+
+def _validate_cron(value: str) -> None:
+    fields = value.split()
+    if len(fields) != 5:
+        raise ValueError(f"schedule must be a 5-field cron expression, got {value!r}")
+    for field_text, (low, high) in zip(fields, _CRON_BOUNDS, strict=True):
+        for part in field_text.split(","):
+            match = _CRON_PART.match(part)
+            if not match:
+                raise ValueError(
+                    f"schedule {value!r} is not a valid cron expression: bad field {field_text!r}"
+                )
+            body = match.group(1)
+            if body == "*":
+                continue
+            numbers = [int(number) for number in body.split("-")]
+            if any(not low <= number <= high for number in numbers) or (
+                len(numbers) == 2 and numbers[0] > numbers[1]
+            ):
+                raise ValueError(
+                    f"cron field {field_text!r} is out of range {low}-{high} "
+                    f"in schedule {value!r}"
+                )
+
+
 class CampaignConfig(_Model):
     schedule: str | None = None  # 5-field cron, None = manual-only
     timezone: str = "UTC"
@@ -161,8 +243,8 @@ class CampaignConfig(_Model):
     @field_validator("schedule")
     @classmethod
     def _schedule_is_cron(cls, value: str | None) -> str | None:
-        if value is not None and len(value.split()) != 5:
-            raise ValueError(f"schedule must be a 5-field cron expression, got {value!r}")
+        if value is not None:
+            _validate_cron(value)
         return value
 
     @field_validator("timezone")
@@ -177,7 +259,7 @@ class CampaignConfig(_Model):
 
 class StoreConfig(_Model):
     backend: Literal["duckdb", "parquet", "mssql"] = "duckdb"
-    path: str = "./metricprobe_store"
+    path: NonBlankStr = "./metricprobe_store"
     retention_runs: int | None = Field(default=None, gt=0)  # None = keep all
     mssql_url: str | None = None  # env-expandable; required for backend "mssql"
 
@@ -188,13 +270,14 @@ class StoreConfig(_Model):
         return self
 
 
-_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_VAR_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_URL_WITH_USERINFO = re.compile(r"^[A-Za-z][\w+.-]*://[^/@\s]+@")
 
 
 class DeliveryRemote(_Model):
-    name: str = Field(min_length=1)
-    url: str = Field(min_length=1)
-    ref: str = "main"
+    name: NonBlankStr
+    url: NonBlankStr
+    ref: NonBlankStr = "main"
     token_env: str | None = None
 
     @field_validator("token_env")
@@ -202,15 +285,25 @@ class DeliveryRemote(_Model):
     def _token_env_is_a_name(cls, value: str | None) -> str | None:
         if value is not None and not _ENV_VAR_NAME.match(value):
             raise ValueError(
-                f"token_env {value!r} must be the NAME of an environment variable "
-                "(letters, digits, underscores), never the token value itself"
+                f"token_env {value!r} must be the UPPER_CASE NAME of an environment "
+                "variable (A-Z, digits, underscores), never the token value itself"
+            )
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def _no_embedded_credentials(cls, value: str) -> str:
+        if _URL_WITH_USERINFO.match(value):
+            raise ValueError(
+                f"delivery remote url {value!r} must not embed credentials; "
+                "supply the token through token_env instead"
             )
         return value
 
 
 class DeliveryConfig(_Model):
     remotes: tuple[DeliveryRemote, ...] = Field(min_length=1)
-    worktree: str = "./dashboard_worktree"
+    worktree: NonBlankStr = "./dashboard_worktree"
 
     @model_validator(mode="after")
     def _unique_remote_names(self) -> DeliveryConfig:
@@ -225,7 +318,7 @@ class ProbeConfig(_Model):
     """The complete, versioned configuration for one probe campaign."""
 
     schema_version: int
-    connection_url: str = Field(min_length=1)
+    connection_url: NonBlankStr
     tables: tuple[TableConfig, ...] = Field(min_length=1)
     campaign: CampaignConfig = CampaignConfig()
     store: StoreConfig = StoreConfig()
@@ -309,8 +402,15 @@ def load_config(path: str | Path) -> ProbeConfig:
 
 # ---------------------------------------------------------------------- digest
 
-# user:password@ credentials inside any URL-shaped string value
-_URL_CREDENTIALS = re.compile(r"://([^:/@\s]+):([^@/\s]+)@")
+# any URL userinfo (user, user:password, or bare token) — masked entirely
+_URL_USERINFO = re.compile(r"://[^@/\s]+@")
+# secret-named query/connection-string parameters; strings are percent-decoded
+# first so percent-encoded forms canonicalize to their plain spelling before
+# masking. Over-masking is safe here, under-masking is not.
+_SECRET_PARAM = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|access_token|secret|api_key|apikey|sig|signature)"
+    r"=([^&;\s\"']*)"
+)
 
 
 def _redact(value):
@@ -319,7 +419,9 @@ def _redact(value):
     if isinstance(value, list):
         return [_redact(item) for item in value]
     if isinstance(value, str):
-        return _URL_CREDENTIALS.sub(r"://\1:***@", value)
+        value = unquote_plus(value)  # canonical decoded form for hashing
+        value = _URL_USERINFO.sub("://***@", value)
+        return _SECRET_PARAM.sub(lambda m: f"{m.group(1)}=***", value)
     return value
 
 

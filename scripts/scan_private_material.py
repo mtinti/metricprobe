@@ -84,6 +84,7 @@ _PLACEHOLDER_VALUE = re.compile(
       | dbo | main | public | master | tempdb | information_schema
       | none | null | true | false | yes | no
       | str | int | float | bool | bytes | date | datetime   # type annotations
+      | [A-Za-z_][A-Za-z0-9_]*Str                             # custom str types (NonBlankStr)
     )$""",
     re.IGNORECASE | re.VERBOSE,
 )

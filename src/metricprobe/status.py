@@ -65,7 +65,11 @@ class ReasonCode(StrEnum):
     STALE_FEED = "stale_feed"
     PARITY_MISMATCH = "parity_mismatch"
     PARITY_ONE_SIDED_MONTH = "parity_one_sided_month"
-    PARITY_PREREQUISITE_FAILED = "parity_prerequisite_failed"
+    # parity prerequisites are SPECIFIC codes: the contract requires the failing
+    # prerequisite as the reason (CLAUDE.md metric 5), never a generic bucket
+    PARITY_PREREQ_UNIQUENESS = "parity_prereq_uniqueness"
+    PARITY_PREREQ_READ_UNCOMMITTED = "parity_prereq_read_uncommitted"
+    PARITY_PREREQ_NEGATIVE_LAG = "parity_prereq_negative_lag"
     INSUFFICIENT_MATURE_MONTHS = "insufficient_mature_months"
     INSUFFICIENT_EPOCHS = "insufficient_epochs"
     BACKTEST_DISAGREEMENT = "backtest_disagreement"
@@ -89,9 +93,13 @@ class Status(BaseModel):
     detail: str = ""
 
     @model_validator(mode="after")
-    def _reason_required_unless_green(self) -> Status:
+    def _reason_matches_severity(self) -> Status:
         if self.severity is not Severity.GREEN and self.reason is None:
             raise ValueError(f"a {self.severity.value} status requires a reason code")
+        if self.severity is Severity.GREEN and self.reason is not None:
+            raise ValueError(
+                f"a green status must not carry a reason code (got {self.reason.value})"
+            )
         return self
 
 
@@ -104,7 +112,14 @@ def worst_severity(statuses: Iterable[Status]) -> Severity:
     return Severity.GREEN
 
 
-def exit_code_for(statuses: Iterable[Status]) -> int:
-    """Reduce statuses to the CLI exit code: 2 on any RED, else 0. Exit 1 is
-    the execution-error path and is never derived from statuses."""
+def exit_code_for(statuses: Iterable[Status], *, execution_error: bool = False) -> int:
+    """Reduce a run to its CLI exit code.
+
+    1 = execution error; it dominates everything, because an execution failure
+        means nothing partial becomes visible — even REDs found before it.
+    2 = ran successfully, at least one data-health RED.
+    0 = ran, no RED (amber/indeterminate/insufficient-history/skipped all 0).
+    """
+    if execution_error:
+        return 1
     return 2 if worst_severity(statuses) is Severity.RED else 0

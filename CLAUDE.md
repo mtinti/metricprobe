@@ -29,7 +29,7 @@ and a *load time* column (when the row landed in the warehouse), it answers:
    From each curve: days-to-p50/p90/p95/p99, then mean/std across mature months.
    **Maturity (single-pass, no iteration):** learned_wait is computed from the FIXED
    training cohort (months with month_end <= as_of − training_cutoff_days, default
-   180 — days, like every duration in this system); the classification horizon =
+   365 — days, like every duration in this system); the classification horizon =
    max(training_cutoff_days, learned_wait) (monotone by construction); mature months
    = month_end <= as_of − horizon; re-check `min_mature_months` against THAT set,
    else "insufficient history". **The cutoff must cover the modeled lag support,
