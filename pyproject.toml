@@ -50,6 +50,7 @@ select = ["E", "F", "W", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+pythonpath = ["."]
 markers = [
     "equivalence: compares DuckDB and SQL Server results; needs METRICPROBE_MSSQL_URL",
 ]
