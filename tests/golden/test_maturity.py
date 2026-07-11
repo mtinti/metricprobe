@@ -19,16 +19,22 @@ def _assess(df, config, as_of):
 
 
 def test_exposure_classifies_maturity_never_curve_shape():
-    # A month whose events happened days ago has a curve that ALREADY reads
-    # 100% at its largest observed lag (self-normalized, by construction).
-    # It must still be classified immature — classification is exposure-based.
+    # PLAN: a month with only ~10% of its rows arrived, whose self-normalized
+    # curve nevertheless ALREADY reads 100% at its largest observed lag, must
+    # still be classified immature — classification is exposure-based only.
     spec = g.TableSpec(
         name="events", start_month="2023-01", n_months=30, rows_per_month=2000,
         lag_model=SHORT_LAG, seed=41,
     )
-    as_of = "2025-07-05"  # 2025-06 is only ~5 days old
+    as_of = "2025-06-07"  # 2025-06 events + lognormal lags: ~10% arrived by now
+    df = g.generate(spec)
     config = table_config()
-    canonical, assessment = _assess(g.generate(spec), config, as_of)
+    june = df["event_time"].dt.to_period("M") == "2025-06"
+    arrived_fraction = float(
+        (june & (df["load_time"] <= pd.Timestamp(as_of))).sum() / june.sum()
+    )
+    assert 0.03 <= arrived_fraction <= 0.20, f"fixture drifted: {arrived_fraction:.1%}"
+    canonical, assessment = _assess(df, config, as_of)
     young = pd.Period("2025-06", freq="M")
     curves = build_month_curves(canonical, config.analysis.lag_cap_days)
     observed_max_lag = int(curves[young].counts.index.max())
@@ -36,6 +42,26 @@ def test_exposure_classifies_maturity_never_curve_shape():
     assert young not in assessment.mature_months  # ... and it is still immature
     # while the horizon itself is monotone: max(cutoff, learned_wait)
     assert assessment.horizon >= config.analysis.training_cutoff_days
+
+
+def test_empty_training_cohort_is_insufficient_history_not_green():
+    # 3 months of history, none ending before as_of - 365d: the cohort is
+    # EMPTY. This must surface as insufficient history — never a silent GREEN.
+    spec = g.TableSpec(
+        name="events", start_month="2025-03", n_months=3, rows_per_month=2000,
+        lag_model=SHORT_LAG, seed=48,
+    )
+    config = table_config()
+    _, assessment = _assess(g.generate(spec), config, "2025-07-01")
+    assert assessment.training_months == []
+    assert assessment.learned_wait is None
+    assert assessment.recommended_wait is None
+    assert any(
+        s.severity is Severity.INSUFFICIENT_HISTORY
+        and s.reason is ReasonCode.INSUFFICIENT_MATURE_MONTHS
+        for s in assessment.statuses
+    )
+    assert not any(s.severity is Severity.GREEN for s in assessment.statuses)
 
 
 def test_too_few_mature_months_is_insufficient_history():
@@ -106,9 +132,14 @@ def test_shared_late_tail_is_the_backtests_documented_blind_spot():
     # agree, the backtest stays silent, and the wait is confidently wrong.
     # This test EXPECTS the non-detection: proving completeness would need an
     # external finality signal the data cannot provide.
+    # 10% of every month rides the invisible tail, so the TRUE p95 sits at
+    # day ~1200+ (visible mass reaches only 90% < 95%). The observed, self-
+    # normalized curves complete at ~41d and yield a ~39-day wait — a genuinely
+    # UNDERESTIMATED p95, which the backtest cannot see because every stratum
+    # is censored identically.
     shared_tail = g.TableSpec(
         name="events", start_month="2023-01", n_months=30, rows_per_month=2000,
-        lag_model=g.StepBatches(schedule=((3.0, 0.60), (10.0, 0.37), (1200.0, 0.03))),
+        lag_model=g.StepBatches(schedule=((3.0, 0.60), (10.0, 0.30), (1200.0, 0.10))),
         seed=46,
     )
     config = table_config()
@@ -116,9 +147,8 @@ def test_shared_late_tail_is_the_backtests_documented_blind_spot():
     reasons = {s.reason for s in assessment.statuses}
     assert ReasonCode.BACKTEST_DISAGREEMENT not in reasons
     assert ReasonCode.PERCENTILE_OVER_CAP not in reasons
-    # confidently wrong: the visible schedule (batches at 3d/10d after month
-    # end, so p95 lag ~37d including the within-month wait) yields a ~39-day
-    # wait, blind to the 1200-day tail carrying 3% of every month
+    # true p95 (with the tail visible) would be ~1200d; the confident answer
+    # is under 60d — wrong by a factor of ~20, and undetectably so
     assert assessment.recommended_wait is not None
     assert assessment.recommended_wait < 60
 

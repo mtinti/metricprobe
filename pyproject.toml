@@ -33,9 +33,6 @@ dev = [
     "pymssql>=2.3",
 ]
 
-[project.scripts]
-metricprobe = "metricprobe.cli:main"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/metricprobe"]
 

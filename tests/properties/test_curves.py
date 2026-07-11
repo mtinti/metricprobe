@@ -54,8 +54,10 @@ def test_reconciliation_equation_holds(name):
         + int(row["n_null_load_time_only"])
         + int(row["n_negative_lag_excluded"])
         + int(row["n_join_unmatched"])
+        + int(row["n_other_exclusions"])
     )
     assert int(row["row_count"]) == buckets, name
+    assert int(row["n_base_rows"]) == int(row["row_count"]), name  # pre/post join
 
 
 def test_row_order_invariance():

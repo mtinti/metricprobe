@@ -78,7 +78,7 @@ _PLACEHOLDER_VALUE = re.compile(
       | \{.*                                  # {templated}
       | localhost(?::\d+)?(?:/.*)?
       | 127\.0\.0\.1(?::\d+)?(?:/.*)?
-      | :memory:
+      | :[A-Za-z_][A-Za-z0-9_]*:?                             # :bind_param / :memory:
       | (?:your|example|demo|sample|synth|fake|mock|dummy|placeholder|metricprobe|test)[\w.!-]*
       | server | host | hostname | database | db | dbname | catalog
       | dbo | main | public | master | tempdb | memory | information_schema

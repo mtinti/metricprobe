@@ -57,6 +57,7 @@ rows.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import pandas as pd
@@ -100,6 +101,8 @@ STAGING_COLUMNS = (
     "is_negative_lag_excluded",
     "is_overflow",
     "is_join_unmatched",
+    "is_base_row",
+    "is_ambiguous_base",
     "lookup_dup",
     "key_hash",
     "load_time",
@@ -120,10 +123,18 @@ RESULT_COLUMNS = (
     "n_negative_lag_excluded",
     "n_overflow",
     "n_join_unmatched",
+    "n_other_exclusions",  # reserved, 0 in v1 — part of the reconciliation contract
+    "n_base_rows",  # pre-join base count (via probes); == row_count otherwise
+    "n_ambiguous_base_rows",  # base rows matching >1 lookup rows (via probes)
     "max_lookup_dup",
     "distinct_keys",
     "min_load_time",
 )
+
+# A result CELL is one entry of a grouping set's matrix (e.g. one event-month x
+# lag-day combination). result_cell_cap bounds cells per set; the aggregation
+# query also carries a server-side row limit of cap x set-count + 1 so the
+# database never returns unbounded rows even before the client counts them.
 
 
 class ProbeAborted(Exception):
@@ -203,22 +214,37 @@ def _time_bucket_default(element, compiler, **kw):
 
 class KeyHash(FunctionElement):
     """SHA-256 over a type-tagged, length-prefixed encoding with a distinct
-    NULL sentinel (ALGORITHMS.md section 9). Each dialect's encoding is
-    injective on its own; equivalence compares COUNTS, not hash bytes.
-    Never 32-bit CHECKSUM."""
+    NULL sentinel (ALGORITHMS.md section 9). The type tag is each column's
+    DECLARED type, fetched once from INFORMATION_SCHEMA (a per-row function
+    like sql_variant would reject varchar(max) and cost a call per row). Each
+    dialect's encoding is injective on its own; equivalence compares COUNTS,
+    not hash bytes. Never 32-bit CHECKSUM."""
 
     name = "key_hash"
-    inherit_cache = True
+    inherit_cache = False
+
+    def __init__(self, type_tags: list[str], *cols):
+        if len(type_tags) != len(cols):
+            raise ValueError("one type tag per key column required")
+        self.type_tags = type_tags
+        super().__init__(*cols)
+
+
+def _sql_literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
 
 
 @compiles(KeyHash, "mssql")
 def _key_hash_mssql(element, compiler, **kw):
+    # per column: 0x00 for NULL, else 0x01 + len(tag) + tag + len(value) + value
     parts = []
-    for clause in element.clauses:
+    for tag, clause in zip(element.type_tags, element.clauses, strict=True):
         col = compiler.process(clause, **kw)
+        tag_binary = f"CAST({_sql_literal(tag)} AS varbinary(64))"
         binary = f"CAST({col} AS varbinary(max))"
         parts.append(
             f"CASE WHEN {col} IS NULL THEN 0x00 ELSE CAST(0x01 AS varbinary(max)) "
+            f"+ CAST(CAST(DATALENGTH({tag_binary}) AS int) AS binary(4)) + {tag_binary} "
             f"+ CAST(CAST(DATALENGTH({binary}) AS int) AS binary(4)) + {binary} END"
         )
     return f"HASHBYTES('SHA2_256', {' + '.join(parts)})"
@@ -226,12 +252,16 @@ def _key_hash_mssql(element, compiler, **kw):
 
 @compiles(KeyHash)
 def _key_hash_default(element, compiler, **kw):
+    # same shape on duckdb: NULL sentinel, then length-prefixed type tag and
+    # length-prefixed value
     parts = []
-    for clause in element.clauses:
+    for tag, clause in zip(element.type_tags, element.clauses, strict=True):
         col = compiler.process(clause, **kw)
+        tag_literal = _sql_literal(tag)
         text = f"CAST({col} AS VARCHAR)"
         parts.append(
             f"CASE WHEN {col} IS NULL THEN chr(0) ELSE '1' || "
+            f"lpad(CAST(length({tag_literal}) AS VARCHAR), 10, '0') || {tag_literal} || "
             f"lpad(CAST(length({text}) AS VARCHAR), 10, '0') || {text} END"
         )
     return f"sha256({' || '.join(parts)})"
@@ -275,9 +305,13 @@ def _staging_clause(dialect: str):
     return sa.table(staging_table_name(dialect), *[sa.column(c) for c in STAGING_COLUMNS])
 
 
-def build_staging_select(table: TableConfig, dialect: str) -> sa.Select:
+def build_staging_select(
+    table: TableConfig, dialect: str, key_types: dict[str, str] | None = None
+) -> sa.Select:
     """The ONLY statement that reads the target table: one scan projecting the
-    narrow derived columns, with bindparam `as_of`."""
+    narrow derived columns, with bindparam `as_of`. `key_types` maps each key
+    column to its declared SQL type (the hash's type tag); required when
+    key_cols are configured — the runner fetches them from INFORMATION_SCHEMA."""
     analysis = table.analysis
     cap = analysis.lag_cap_days
     tolerance = analysis.clock_skew_tolerance_days
@@ -306,13 +340,17 @@ def build_staging_select(table: TableConfig, dialect: str) -> sa.Select:
         lookup = _table_clause(
             via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
         )
+        partition = [lookup.c[pair.lookup_col] for pair in via.on]
         lk = (
             sa.select(
                 *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
                 sa.literal(1).label("lk_matched"),
-                sa.func.count()
-                .over(partition_by=[lookup.c[pair.lookup_col] for pair in via.on])
-                .label("lk_dup"),
+                sa.func.count().over(partition_by=partition).label("lk_dup"),
+                # numbers a base row's matches so it is counted ONCE in the
+                # pre-join base count even when the lookup is ambiguous
+                sa.func.row_number()
+                .over(partition_by=partition, order_by=partition)
+                .label("lk_rn"),
             ).subquery("lk")
         )
         event = lk.c[f"lk_{via.column}"]
@@ -361,15 +399,29 @@ def build_staging_select(table: TableConfig, dialect: str) -> sa.Select:
     else:
         alt_key = sa.cast(sa.null(), sa.String()).label("alt_value")
     if table.key_cols:
-        key_hash = KeyHash(*[base.c[key] for key in table.key_cols]).label("key_hash")
+        missing = [key for key in table.key_cols if key not in (key_types or {})]
+        if missing:
+            raise ValueError(
+                f"probe {table.probe_name!r}: declared types required for key "
+                f"column(s) {missing} (the hash type tag)"
+            )
+        key_hash = KeyHash(
+            [key_types[key] for key in table.key_cols],
+            *[base.c[key] for key in table.key_cols],
+        ).label("key_hash")
     else:
         key_hash = sa.cast(sa.null(), sa.String()).label("key_hash")
     if via:
         unmatched_flag = flag(lk.c.lk_matched.is_(None))
         lookup_dup = lk.c.lk_dup
+        # pre-join base count: unmatched rows plus the FIRST match per base row
+        base_row_flag = flag(sa.or_(lk.c.lk_matched.is_(None), lk.c.lk_rn == 1))
+        ambiguous_flag = flag(sa.and_(lk.c.lk_rn == 1, lk.c.lk_dup > 1))
     else:
         unmatched_flag = sa.cast(sa.literal(0), sa.Integer())
         lookup_dup = sa.cast(sa.null(), sa.Integer())
+        base_row_flag = sa.cast(sa.literal(1), sa.Integer())
+        ambiguous_flag = sa.cast(sa.literal(0), sa.Integer())
 
     return (
         sa.select(
@@ -385,6 +437,8 @@ def build_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             flag(is_negative_excluded).label("is_negative_lag_excluded"),
             flag(is_overflow).label("is_overflow"),
             unmatched_flag.label("is_join_unmatched"),
+            base_row_flag.label("is_base_row"),
+            ambiguous_flag.label("is_ambiguous_base"),
             lookup_dup.label("lookup_dup"),
             key_hash,
             load.label("load_time"),
@@ -395,11 +449,16 @@ def build_staging_select(table: TableConfig, dialect: str) -> sa.Select:
     )
 
 
-def staging_sql(table: TableConfig, dialect: str, as_of=None) -> str:
+def staging_sql(
+    table: TableConfig,
+    dialect: str,
+    as_of=None,
+    key_types: dict[str, str] | None = None,
+) -> str:
     """Wrap the staging select as temp-table creation DDL. When as_of is given
     it is rendered as a literal (the runner's execution form); without it the
     bindparam form is kept (the snapshot form)."""
-    select = build_staging_select(table, dialect)
+    select = build_staging_select(table, dialect, key_types=key_types)
     if as_of is not None:
         select = select.params(as_of=as_of)
         compiled = str(
@@ -472,12 +531,18 @@ def build_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
             sa.func.sum(staging.c.is_negative_lag_excluded).label("n_negative_lag_excluded"),
             sa.func.sum(staging.c.is_overflow).label("n_overflow"),
             sa.func.sum(staging.c.is_join_unmatched).label("n_join_unmatched"),
+            sa.cast(sa.literal(0), sa.BigInteger()).label("n_other_exclusions"),
+            sa.func.sum(staging.c.is_base_row).label("n_base_rows"),
+            sa.func.sum(staging.c.is_ambiguous_base).label("n_ambiguous_base_rows"),
             sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
             sa.cast(sa.null(), sa.BigInteger()).label("distinct_keys"),
             sa.func.min(staging.c.load_time).label("min_load_time"),
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))
+        # server-side bound: the database never returns unbounded rows; the
+        # runner still enforces the per-set cell cap while streaming
+        .limit(table.analysis.result_cell_cap * len(sets) + 1)
     )
 
 
@@ -497,6 +562,110 @@ def drop_staging_sql(dialect: str) -> str:
     return f"DROP TABLE {staging_table_name(dialect)}"
 
 
+# ------------------------------------------------------ scan-budget machinery
+
+_STATS_IO_LINE = re.compile(r"Table '([^']+)'\. Scan count \d+, logical reads (\d+)")
+
+
+def check_scan_budget(target_reads: int, budget_reads: int, probe_name: str) -> None:
+    """The frozen numeric budget: logical reads on the TARGET table(s) <= 3x
+    one full scan per probe. Exceeding it ABORTS with SCAN_BUDGET_EXCEEDED."""
+    if target_reads > budget_reads:
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_EXCEEDED,
+            f"probe {probe_name!r}: {target_reads} logical reads on the target "
+            f"table(s) exceed the budget of {budget_reads} (3x one full scan)",
+        )
+
+
+def _bracket(name: str) -> str:
+    return "[" + name.replace("]", "]]") + "]"
+
+
+def _mssql_target_pages(conn, table: TableConfig) -> int | None:
+    """used_page_count of the probed table (+ lookup for via probes); None when
+    the DMV is not readable (budget then unenforced, by design)."""
+    locators = [(table.database, table.table_schema, table.table)]
+    if table.event_time_via is not None:
+        via = table.event_time_via
+        locators.append((via.database, via.table_schema, via.table))
+    total = 0
+    for database, schema, name in locators:
+        try:
+            pages = conn.execute(
+                sa.text(
+                    f"SELECT SUM(used_page_count) FROM {_bracket(database)}.sys."
+                    "dm_db_partition_stats WHERE object_id = OBJECT_ID(:full_name)"
+                ),
+                {"full_name": f"{database}.{schema}.{name}"},
+            ).scalar()
+        except sa.exc.DBAPIError:
+            return None
+        if pages is None:
+            return None
+        total += int(pages)
+    return total
+
+
+def _key_column_types(conn, table: TableConfig, dialect: str) -> dict[str, str]:
+    """Declared types of the key columns from INFORMATION_SCHEMA — a metadata
+    lookup, not a table scan. Used as the hash encoding's type tags."""
+    if dialect == "mssql":
+        sql = (
+            f"SELECT COLUMN_NAME, DATA_TYPE FROM {_bracket(table.database)}."
+            "INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t"
+        )
+        params = {"s": table.table_schema, "t": table.table}
+    else:
+        sql = (
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_catalog = :c AND table_schema = :s AND table_name = :t"
+        )
+        params = {"c": table.database, "s": table.table_schema, "t": table.table}
+    types = {name: data_type for name, data_type in conn.execute(sa.text(sql), params)}
+    missing = [key for key in table.key_cols or () if key not in types]
+    if missing:
+        raise ProbeAborted(
+            ReasonCode.MISSING_TABLE,
+            f"probe {table.probe_name!r}: key column(s) {missing} not found in "
+            f"{table.database}.{table.table_schema}.{table.table}",
+        )
+    return types
+
+
+def _install_message_capture(conn, messages: list[str]) -> bool:
+    """Route server info messages (STATISTICS IO) into `messages`. Supported
+    for pymssql (message handler); best-effort otherwise."""
+    driver = getattr(conn.connection, "driver_connection", None)
+    inner = getattr(driver, "_conn", None)
+    if hasattr(inner, "set_msghandler"):
+
+        def handler(msgstate, severity, srvname, procname, line, text):
+            messages.append(text.decode() if isinstance(text, bytes) else str(text))
+
+        inner.set_msghandler(handler)
+        return True
+    return False
+
+
+def _harvest_cursor_messages(result, messages: list[str]) -> None:
+    """pyodbc exposes info messages on cursor.messages instead."""
+    cursor_messages = getattr(getattr(result, "cursor", None), "messages", None)
+    for entry in cursor_messages or []:
+        messages.append(str(entry[-1] if isinstance(entry, tuple) else entry))
+
+
+def _target_reads_from(messages: list[str], target_tables: set[str]) -> int | None:
+    found = False
+    total = 0
+    for message in messages:
+        for name, count in _STATS_IO_LINE.findall(message):
+            if name in target_tables:
+                found = True
+                total += int(count)
+    return total if found else None
+
+
 # ---------------------------------------------------------------------- runner
 
 
@@ -505,6 +674,8 @@ class CanonicalResult:
     """Typed access to the canonical aggregation, split by grouping set."""
 
     frame: pd.DataFrame
+    target_logical_reads: int | None = None  # measured on mssql when supported
+    scan_budget_reads: int | None = None  # 3x one full scan of the target(s)
 
     def rows_for(self, set_name: str) -> pd.DataFrame:
         gid = GROUPING_SET_IDS[set_name]
@@ -526,15 +697,37 @@ class CanonicalResult:
 
 def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
     """Execute stage -> aggregate -> guard -> drop on one connection; abort on
-    cap or join-uniqueness violations."""
+    scan-budget, cell-cap or join-uniqueness violations."""
     dialect = engine.dialect.name
     cap = table.analysis.result_cell_cap
     counts: dict[int, int] = {}
     rows = []
     guard_distinct = None
+    target_reads = budget = None
     with engine.connect() as conn:
-        conn.exec_driver_sql(staging_sql(table, dialect, as_of=pd.Timestamp(as_of)))
+        # scan-budget enforcement (mssql): only the staging statement touches
+        # the target table(s), so its STATISTICS IO carries the whole cost —
+        # the aggregation and the distinct-count guard read the scratch table
+        key_types = _key_column_types(conn, table, dialect) if table.key_cols else None
+        messages: list[str] = []
+        pages = None
+        if dialect == "mssql":
+            pages = _mssql_target_pages(conn, table)
+            _install_message_capture(conn, messages)
+            conn.exec_driver_sql("SET STATISTICS IO ON")
+        staging_result = conn.exec_driver_sql(
+            staging_sql(table, dialect, as_of=pd.Timestamp(as_of), key_types=key_types)
+        )
+        _harvest_cursor_messages(staging_result, messages)
         try:
+            if pages is not None:
+                target_tables = {table.table}
+                if table.event_time_via is not None:
+                    target_tables.add(table.event_time_via.table)
+                target_reads = _target_reads_from(messages, target_tables)
+                if target_reads is not None:
+                    budget = 3 * pages
+                    check_scan_budget(target_reads, budget, table.probe_name)
             result = conn.execute(build_aggregation_query(table, dialect))
             keys = result.keys()
             for row in result:
@@ -557,13 +750,17 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
     if guard_distinct is not None:
         global_mask = frame["grouping_id"] == GROUPING_SET_IDS["global"]
         frame.loc[global_mask, "distinct_keys"] = guard_distinct
-    result = CanonicalResult(frame=frame)
+    result = CanonicalResult(
+        frame=frame, target_logical_reads=target_reads, scan_budget_reads=budget
+    )
     if table.event_time_via is not None:
         max_dup = result.global_row["max_lookup_dup"]
         if pd.notna(max_dup) and int(max_dup) > 1:
+            ambiguous = int(result.global_row["n_ambiguous_base_rows"])
             raise ProbeAborted(
                 ReasonCode.JOIN_NOT_UNIQUE,
                 f"probe {table.probe_name!r}: lookup side of event_time_via is not "
-                f"unique on the join key (a key matches {int(max_dup)} rows)",
+                f"unique on the join key (worst key matches {int(max_dup)} rows; "
+                f"{ambiguous} base rows are ambiguous)",
             )
     return result

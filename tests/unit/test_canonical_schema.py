@@ -56,6 +56,9 @@ def test_result_columns_are_frozen():
         "n_negative_lag_excluded",
         "n_overflow",
         "n_join_unmatched",
+        "n_other_exclusions",
+        "n_base_rows",
+        "n_ambiguous_base_rows",
         "max_lookup_dup",
         "distinct_keys",
         "min_load_time",
@@ -73,6 +76,8 @@ def test_result_columns_are_frozen():
         "is_negative_lag_excluded",
         "is_overflow",
         "is_join_unmatched",
+        "is_base_row",
+        "is_ambiguous_base",
         "lookup_dup",
         "key_hash",
         "load_time",
@@ -141,9 +146,16 @@ def _dialect(dialect_name: str):
     return sa.create_engine("duckdb:///:memory:").dialect
 
 
+# declared key-column types for the snapshot form (the runner fetches these
+# from INFORMATION_SCHEMA at probe time)
+KEY_TYPES = {"settlement_id": "bigint", "leg": "varchar"}
+
+
 def _statements(config: TableConfig, dialect_name: str) -> dict[str, str]:
     out = {
-        "staging": staging_sql(config, dialect_name),
+        "staging": staging_sql(
+            config, dialect_name, key_types=KEY_TYPES if config.key_cols else None
+        ),
         "aggregation": str(
             build_aggregation_query(config, dialect_name).compile(dialect=_dialect(dialect_name))
         ),
@@ -191,3 +203,36 @@ def test_as_of_predicate_keeps_null_loads():
         for dialect in ("duckdb", "mssql"):
             sql = _statements(case(), dialect)["staging"]
             assert "IS NULL" in sql.split("WHERE", 1)[1]
+
+
+def test_key_hash_encoding_is_type_tagged():
+    # the hard rule: type-tagged, length-prefixed, distinct NULL sentinel —
+    # tags are the DECLARED column types, embedded as literals
+    mssql_sql = _statements(_config_batch_alt_keys(), "mssql")["staging"]
+    assert "CAST('bigint' AS varbinary(64))" in mssql_sql
+    assert "CAST('varchar' AS varbinary(64))" in mssql_sql
+    assert "HASHBYTES('SHA2_256'" in mssql_sql and "CHECKSUM" not in mssql_sql
+    duckdb_sql = _statements(_config_batch_alt_keys(), "duckdb")["staging"]
+    assert "'bigint'" in duckdb_sql and "sha256(" in duckdb_sql
+    # missing declared types fail loudly at build time
+    with pytest.raises(ValueError, match="declared types required"):
+        staging_sql(_config_batch_alt_keys(), "duckdb")
+
+
+def test_aggregation_carries_a_server_side_row_bound():
+    # the database must never return unbounded rows, independent of the
+    # client-side per-set cell counting
+    mssql_sql = _statements(_config_batch_alt_keys(), "mssql")["aggregation"]
+    assert "TOP" in mssql_sql
+    duckdb_sql = _statements(_config_batch_alt_keys(), "duckdb")["aggregation"]
+    assert "LIMIT" in duckdb_sql
+
+
+def test_scan_budget_check_aborts_with_reason_code():
+    from metricprobe.extract.canonical import ProbeAborted, check_scan_budget
+    from metricprobe.status import ReasonCode
+
+    check_scan_budget(target_reads=3000, budget_reads=3300, probe_name="p")  # within
+    with pytest.raises(ProbeAborted) as excinfo:
+        check_scan_budget(target_reads=3301, budget_reads=3300, probe_name="p")
+    assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_EXCEEDED

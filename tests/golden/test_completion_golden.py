@@ -259,6 +259,8 @@ def test_via_unmatched_rows_are_counted_and_reconciled():
     assert int(row["n_null_event_time"]) == 50
     # pre/post reconciliation: unique lookup => post-join count == base count
     assert int(row["row_count"]) == len(base)
+    assert int(row["n_base_rows"]) == len(base)
+    assert int(row["n_ambiguous_base_rows"]) == 0
 
 
 def test_via_non_unique_lookup_fails_loudly():
@@ -267,6 +269,8 @@ def test_via_non_unique_lookup_fails_loudly():
     with pytest.raises(ProbeAborted) as excinfo:
         _probe_via(base, duplicated, _via_config([{"base_col": "referral_id", "lookup_col": "id"}]))
     assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+    # ambiguous base rows are counted and reported in the abort detail
+    assert "5 base rows are ambiguous" in excinfo.value.detail
 
 
 def test_via_percentiles_match_generator_expectations():

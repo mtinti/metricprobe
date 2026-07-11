@@ -8,6 +8,7 @@ observed lag, so curve shape carries no censoring signal.
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -15,6 +16,7 @@ import pandas as pd
 
 from metricprobe.config import TableConfig
 from metricprobe.extract.canonical import CanonicalResult
+from metricprobe.metrics.robust import median_of_curves
 from metricprobe.metrics.robust import recommended_wait as _wait_formula
 from metricprobe.status import Check, ReasonCode, Severity, Status
 
@@ -98,6 +100,23 @@ def _wait_over(months: list[pd.Period], p95s: dict[pd.Period, Percentile]) -> in
     return _wait_formula([p95s[m].value for m in months])
 
 
+def percentile_summary(
+    percentiles: dict, months: list
+) -> dict[int, tuple[float, float] | None]:
+    """Per-percentile (mean, population std) across the given months — the
+    headline 'days-to-pXX, mean/std across mature months' (CLAUDE.md metric 2).
+    None for a percentile when there are no months or any month is over-cap."""
+    summary: dict[int, tuple[float, float] | None] = {}
+    for pct in PERCENTILES:
+        values = [percentiles[m][pct] for m in months]
+        if not values or any(p.over_cap for p in values):
+            summary[pct] = None
+        else:
+            numbers = [p.value for p in values]
+            summary[pct] = (statistics.fmean(numbers), statistics.pstdev(numbers))
+    return summary
+
+
 @dataclass
 class CompletionAssessment:
     percentiles: dict[pd.Period, dict[int, Percentile]]
@@ -106,6 +125,9 @@ class CompletionAssessment:
     horizon: int | None
     mature_months: list[pd.Period]
     recommended_wait: int | None
+    # per-percentile (mean, population std) across MATURE months; None entries
+    # when there are no mature months or a percentile is censored
+    mature_percentile_summary: dict[int, tuple[float, float] | None]
     f_mature: pd.Series | None  # index: lag day grid, values: median fraction
     negative_lag_excess_fraction: float
     statuses: list[Status] = field(default_factory=list)
@@ -132,6 +154,7 @@ def assess_completion(
         + g["n_null_load_time_only"]
         + g["n_negative_lag_excluded"]
         + g["n_join_unmatched"]
+        + g["n_other_exclusions"]
     )
     if bucket_sum != int(g["row_count"]):
         statuses.append(
@@ -140,6 +163,17 @@ def assess_completion(
                 severity=Severity.RED,
                 reason=ReasonCode.RECONCILIATION_MISMATCH,
                 detail=f"total_rows={int(g['row_count'])} != bucket sum={bucket_sum}",
+            )
+        )
+    if table.event_time_via is not None and int(g["n_base_rows"]) != int(g["row_count"]):
+        # pre/post join reconciliation: with a unique lookup these are equal
+        statuses.append(
+            Status(
+                check=Check.RECONCILIATION,
+                severity=Severity.RED,
+                reason=ReasonCode.RECONCILIATION_MISMATCH,
+                detail=f"pre-join base rows {int(g['n_base_rows'])} != post-join "
+                f"rows {int(g['row_count'])}",
             )
         )
 
@@ -166,6 +200,17 @@ def assess_completion(
     cutoff_edge = as_of - pd.Timedelta(days=analysis.training_cutoff_days)
     training = [m for m in months if month_end(m) <= cutoff_edge]
     learned_wait = _wait_over(training, p95s)
+    if not training:
+        # an empty cohort is insufficient history, never a silent GREEN
+        statuses.append(
+            Status(
+                check=Check.COMPLETION,
+                severity=Severity.INSUFFICIENT_HISTORY,
+                reason=ReasonCode.INSUFFICIENT_MATURE_MONTHS,
+                detail="training cohort is empty: no month ends on or before "
+                f"as_of - training_cutoff_days ({cutoff_edge.date()})",
+            )
+        )
     if training and learned_wait is None:
         statuses.append(
             Status(
@@ -247,8 +292,8 @@ def assess_completion(
     f_mature = None
     if mature:
         grid = np.arange(0, analysis.lag_cap_days + 2)
-        stacked = np.vstack([curves[m].cumulative(grid) for m in mature])
-        f_mature = pd.Series(np.median(stacked, axis=0), index=grid)
+        stacked = [list(curves[m].cumulative(grid)) for m in mature]
+        f_mature = pd.Series(median_of_curves(stacked), index=grid)
 
     if not statuses:
         statuses.append(Status(check=Check.COMPLETION, severity=Severity.GREEN))
@@ -260,6 +305,7 @@ def assess_completion(
         horizon=horizon,
         mature_months=mature,
         recommended_wait=rec_wait,
+        mature_percentile_summary=percentile_summary(percentiles, mature),
         f_mature=f_mature,
         negative_lag_excess_fraction=excess,
         statuses=statuses,

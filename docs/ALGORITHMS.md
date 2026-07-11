@@ -15,9 +15,12 @@ crossed, an integer.
 - `MAD(x) = median(|x_i - median(x)|)` — median absolute deviation.
 - `robust_sigma(x) = 1.4826 * MAD(x)` — the normal-consistency scaling, so a
   Gaussian sample yields sigma ~= standard deviation.
-- **Zero-MAD fallback**: when `MAD == 0` (perfectly regular values), callers
-  use an explicit fallback tolerance instead of a zero band:
-  `robust_sigma_or(x, fallback) = robust_sigma(x) if MAD(x) > 0 else fallback`.
+- **Zero-MAD fallback** (frozen in CLAUDE.md): a RELATIVE FLOOR, not an
+  exact-zero special case —
+  `robust_sigma_floor(x, rel_tol) = max(robust_sigma(x), rel_tol * median(x))`.
+  Perfectly regular AND nearly regular values both get at least rel_tol of
+  their median as spread. v1 default `rel_tol = 0.05` where no explicit
+  tolerance is configured (freshness uses its configured absolute tolerance).
 
 ## 2. Completion curves and day-grain percentiles
 
@@ -51,8 +54,12 @@ pstdev 0, so the wait equals that month's p95). If ANY month in M is over-cap,
 the wait is refused (PERCENTILE_OVER_CAP).
 
 - `learned_wait` = recommended_wait over the TRAINING cohort (fixed: months
-  with `month_end <= as_of - training_cutoff_days`).
+  with `month_end <= as_of - training_cutoff_days`). An EMPTY cohort is
+  insufficient history, never a silent green.
 - The user-facing `recommended_wait` = the same formula over MATURE months.
+- Headline percentile summary: for each of p50/p90/p95/p99, the (mean,
+  population std) across mature months — undefined when any mature month's
+  percentile is over-cap.
 - "complete back to" date = `as_of - recommended_wait` (Step 5 wiring).
 
 ## 4. Maturity (single-pass, exposure-based)
@@ -119,7 +126,13 @@ total_rows = curve_eligible + null_event_time + null_load_time_only
 - `null_load_time_only`: event time present, load_time NULL (query-time count,
   not watermarked by as_of).
 - `join_unmatched` (via-joins only): no lookup row matched.
-- `other_exclusions`: reserved, 0 in v1.
+- `other_exclusions`: reserved, 0 in v1 — carried explicitly in the result
+  schema so the equation is complete.
+
+Via-joins additionally report `n_base_rows` (pre-join base count: unmatched
+rows plus the FIRST match per base row) and `n_ambiguous_base_rows` (base rows
+matching more than one lookup row). The pre/post reconciliation
+`n_base_rows == total_rows` must hold; ambiguity aborts the probe.
 
 The equation must hold exactly; violation is RECONCILIATION_MISMATCH (RED) —
 it ties completion to volume counts from the ONE canonical aggregation.
@@ -144,6 +157,9 @@ band(t) = expected(t) ± expected_fill_band_mads * sigma_band(t)
 
 `duplicate_rows = total_rows - COUNT(DISTINCT key_hash)` where key_hash is
 SHA-256 over a type-tagged, length-prefixed binary encoding with a distinct
-NULL sentinel (delimiter concatenation is ambiguous). The check is documented
-as probabilistic: SHA-256 collision odds are negligible; encoding ambiguity was
-the real risk. Never 32-bit CHECKSUM. Duplicates present iff duplicate_rows > 0.
+NULL sentinel. Per column: `0x00` for NULL, else `0x01` + length-prefixed TYPE
+TAG (the value's base SQL type: SQL_VARIANT_PROPERTY BaseType on mssql,
+typeof on duckdb) + length-prefixed value bytes. Delimiter concatenation is
+ambiguous; the check is documented as probabilistic: SHA-256 collision odds
+are negligible; encoding ambiguity was the real risk. Never 32-bit CHECKSUM.
+Duplicates present iff duplicate_rows > 0.

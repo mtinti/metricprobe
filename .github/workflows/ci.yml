@@ -25,12 +25,20 @@ jobs:
       - run: .venv/bin/python -m ruff check .
       - run: .venv/bin/python -m pytest -m "not equivalence"
 
-  equivalence:
-    # SQL Server container images exist for Linux x86-64 only (the sole platform
-    # Microsoft supports). On GitHub this label resolves to x86-64; on Gitea it is
-    # an administrator-defined label, so the first step below asserts the platform
-    # executably and fails fast on a mislabeled runner.
+  # SQL Server container images exist for Linux x86-64 only (the sole platform
+  # Microsoft supports). On GitHub the ubuntu-24.04 label resolves to x86-64; on
+  # Gitea it is administrator-defined — and service containers are provisioned
+  # BEFORE any step runs, so the platform must be asserted in a service-free
+  # preflight job that gates the equivalence job.
+  equivalence-preflight:
     runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/assert_runner_arch.py
+
+  equivalence:
+    runs-on: ubuntu-24.04
+    needs: equivalence-preflight
     services:
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
@@ -44,7 +52,6 @@ jobs:
       METRICPROBE_MSSQL_URL: "mssql+pymssql://sa:Metricprobe1!@localhost:1433/tempdb"
     steps:
       - uses: actions/checkout@v4
-      - run: python3 scripts/assert_runner_arch.py
       - run: python3 -m venv .venv
       - run: .venv/bin/python -m pip install --upgrade pip
       - run: .venv/bin/python -m pip install -e ".[dev]"

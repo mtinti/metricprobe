@@ -1,23 +1,19 @@
 """Step 3 equivalence: the identical synthetic dataset loaded into DuckDB and a
 real SQL Server must yield the same canonical aggregation and the same
-completion percentiles — plus the scan budget measured in LOGICAL READS."""
+completion percentiles — including via-joins, group_by_alt, and the scan
+budget enforced through the production runner."""
 
 import dataclasses
-import re
 
 import pandas as pd
+import pytest
 import sqlalchemy as sa
 from tests.synth import generator as g
 
 from metricprobe.config import TableConfig
-from metricprobe.extract.canonical import (
-    build_aggregation_query,
-    build_uniqueness_query,
-    drop_staging_sql,
-    run_canonical,
-    staging_sql,
-)
+from metricprobe.extract.canonical import ProbeAborted, run_canonical
 from metricprobe.metrics.completion import assess_completion
+from metricprobe.status import ReasonCode
 
 AS_OF = pd.Timestamp("2026-07-01")
 
@@ -30,6 +26,22 @@ SPEC = g.TableSpec(
     seed=61,
 )
 
+INT_COLUMNS = (
+    "lag_day",
+    "row_count",
+    "n_curve_eligible",
+    "n_null_event_time",
+    "n_null_load_time_only",
+    "n_negative_clipped",
+    "n_negative_lag_excluded",
+    "n_overflow",
+    "n_join_unmatched",
+    "n_other_exclusions",
+    "n_base_rows",
+    "n_ambiguous_base_rows",
+    "distinct_keys",
+)
+
 
 def _dataset() -> pd.DataFrame:
     # exercise every bucket: nulls, in-tolerance and beyond-tolerance negatives
@@ -40,7 +52,7 @@ def _dataset() -> pd.DataFrame:
     return df
 
 
-def _config(database: str, schema: str) -> TableConfig:
+def _config(database: str, schema: str, **overrides) -> TableConfig:
     return TableConfig.model_validate(
         {
             "probe_name": "events_probe",
@@ -52,24 +64,18 @@ def _config(database: str, schema: str) -> TableConfig:
             "load_batch_col": "batch_id",
             "key_cols": ["row_id", "batch_id"],
         }
+        | overrides
     )
 
 
 def _normalized(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    out["event_month"] = pd.to_datetime(out["event_month"])
-    out["load_epoch_day"] = pd.to_datetime(out["load_epoch_day"])
-    out["min_load_time"] = pd.to_datetime(out["min_load_time"])
-    for col in ("lag_day", "row_count", "n_curve_eligible", "n_null_event_time",
-                "n_null_load_time_only", "n_negative_clipped", "n_negative_lag_excluded",
-                "n_overflow", "n_join_unmatched", "distinct_keys"):
+    for col in ("event_month", "load_epoch_day", "min_load_time"):
+        out[col] = pd.to_datetime(out[col])
+    for col in INT_COLUMNS:
         out[col] = out[col].astype("Int64")
-    keys = ["grouping_id", "event_month", "lag_day", "load_epoch_day", "batch_id"]
-    return (
-        out.drop(columns=["max_lookup_dup"])
-        .sort_values(keys)
-        .reset_index(drop=True)
-    )
+    keys = ["grouping_id", "event_month", "lag_day", "load_epoch_day", "batch_id", "alt_value"]
+    return out.drop(columns=["max_lookup_dup"]).sort_values(keys).reset_index(drop=True)
 
 
 def test_canonical_pass_matches_between_duckdb_and_mssql(duckdb_engine, mssql_engine):
@@ -88,82 +94,97 @@ def test_canonical_pass_matches_between_duckdb_and_mssql(duckdb_engine, mssql_en
     assert duck_result.percentiles == mssql_result.percentiles
     assert duck_result.recommended_wait == mssql_result.recommended_wait
     assert duck_result.learned_wait == mssql_result.learned_wait
+    assert duck_result.mature_percentile_summary == mssql_result.mature_percentile_summary
 
 
-STATS_IO_LINE = re.compile(r"Table '([^']+)'\. Scan count \d+, logical reads (\d+)")
-
-
-def _target_table_reads(engine, sql_statements) -> dict[str, int]:
-    """Execute raw SQL statements with SET STATISTICS IO ON and sum per-table
-    logical reads from the captured info messages (pymssql message handler)."""
-    reads: dict[str, int] = {}
-    messages: list[str] = []
-
-    def handler(msgstate, severity, srvname, procname, line, text):
-        messages.append(text.decode() if isinstance(text, bytes) else str(text))
-
-    raw = engine.raw_connection()
-    try:
-        raw.driver_connection._conn.set_msghandler(handler)
-        cursor = raw.cursor()
-        cursor.execute("SET STATISTICS IO ON")
-        for sql in sql_statements:
-            cursor.execute(sql)
-            if cursor.description is not None:
-                cursor.fetchall()
-            while cursor.nextset():
-                pass
-    finally:
-        raw.close()
-    for message in messages:
-        for table, count in STATS_IO_LINE.findall(message):
-            reads[table] = reads.get(table, 0) + int(count)
-    return reads
-
-
-def test_scan_budget_in_logical_reads(mssql_engine):
-    """The probe (canonical pass + distinct-count guard, which is counted) must
-    cost <= 3x one full scan of the TARGET TABLE, in SQL Server logical reads.
-    Measured per table via STATISTICS IO: tempdb worktable spool pages are the
-    aggregation's own scratch space, not pressure on the production table."""
-    df = g.generate(dataclasses.replace(SPEC, rows_per_month=30_000, seed=62))
-    g.load_via_sqlalchemy(df, mssql_engine, "events_budget")
-    config = TableConfig.model_validate(
+def _via_dataset():
+    df = g.generate(dataclasses.replace(SPEC, seed=63))
+    base = pd.DataFrame(
         {
-            "probe_name": "events_budget_probe",
-            "database": "tempdb",
-            "schema": "dbo",
-            "table": "events_budget",
-            "event_time": "event_time",
-            "load_time": "load_time",
-            "load_batch_col": "batch_id",
-            "key_cols": ["row_id", "batch_id"],
+            "referral_id": df["row_id"],
+            "site_code": df["row_id"] % 5,
+            "region": (df["row_id"] % 3).map({0: "north", 1: "south", 2: "west"}),
+            "load_time": df["load_time"],
+            "batch_id": df["batch_id"],
         }
     )
+    lookup = pd.DataFrame(
+        {"id": df["row_id"], "site": df["row_id"] % 5, "referral_date": df["event_time"]}
+    )
+    lookup = lookup.iloc[200:].copy()  # 200 unmatched base rows
+    lookup.iloc[:80, lookup.columns.get_loc("referral_date")] = pd.NaT  # matched, NULL column
+    return base, lookup
+
+
+def _via_config(database: str, schema: str) -> TableConfig:
+    return TableConfig.model_validate(
+        {
+            "probe_name": "episodes_via",
+            "database": database,
+            "schema": schema,
+            "table": "events",
+            "load_time": "load_time",
+            "group_by_alt": "region",
+            "event_time_via": {
+                "join_table": f"{database}.{schema}.referrals",
+                "on": [
+                    {"base_col": "referral_id", "lookup_col": "id"},
+                    {"base_col": "site_code", "lookup_col": "site"},
+                ],
+                "column": "referral_date",
+            },
+        }
+    )
+
+
+def test_via_join_and_alt_grouping_match_between_dialects(duckdb_engine, mssql_engine):
+    # composite differently-named keys + unmatched rows + NULL borrowed column
+    # + group_by_alt: all dialect-sensitive paths execute on the REAL server
+    base, lookup = _via_dataset()
+    for engine in (duckdb_engine, mssql_engine):
+        g.load_via_sqlalchemy(base, engine, "events")
+        g.load_via_sqlalchemy(lookup, engine, "referrals")
+    duck = run_canonical(duckdb_engine, _via_config("memory", "main"), AS_OF)
+    mssql = run_canonical(mssql_engine, _via_config("tempdb", "dbo"), AS_OF)
+    pd.testing.assert_frame_equal(
+        _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
+    )
+    row = mssql.global_row
+    assert int(row["n_join_unmatched"]) == 200
+    assert int(row["n_base_rows"]) == len(base)
+
+
+def test_via_non_unique_lookup_aborts_on_both_dialects(duckdb_engine, mssql_engine):
+    base, lookup = _via_dataset()
+    duplicated = pd.concat([lookup, lookup.iloc[:7]], ignore_index=True)
+    for engine, config in (
+        (duckdb_engine, _via_config("memory", "main")),
+        (mssql_engine, _via_config("tempdb", "dbo")),
+    ):
+        g.load_via_sqlalchemy(base, engine, "events")
+        g.load_via_sqlalchemy(duplicated, engine, "referrals")
+        with pytest.raises(ProbeAborted) as excinfo:
+            run_canonical(engine, config, AS_OF)
+        assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+        assert "7 base rows are ambiguous" in excinfo.value.detail
+
+
+def test_scan_budget_enforced_through_the_production_runner(mssql_engine):
+    """run_canonical itself measures target-table logical reads (STATISTICS IO
+    via the driver) against 3x one full scan and records both on the result.
+    The staging design keeps the target at ~1 scan, so a healthy probe passes
+    with plenty of headroom; check_scan_budget's abort path is unit-tested."""
+    df = g.generate(dataclasses.replace(SPEC, rows_per_month=30_000, seed=62))
+    g.load_via_sqlalchemy(df, mssql_engine, "events")
+    result = run_canonical(mssql_engine, _config("tempdb", "dbo"), AS_OF)
+    assert result.target_logical_reads is not None, "budget measurement did not run"
+    assert result.scan_budget_reads is not None
     with mssql_engine.connect() as conn:
         pages = conn.execute(
             sa.text(
                 "SELECT SUM(used_page_count) FROM sys.dm_db_partition_stats "
-                "WHERE object_id = OBJECT_ID('dbo.events_budget')"
+                "WHERE object_id = OBJECT_ID('dbo.events')"
             )
         ).scalar_one()
-    def literal_sql(query) -> str:
-        return str(
-            query.compile(
-                dialect=mssql_engine.dialect, compile_kwargs={"literal_binds": True}
-            )
-        )
-
-    sql_statements = [
-        staging_sql(config, "mssql", as_of=AS_OF),
-        literal_sql(build_aggregation_query(config, "mssql")),
-        literal_sql(build_uniqueness_query(config, "mssql")),
-        drop_staging_sql("mssql"),
-    ]
-    reads = _target_table_reads(mssql_engine, sql_statements)
-    target_reads = reads.get("events_budget", 0)
-    assert pages > 0 and target_reads > 0
-    assert target_reads <= 3 * pages, (
-        f"probe cost {target_reads} logical reads on the target table "
-        f"({pages} pages; budget 3x one scan). All reads: {reads}"
-    )
+    assert result.scan_budget_reads == 3 * pages
+    assert result.target_logical_reads <= result.scan_budget_reads
