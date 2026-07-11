@@ -119,6 +119,7 @@ def test_wire_values_are_frozen_v1():
         "duplicate_keys",
         "negative_lag_excess",
         "stale_feed",
+        "null_batch_ids",
         "parity_mismatch",
         "parity_one_sided_month",
         # parity prerequisites are SPECIFIC codes: the contract requires the

@@ -32,6 +32,7 @@ import sqlalchemy as sa
 
 from metricprobe.config import TableConfig
 from metricprobe.extract.canonical import (
+    NEGATIVE_LAG_SENTINEL,
     DateDiffDay,
     GroupingSetsClause,
     MonthFloor,
@@ -39,10 +40,13 @@ from metricprobe.extract.canonical import (
     _dialect_instance,
     _harvest_cursor_messages,
     _install_message_capture,
+    _mssql_staging_pages,
     _mssql_target_pages,
+    _scratch_reads_from,
     _table_clause,
     _target_reads_from,
     verify_scan_budget,
+    verify_scratch_budget,
 )
 from metricprobe.status import ReasonCode
 
@@ -92,27 +96,50 @@ def _dual_staging_clause(dialect: str):
 
 
 def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
-    """The one target-table scan of the dual pass."""
+    """The one target-table scan of the dual pass. event_time_via is supported:
+    the event time is borrowed through the same join shape as the main pass
+    (whose run already asserted lookup uniqueness — join validation piggybacks
+    there); unmatched rows surface as NULL event time here."""
     if not table.source_insert_time:
         raise ValueError(f"probe {table.probe_name!r} has no source_insert_time")
-    if not table.event_time:
-        raise ValueError(
-            f"probe {table.probe_name!r}: dual lag with event_time_via is not "
-            "supported in v1 (the borrowed-event pass carries no source column)"
-        )
     analysis = table.analysis
     cap = analysis.lag_cap_days
     tolerance = analysis.clock_skew_tolerance_days
 
-    columns = sorted({table.event_time, table.load_time, table.source_insert_time})
-    base = _table_clause(table.database, table.table_schema, table.table, columns, dialect)
-    event = base.c[table.event_time]
+    base_columns = {table.load_time, table.source_insert_time}
+    via = table.event_time_via
+    if via:
+        for pair in via.on:
+            base_columns.add(pair.base_col)
+    else:
+        base_columns.add(table.event_time)
+    base = _table_clause(
+        table.database, table.table_schema, table.table, sorted(base_columns), dialect
+    )
     load = base.c[table.load_time]
     source = base.c[table.source_insert_time]
+    if via:
+        lookup_cols = {pair.lookup_col for pair in via.on} | {via.column}
+        lookup = _table_clause(
+            via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
+        )
+        lk = sa.select(
+            *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
+        ).subquery("lk")
+        event = lk.c[f"lk_{via.column}"]
+        source_from = base.outerjoin(
+            lk,
+            sa.and_(
+                *[base.c[pair.base_col] == lk.c[f"lk_{pair.lookup_col}"] for pair in via.on]
+            ),
+        )
+    else:
+        event = base.c[table.event_time]
+        source_from = base
 
     lag = DateDiffDay(event, source)
     both = sa.and_(event.is_not(None), source.is_not(None))
-    is_null_event = event.is_(None)
+    is_null_event = event.is_(None)  # via: includes unmatched/NULL-column rows
     is_null_source_only = sa.and_(event.is_not(None), source.is_(None))
     is_negative_excluded = sa.and_(both, lag < -tolerance)
     is_eligible = sa.and_(both, lag >= -tolerance)
@@ -123,8 +150,11 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
     def flag(condition):
         return sa.case((condition, 1), else_=0)
 
-    month_key = sa.case((is_eligible, MonthFloor(event)), else_=sa.null()).label("event_month")
+    month_key = sa.case(
+        (sa.or_(is_eligible, is_negative_excluded), MonthFloor(event)), else_=sa.null()
+    ).label("event_month")
     lag_key = sa.case(
+        (is_negative_excluded, NEGATIVE_LAG_SENTINEL),
         (sa.and_(is_eligible, lag > cap), cap + 1),  # frozen overflow sentinel
         (sa.and_(is_eligible, lag < 0), 0),  # clock-skew clip
         (is_eligible, lag),
@@ -147,7 +177,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             flag(is_overflow).label("is_overflow"),
             flag(is_delta_row).label("is_delta_row"),
         )
-        .select_from(base)
+        .select_from(source_from)
         # the bare <= would silently delete the NULL-load bucket
         .where(sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None)))
     )
@@ -216,8 +246,11 @@ def drop_dual_staging_sql(dialect: str) -> str:
 @dataclass
 class DualLagResult:
     frame: pd.DataFrame
+    # CUMULATIVE across the probe: main-pass target reads + this pass's
     target_logical_reads: int | None = None
     scan_budget_reads: int | None = None
+    scratch_logical_reads: int | None = None
+    scratch_budget_reads: int | None = None
 
     def rows_for(self, set_name: str) -> pd.DataFrame:
         gid = DUAL_GROUPING_SET_IDS[set_name]
@@ -236,17 +269,21 @@ class DualLagResult:
         return rows.iloc[0]
 
 
-def run_dual_lag(engine, table: TableConfig, as_of) -> DualLagResult:
-    """Stage -> aggregate -> drop for the dual pass, with the same fail-closed
-    scan-budget verification as the main pass."""
+def run_dual_lag(
+    engine, table: TableConfig, as_of, prior_target_reads: int | None = None
+) -> DualLagResult:
+    """Stage -> aggregate -> drop for the dual pass. The <=3x target budget is
+    per PROBE, cumulative: pass the main pass's measured target reads as
+    prior_target_reads so main + dual together are verified against 3x one
+    full scan. Scratch reads carry their own fail-closed ledger."""
     dialect = engine.dialect.name
     cap = table.analysis.result_cell_cap
     counts: dict[int, int] = {}
     rows = []
-    target_reads = budget = None
+    target_reads = budget = scratch_reads = scratch_budget = None
     with engine.connect() as conn:
         messages: list[str] = []
-        pages = None
+        pages = staging_pages = None
         if dialect == "mssql":
             pages = _mssql_target_pages(conn, table)
             _install_message_capture(conn, messages)
@@ -255,7 +292,10 @@ def run_dual_lag(engine, table: TableConfig, as_of) -> DualLagResult:
             dual_staging_sql(table, dialect, as_of=pd.Timestamp(as_of))
         )
         _harvest_cursor_messages(staging_result, messages)
+        staging_message_count = len(messages)
         try:
+            if dialect == "mssql":
+                staging_pages = _mssql_staging_pages(conn, dual_staging_table_name(dialect))
             result = conn.execute(build_dual_aggregation_query(table, dialect))
             keys = result.keys()
             for row in result:
@@ -269,14 +309,30 @@ def run_dual_lag(engine, table: TableConfig, as_of) -> DualLagResult:
                     )
                 rows.append(tuple(row))
             _harvest_cursor_messages(result, messages)
-            if dialect == "mssql":
-                target_reads, budget = verify_scan_budget(
-                    _target_reads_from(messages, {table.table}), pages, table.probe_name
-                )
         finally:
+            # the drop also flushes the aggregation's pending STATISTICS IO
             conn.exec_driver_sql(drop_dual_staging_sql(dialect))
+        if dialect == "mssql":
+            target_tables = {table.table}
+            if table.event_time_via is not None:
+                target_tables.add(table.event_time_via.table)
+            own_reads = _target_reads_from(messages, target_tables)
+            cumulative = None if own_reads is None else own_reads + (prior_target_reads or 0)
+            target_reads, budget = verify_scan_budget(cumulative, pages, table.probe_name)
+            scratch_reads, scratch_budget = verify_scratch_budget(
+                _scratch_reads_from(
+                    messages[staging_message_count:], dual_staging_table_name(dialect)
+                ),
+                staging_pages,
+                3,  # grouping sets: month_src_lag, delta, ()
+                table.probe_name,
+            )
     frame = pd.DataFrame(rows, columns=list(keys))
     frame["event_month"] = pd.to_datetime(frame["event_month"])
     return DualLagResult(
-        frame=frame, target_logical_reads=target_reads, scan_budget_reads=budget
+        frame=frame,
+        target_logical_reads=target_reads,
+        scan_budget_reads=budget,
+        scratch_logical_reads=scratch_reads,
+        scratch_budget_reads=scratch_budget,
     )

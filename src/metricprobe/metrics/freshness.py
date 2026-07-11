@@ -41,9 +41,15 @@ def epoch_timestamps(canonical: CanonicalResult, table: TableConfig) -> list[pd.
     """Distinct arrival epochs: batch canonical timestamps when configured,
     else load-time day/hour buckets."""
     if table.load_batch_col:
-        cells = canonical.rows_for("month_batch")
-        # a batch can span cohorts: its canonical timestamp is the MIN over
-        # its per-month cells' MIN(load_time)
+        from metricprobe.extract.canonical import GROUPING_SET_IDS
+
+        # ALL batch cells, INCLUDING the null-event-month artifact cells: a
+        # batch whose rows have corrupt/null event times is still a real
+        # arrival epoch, and its true earliest load time may live there
+        cells = canonical.frame[
+            canonical.frame["grouping_id"] == GROUPING_SET_IDS["month_batch"]
+        ]
+        cells = cells[cells["batch_id"].notna()]
         epochs = cells.groupby("batch_id")["min_load_time"].min()
         return sorted(pd.to_datetime(stamp) for stamp in epochs)
     cells = canonical.rows_for("epoch")

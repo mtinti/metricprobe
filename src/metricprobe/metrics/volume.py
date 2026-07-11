@@ -64,7 +64,10 @@ class VolumeAssessment:
 
 
 def _volumes_by_month(canonical: CanonicalResult) -> dict[pd.Period, int]:
+    """Curve-eligible rows per month (the -1 negative-excluded sentinel cells
+    belong to parity's watermarked population, not to volume history)."""
     cells = canonical.rows_for("month_lag")
+    cells = cells[cells["lag_day"] >= 0]
     grouped = cells.groupby("event_month")["row_count"].sum()
     return {pd.Period(ts, freq="M"): int(count) for ts, count in grouped.items()}
 

@@ -63,6 +63,7 @@ class ReasonCode(StrEnum):
     DUPLICATE_KEYS = "duplicate_keys"
     NEGATIVE_LAG_EXCESS = "negative_lag_excess"
     STALE_FEED = "stale_feed"
+    NULL_BATCH_IDS = "null_batch_ids"
     PARITY_MISMATCH = "parity_mismatch"
     PARITY_ONE_SIDED_MONTH = "parity_one_sided_month"
     # parity prerequisites are SPECIFIC codes: the contract requires the failing

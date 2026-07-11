@@ -70,6 +70,10 @@ from metricprobe.status import ReasonCode
 
 CANONICAL_SCHEMA_VERSION = 1
 
+# frozen lag_day sentinel for negative-excluded rows: they carry their event
+# month (parity's watermarked population) but never enter curves or volumes
+NEGATIVE_LAG_SENTINEL = -1
+
 GROUPING_WEIGHTS = {
     "event_month": 16,
     "lag_day": 8,
@@ -383,9 +387,15 @@ def build_staging_select(
         return sa.case((condition, 1), else_=0)
 
     # grouping keys are NULL outside their population; the NULL-key artifact
-    # rows are dropped by the runner — their mass lives in the flag counts
-    month_key = sa.case((is_eligible, MonthFloor(event)), else_=sa.null()).label("event_month")
+    # rows are dropped by the runner — their mass lives in the flag counts.
+    # The month key covers eligible AND negative-excluded rows so parity can
+    # compare the full WATERMARKED per-month population; excluded rows land at
+    # the frozen lag sentinel -1 and are filtered out of curves/volumes.
+    month_key = sa.case(
+        (sa.or_(is_eligible, is_negative_excluded), MonthFloor(event)), else_=sa.null()
+    ).label("event_month")
     lag_key = sa.case(
+        (is_negative_excluded, NEGATIVE_LAG_SENTINEL),
         (sa.and_(is_eligible, lag > cap), cap + 1),  # frozen overflow sentinel
         (sa.and_(is_eligible, lag < 0), 0),  # clock-skew clip
         (is_eligible, lag),
@@ -393,8 +403,10 @@ def build_staging_select(
     ).label("lag_day")
     epoch_key = TimeBucket(load, analysis.freshness_bucket).label("load_epoch_day")
     if table.load_batch_col:
+        # keyed by LOAD presence, not eligibility: a batch whose rows have
+        # corrupt/null event times is still a real arrival epoch
         batch_key = sa.case(
-            (is_eligible, base.c[table.load_batch_col]), else_=sa.null()
+            (load.is_not(None), base.c[table.load_batch_col]), else_=sa.null()
         ).label("batch_id")
     else:
         batch_key = sa.cast(sa.null(), sa.String()).label("batch_id")
@@ -696,18 +708,55 @@ def _harvest_cursor_messages(result, messages: list[str]) -> None:
         messages.append(str(entry[-1] if isinstance(entry, tuple) else entry))
 
 
-def _target_reads_from(messages: list[str], target_tables: set[str]) -> int | None:
-    found = False
-    total = 0
+def _reads_by_table(messages: list[str]) -> dict[str, int]:
+    reads: dict[str, int] = {}
     for message in messages:
         for name, count in _STATS_IO_LINE.findall(message):
-            if name in target_tables:
-                found = True
-                total += int(count)
-    return total if found else None
+            reads[name] = reads.get(name, 0) + int(count)
+    return reads
+
+
+def _target_reads_from(messages: list[str], target_tables: set[str]) -> int | None:
+    reads = _reads_by_table(messages)
+    matched = {name: count for name, count in reads.items() if name in target_tables}
+    return sum(matched.values()) if matched else None
+
+
+def _scratch_reads_from(messages: list[str], staging_prefix: str) -> int | None:
+    """Everything that is not a target table: the staging temp (its tempdb
+    name is the prefix padded with underscores) plus worktables/workfiles."""
+    reads = _reads_by_table(messages)
+    if not reads:
+        return None
+    return sum(
+        count
+        for name, count in reads.items()
+        if name.startswith(staging_prefix) or name in ("Worktable", "Workfile")
+    )
+
+
+def _mssql_staging_pages(conn, staging_name: str) -> int | None:
+    try:
+        pages = conn.execute(
+            sa.text(
+                "SELECT SUM(used_page_count) FROM tempdb.sys.dm_db_partition_stats "
+                "WHERE object_id = OBJECT_ID(:name)"
+            ),
+            {"name": f"tempdb..{staging_name}"},
+        ).scalar()
+    except sa.exc.DBAPIError:
+        return None
+    return int(pages) if pages is not None else None
 
 
 # ---------------------------------------------------------------------- runner
+
+
+def aggregation_branch_count(table: TableConfig) -> int:
+    """Scans of the staging table by construction: one per grouping set in the
+    grouped branch (month_lag, epoch [, month_batch][, alt]) plus the () branch
+    carrying the global scalars and the distinct-count guard."""
+    return 3 + (1 if table.load_batch_col else 0) + (1 if table.group_by_alt else 0)
 
 
 @dataclass
@@ -717,6 +766,9 @@ class CanonicalResult:
     frame: pd.DataFrame
     target_logical_reads: int | None = None  # measured on mssql when supported
     scan_budget_reads: int | None = None  # 3x one full scan of the target(s)
+    scratch_logical_reads: int | None = None  # aggregation reads incl. the guard
+    scratch_budget_reads: int | None = None  # (branches + 1) x staging pages
+    staging_spool_reads: int | None = None  # staging stmt worktables (via window spool)
 
     def rows_for(self, set_name: str) -> pd.DataFrame:
         gid = GROUPING_SET_IDS[set_name]
@@ -761,6 +813,31 @@ def verify_scan_budget(
     return target_reads, budget
 
 
+def verify_scratch_budget(
+    scratch_reads: int | None, staging_pages: int | None, branches: int, probe_name: str
+) -> tuple[int, int]:
+    """The SCRATCH ledger (ALGORITHMS.md section 15): the aggregation and the
+    distinct-count guard read the probe's own staging materialization, never
+    the target. Their reads are COUNTED and enforced against the
+    by-construction bound (branches + 1) x staging pages — each aggregation
+    branch scans staging once, plus one spare scan of margin. Fail-closed."""
+    if staging_pages is None or scratch_reads is None:
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
+            f"probe {probe_name!r}: the scratch-read ledger (staging pages or "
+            "STATISTICS IO) is unmeasurable; refusing to run unbudgeted",
+        )
+    budget = (branches + 1) * max(staging_pages, 1)
+    if scratch_reads > budget:
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_EXCEEDED,
+            f"probe {probe_name!r}: {scratch_reads} scratch logical reads exceed "
+            f"the by-construction bound of {budget} "
+            f"({branches} aggregation branches + 1 spare, x {staging_pages} pages)",
+        )
+    return scratch_reads, budget
+
+
 def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
     """Execute stage -> aggregate (incl. the () uniqueness row) -> drop on one
     connection; abort on scan-budget, cell-cap or join-uniqueness violations."""
@@ -768,11 +845,11 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
     cap = table.analysis.result_cell_cap
     counts: dict[int, int] = {}
     rows = []
-    target_reads = budget = None
+    target_reads = budget = scratch_reads = scratch_budget = None
     with engine.connect() as conn:
         key_types = _key_column_types(conn, table, dialect) if table.key_cols else None
         messages: list[str] = []
-        pages = None
+        pages = staging_pages = None
         if dialect == "mssql":
             pages = _mssql_target_pages(conn, table)
             _install_message_capture(conn, messages)
@@ -781,7 +858,11 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
             staging_sql(table, dialect, as_of=pd.Timestamp(as_of), key_types=key_types)
         )
         _harvest_cursor_messages(staging_result, messages)
+        staging_message_count = len(messages)
+        spool_reads = None
         try:
+            if dialect == "mssql":
+                staging_pages = _mssql_staging_pages(conn, staging_table_name(dialect))
             result = conn.execute(build_aggregation_query(table, dialect))
             keys = result.keys()
             for row in result:
@@ -795,22 +876,45 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                     )
                 rows.append(tuple(row))
             _harvest_cursor_messages(result, messages)
-            if dialect == "mssql":
-                # ALL statements are counted (staging + aggregation with its
-                # distinct-count branch); only staging touches the targets by
-                # construction, but any regression that re-reads them is caught
-                target_tables = {table.table}
-                if table.event_time_via is not None:
-                    target_tables.add(table.event_time_via.table)
-                target_reads, budget = verify_scan_budget(
-                    _target_reads_from(messages, target_tables), pages, table.probe_name
-                )
         finally:
+            # pymssql flushes a statement's STATISTICS IO tokens only when the
+            # NEXT statement runs, so the drop both cleans up AND completes the
+            # aggregation's message stream — ledgers are computed after it
             conn.exec_driver_sql(drop_staging_sql(dialect))
+        if dialect == "mssql":
+            # TWO fail-closed ledgers (ALGORITHMS.md section 15): target
+            # pressure <= 3x one full scan over ALL statements, and the
+            # aggregation statement's scratch reads (its branches INCLUDING
+            # the distinct-count guard) <= their by-construction bound
+            target_tables = {table.table}
+            if table.event_time_via is not None:
+                target_tables.add(table.event_time_via.table)
+            target_reads, budget = verify_scan_budget(
+                _target_reads_from(messages, target_tables), pages, table.probe_name
+            )
+            scratch_reads, scratch_budget = verify_scratch_budget(
+                _scratch_reads_from(
+                    messages[staging_message_count:], staging_table_name(dialect)
+                ),
+                staging_pages,
+                aggregation_branch_count(table),
+                table.probe_name,
+            )
+            # the staging statement's own worktable spool (the via uniqueness
+            # window functions) is row-proportional: measured and REPORTED,
+            # not branch-bounded (ALGORITHMS.md section 15)
+            spool_reads = _scratch_reads_from(
+                messages[:staging_message_count], staging_table_name(dialect)
+            )
     frame = pd.DataFrame(rows, columns=list(keys))
     frame["event_month"] = pd.to_datetime(frame["event_month"])
     result = CanonicalResult(
-        frame=frame, target_logical_reads=target_reads, scan_budget_reads=budget
+        frame=frame,
+        target_logical_reads=target_reads,
+        scan_budget_reads=budget,
+        scratch_logical_reads=scratch_reads,
+        scratch_budget_reads=scratch_budget,
+        staging_spool_reads=spool_reads,
     )
     if table.event_time_via is not None:
         max_dup = result.global_row["max_lookup_dup"]

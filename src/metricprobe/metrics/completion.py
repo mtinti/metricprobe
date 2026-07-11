@@ -66,7 +66,10 @@ class MonthCurve:
 
 def curves_from_cells(cells: pd.DataFrame, lag_cap: int) -> dict[pd.Period, MonthCurve]:
     """Month curves from any (event_month, lag_day, row_count) cell frame —
-    shared by the main pass and the dual-lag source-side pass."""
+    shared by the main pass and the dual-lag source-side pass. Cells at the
+    frozen lag sentinel -1 (negative-excluded rows, kept for parity's
+    watermarked population) never enter a curve."""
+    cells = cells[cells["lag_day"] >= 0]
     curves: dict[pd.Period, MonthCurve] = {}
     for month_ts, group in cells.groupby("event_month"):
         month = pd.Period(month_ts, freq="M")

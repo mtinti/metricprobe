@@ -228,6 +228,10 @@ def test_scan_budget_enforced_through_the_production_runner(mssql_engine):
     result = run_canonical(mssql_engine, _config("tempdb", "dbo"), AS_OF)
     assert result.target_logical_reads is not None, "budget measurement did not run"
     assert result.scan_budget_reads is not None
+    # the SCRATCH ledger (aggregation + distinct-count guard) is measured and
+    # enforced too — the guard's reads are counted, fail-closed
+    assert result.scratch_logical_reads is not None and result.scratch_logical_reads > 0
+    assert result.scratch_logical_reads <= result.scratch_budget_reads
     with mssql_engine.connect() as conn:
         pages = conn.execute(
             sa.text(
@@ -250,6 +254,10 @@ def test_step5_metrics_match_between_dialects(duckdb_engine, mssql_engine):
 
     spec = dataclasses.replace(SPEC, dual_offset_days=2.0, seed=64)
     df = g.inject_raw_vs_corrected(g.generate(spec), fraction=0.05, shift_days=-35, seed=1)
+    df = g.inject_null_source_insert(df, fraction=0.02, seed=2)
+    # negative SOURCE lags beyond tolerance: the dual clip/cap policy on mssql
+    corrupt = df.sample(frac=0.01, random_state=3).index
+    df.loc[corrupt, "source_insert_time"] = df.loc[corrupt, "event_time"] - pd.Timedelta(days=5)
     results = []
     for engine, database, schema in (
         (duckdb_engine, "memory", "main"),
@@ -263,7 +271,14 @@ def test_step5_metrics_match_between_dialects(duckdb_engine, mssql_engine):
         )
         g.load_via_sqlalchemy(df, engine, "events")
         canonical = run_canonical(engine, config, AS_OF)
-        dual = run_dual_lag(engine, config, AS_OF)
+        # the <=3x target budget is CUMULATIVE across main + dual
+        dual = run_dual_lag(
+            engine, config, AS_OF, prior_target_reads=canonical.target_logical_reads
+        )
+        if engine.dialect.name == "mssql":
+            assert dual.target_logical_reads > canonical.target_logical_reads
+            assert dual.target_logical_reads <= dual.scan_budget_reads
+            assert dual.scratch_logical_reads <= dual.scratch_budget_reads
         results.append(
             {
                 "batch": assess_batch(canonical, config),
@@ -278,6 +293,8 @@ def test_step5_metrics_match_between_dialects(duckdb_engine, mssql_engine):
     assert duck["dual"].source_percentiles == mssql["dual"].source_percentiles
     assert duck["dual"].delta_histogram.equals(mssql["dual"].delta_histogram)
     assert duck["dual"].n_null_source_only == mssql["dual"].n_null_source_only
+    assert duck["dual"].negative_lag_excess_fraction == mssql["dual"].negative_lag_excess_fraction
+    assert duck["dual"].negative_lag_excess_fraction > 0  # the corrupt rows registered
     assert duck["fresh"] == mssql["fresh"]
     assert duck["compare"] == mssql["compare"]
     assert sum(duck["compare"].values()) > 0  # the side-stat actually fired
@@ -296,13 +313,19 @@ def test_parity_matches_between_dialects(duckdb_engine, mssql_engine):
     ):
         sides = []
         for name, frame in (("events_a", df), ("events_b", right_df)):
-            config = _config(database, schema, table=name, probe_name=f"{name}_probe")
+            config = _config(
+                database,
+                schema,
+                table=name,
+                probe_name=f"{name}_probe",
+                parity_with="events_b_probe" if name == "events_a" else None,
+            )
             g.load_via_sqlalchemy(frame, engine, name)
             canonical = run_canonical(engine, config, AS_OF)
             completion = assess_completion(canonical, config, AS_OF)
             volume = assess_volume(canonical, config, AS_OF, completion)
             sides.append(ParitySide(config, canonical, completion, volume))
-        outcomes.append(assess_parity(*sides))
+        outcomes.append(assess_parity(*sides, AS_OF))
     duck, mssql = outcomes
     assert duck.rows == mssql.rows
     assert duck.statuses == mssql.statuses

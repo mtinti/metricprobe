@@ -34,6 +34,11 @@ cells over CURVE-ELIGIBLE rows only:
   censoring signal and is never used for maturity classification.
 - `days_to_p(m, p)` = smallest integer d with `F_m(d) >= p`.
 
+**Frozen lag sentinels**: rows beyond the cap land in the overflow bucket at
+`lag_cap_days + 1`; negative-excluded rows (section 6) keep their event month
+at lag sentinel `-1` — they belong to parity's watermarked population but
+NEVER enter curves or volume history.
+
 **Censoring-aware cap rule**: lag_day is capped at `lag_cap_days`; rows beyond
 it land in the overflow bucket (recorded at lag_cap_days + 1). If
 `F_m(lag_cap_days) < p` — equivalently overflow mass > (1 - p) — the percentile
@@ -219,8 +224,14 @@ From the (event_month, batch_id) cells; a batch's canonical timestamp is
 MIN(load_time) within the batch — the minimum over its per-month cells, since
 a batch can span cohorts.
 
-- `rows_per_run(b)` = the batch's row count summed over its month cells.
+- Batch cells are keyed by LOAD presence, not curve eligibility: a batch
+  whose rows have corrupt/NULL event times is still a real arrival epoch for
+  freshness. Batch COMPLETION weights use the cells' curve-eligible counts.
+- `rows_per_run(b)` = the batch's curve-eligible rows summed over its cells.
 - `runs_per_month(m)` = distinct batches touching event month m.
+- Curve-eligible rows with a NULL batch id are counted and reported (AMBER
+  NULL_BATCH_IDS) and REMAIN in the completion denominator — attributing only
+  labelled rows would overstate completion; unreachable percentiles stay None.
 - **Batch-level completion** for month m: order its batches by canonical
   timestamp T_b; `F_m(T) = sum(rows of batches with T_b <= T) / final_m` —
   cumulative and WEIGHTED BY BATCH ROW COUNTS (a bulk run moves the curve by
@@ -231,16 +242,22 @@ a batch can span cohorts.
 
 ## 13. Parity (two NAMED probes)
 
-Exact parity compares the WATERMARKED per-month population: the curve-eligible
-counts (rows with non-NULL load_time <= as_of and a defined event month).
-NULL-load rows are query-time counts, reported separately and informationally,
-never inside the exact diff.
+Exact parity compares the WATERMARKED per-month population: rows with
+non-NULL load_time <= as_of and a defined event month — the curve-eligible
+rows PLUS the negative-lag-excluded rows kept at the frozen -1 sentinel (an
+allowed below-threshold excess must not create false diffs). NULL-load rows
+are query-time counts, reported separately and informationally, never inside
+the exact diff. The pairing itself is declared: the left probe's parity_with
+must name the right probe.
 
-- Candidate months = the UNION of both sides' observed MATURE months (common
-  mature population by TIME, so a month missing from one side is still a
-  candidate): present on both sides -> compare counts; present on exactly one
-  side -> RED PARITY_ONE_SIDED_MONTH (an explicit diff, never silently
-  dropped). |left - right| > parity_tolerance -> RED PARITY_MISMATCH.
+- The COMMON MATURE population is defined by TIME under the STRICTER of the
+  two sides' horizons (month_end <= as_of - max(horizon_left, horizon_right)):
+  different learned horizons on identical data must never manufacture
+  one-sided months. Candidate months = the union of both sides' OBSERVED
+  months within that common range: present on both sides -> compare counts;
+  present on exactly one side -> RED PARITY_ONE_SIDED_MONTH (an explicit
+  diff, never silently dropped). |left - right| > parity_tolerance -> RED
+  PARITY_MISMATCH.
 - Zero-tolerance parity is sound ONLY under VERIFIED prerequisites, checked
   per run; any failure or unverifiability yields INDETERMINATE with the
   failing prerequisite as the reason code, never a false mismatch:
@@ -268,3 +285,36 @@ never inside the exact diff.
   month where DATEDIFF(day, event_time, compare_event_time) != 0 or the
   compare column is NULL (`n_compare_mismatch`, aggregated in the main pass —
   no extra scan).
+
+## 15. Scan-budget accounting (two fail-closed ledgers)
+
+The probe's I/O is measured per table via STATISTICS IO and split into two
+ledgers, BOTH enforced fail-closed on SQL Server (unmeasurable => abort with
+SCAN_BUDGET_UNVERIFIABLE; exceeded => SCAN_BUDGET_EXCEEDED):
+
+1. **Target ledger** — reads on the probed table(s) (base + via lookup):
+   `target_reads <= 3 x one full scan` (3 x used_page_count). This budget is
+   per PROBE and CUMULATIVE: a dual-lag probe verifies main-pass + dual-pass
+   target reads together against the same 3x bound (by construction each pass
+   scans the target once, so main + dual = 2 <= 3).
+2. **Scratch ledger** — everything else the probe reads: its own staging
+   materialization, worktables and workfiles. This is where the aggregation
+   branches and the COUNT(DISTINCT key_hash) uniqueness guard run, so the
+   guard's reads are COUNTED and enforced here:
+   `scratch_reads <= (branches + 1) x staging pages`, where branches is the
+   by-construction number of staging scans (one per grouping set plus the ()
+   global/distinct branch) and +1 is margin. Measured (180k-row fixture):
+   staging ~2.8k pages, scratch ~11.3k reads = 4.0 branches — the bound is
+   tight, not decorative.
+
+The staging statement's own worktable spool (the via-join uniqueness window
+functions) is row-proportional and therefore measured and REPORTED
+(`staging_spool_reads`), not branch-bounded — it is tempdb-local, O(base rows),
+and the price of piggybacking join validation instead of a second lookup scan.
+
+Rationale: the hard rule's "3x one full scan" bounds pressure on the
+PRODUCTION table; the scratch work is tempdb-local, bounded by construction,
+and now measured and enforced rather than assumed. A single combined
+"3x target pages" ledger cannot honestly include scratch: for tables narrower
+than their own staging projection it is unsatisfiable by ANY architecture
+that materializes derived columns.

@@ -107,6 +107,30 @@ def test_zero_mad_fallback_boundaries_hand_calculated():
     red = _fresh(df, config, "2024-05-30 12:00")  # 10.5 days
     assert [s.severity for s in red.statuses] == [Severity.RED]
     assert green.cadence_sigma_days == 1.0  # the zero-MAD fixed tolerance
+    # the inequalities are STRICT: exactly AT a threshold stays on the calm side
+    at_amber = _fresh(df, config, "2024-05-29 00:00")  # exactly 9.0 days
+    assert at_amber.days_since_last == 9.0
+    assert [s.severity for s in at_amber.statuses] == [Severity.GREEN]
+    at_red = _fresh(df, config, "2024-05-30 00:00")  # exactly 10.0 days
+    assert at_red.days_since_last == 10.0
+    assert [s.severity for s in at_red.statuses] == [Severity.AMBER]
+
+
+def test_batches_with_corrupt_event_times_are_still_epochs():
+    # the last two months' rows get NULL event times (a real upstream
+    # corruption): those batches are ineligible for curves but they ARE
+    # arrivals — freshness must not report a false STALE_FEED
+    config = table_config(load_batch_col="batch_id")
+    df = g.generate(WEEKLY_BATCHES)
+    corrupted = df.copy()
+    recent = corrupted["load_time"] >= pd.Timestamp("2024-11-01")
+    corrupted.loc[recent, "event_time"] = pd.NaT
+    as_of = "2025-01-28"
+    clean = _fresh(df, config, as_of)
+    with_corruption = _fresh(corrupted, config, as_of)
+    assert with_corruption.epoch_count == clean.epoch_count  # no epoch lost
+    assert with_corruption.last_epoch == clean.last_epoch
+    assert [s.severity for s in with_corruption.statuses] == [Severity.GREEN]
 
 
 def test_epochs_come_from_batches_when_configured():

@@ -16,7 +16,7 @@ import pandas as pd
 
 from metricprobe.config import TableConfig
 from metricprobe.extract.canonical import CanonicalResult
-from metricprobe.metrics.completion import CompletionAssessment
+from metricprobe.metrics.completion import CompletionAssessment, month_end
 from metricprobe.metrics.volume import VolumeAssessment
 from metricprobe.status import Check, ReasonCode, Severity, Status
 
@@ -28,11 +28,14 @@ class ParitySide:
     completion: CompletionAssessment
     volume: VolumeAssessment
 
-    def mature_counts(self) -> dict[pd.Period, int]:
-        mature = set(self.completion.mature_months)
-        return {
-            row.month: row.volume for row in self.volume.months if row.month in mature
-        }
+    def watermarked_counts(self) -> dict[pd.Period, int]:
+        """The population exact parity compares: rows with non-NULL load_time
+        <= as_of and a defined event month — curve-eligible rows PLUS the
+        negative-lag-excluded rows kept at the frozen -1 sentinel (an allowed
+        below-threshold excess must not create false diffs)."""
+        cells = self.canonical.rows_for("month_lag")
+        grouped = cells.groupby("event_month")["row_count"].sum()
+        return {pd.Period(ts, freq="M"): int(count) for ts, count in grouped.items()}
 
 
 @dataclass
@@ -86,7 +89,13 @@ def _failed_prerequisite(left: ParitySide, right: ParitySide) -> tuple[ReasonCod
     return None
 
 
-def assess_parity(left: ParitySide, right: ParitySide) -> ParityAssessment:
+def assess_parity(left: ParitySide, right: ParitySide, as_of: pd.Timestamp) -> ParityAssessment:
+    # parity_with is the declared relationship: refuse arbitrary pairings
+    if left.config.parity_with != right.config.probe_name:
+        raise ValueError(
+            f"probe {left.config.probe_name!r} declares parity_with="
+            f"{left.config.parity_with!r}, not {right.config.probe_name!r}"
+        )
     null_load_left = int(left.canonical.global_row["n_null_load_time_only"])
     null_load_right = int(right.canonical.global_row["n_null_load_time_only"])
 
@@ -107,12 +116,37 @@ def assess_parity(left: ParitySide, right: ParitySide) -> ParityAssessment:
             ],
         )
 
+    if left.completion.horizon is None or right.completion.horizon is None:
+        return ParityAssessment(
+            rows=[],
+            null_load_left=null_load_left,
+            null_load_right=null_load_right,
+            statuses=[
+                Status(
+                    check=Check.PARITY,
+                    severity=Severity.INSUFFICIENT_HISTORY,
+                    reason=ReasonCode.INSUFFICIENT_MATURE_MONTHS,
+                    detail="maturity is unavailable on at least one side; the "
+                    "common mature population cannot be established",
+                )
+            ],
+        )
     tolerance = left.config.analysis.parity_tolerance
-    left_counts = left.mature_counts()
-    right_counts = right.mature_counts()
+    # the COMMON mature population is defined by TIME under the STRICTER of
+    # the two horizons — different learned horizons on identical data must
+    # never manufacture one-sided months
+    common_edge = as_of - pd.Timedelta(
+        days=max(left.completion.horizon, right.completion.horizon)
+    )
+    left_counts = {
+        m: c for m, c in left.watermarked_counts().items() if month_end(m) <= common_edge
+    }
+    right_counts = {
+        m: c for m, c in right.watermarked_counts().items() if month_end(m) <= common_edge
+    }
     rows: list[ParityMonth] = []
     statuses: list[Status] = []
-    # full outer join over the UNION of both sides' observed mature months
+    # full outer join over the UNION of both sides' observed common-mature months
     for month in sorted(set(left_counts) | set(right_counts)):
         left_count = left_counts.get(month)
         right_count = right_counts.get(month)
