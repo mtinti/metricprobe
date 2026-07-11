@@ -273,6 +273,27 @@ def test_via_non_unique_lookup_fails_loudly():
     assert "5 base rows are ambiguous" in excinfo.value.detail
 
 
+def test_via_lookup_duplicates_abort_even_when_unreferenced():
+    """The uniqueness contract covers the LOOKUP TABLE, not just the keys a
+    base row happens to reference: duplicate lookup keys that join to no
+    current base row must still abort the probe."""
+    _, base, lookup = _via_frames()
+    stranger = pd.DataFrame(
+        {
+            "id": [-1, -1],  # a duplicated key NO base row references
+            "site": [0, 0],
+            "referral_date": [pd.Timestamp("2024-01-01")] * 2,
+        }
+    )
+    duplicated = pd.concat([lookup, stranger], ignore_index=True)
+    with pytest.raises(ProbeAborted) as excinfo:
+        _probe_via(
+            base, duplicated, _via_config([{"base_col": "referral_id", "lookup_col": "id"}])
+        )
+    assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+    assert "0 base rows are ambiguous" in excinfo.value.detail
+
+
 def test_via_percentiles_match_generator_expectations():
     df, base, lookup = _via_frames()
     config = _via_config([{"base_col": "referral_id", "lookup_col": "id"}])

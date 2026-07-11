@@ -71,7 +71,8 @@ def test_full_config_loads():
                     proxy=True,
                     expect_batchy=True,
                     resolution={"order_date": "date", "loaded_at": "datetime",
-                                "src_inserted_at": "datetime"},
+                                "src_inserted_at": "datetime",
+                                "order_date_raw": "date"},
                     suppress_small_counts=True,
                     read_uncommitted=True,
                     analysis={"training_cutoff_days": 400, "lag_cap_days": 400},
@@ -304,6 +305,12 @@ def test_campaign_schedule_must_be_real_cron():
     # and within its field's numeric bounds
     with pytest.raises(ValidationError, match="range"):
         ProbeConfig.model_validate(minimal_config(campaign={"schedule": "99 * * * *"}))
+    # a zero step never fires: invalid, not silently accepted
+    for zero_step in ["*/0 * * * *", "0-10/0 * * * *"]:
+        with pytest.raises(ValidationError, match="zero step"):
+            ProbeConfig.model_validate(minimal_config(campaign={"schedule": zero_step}))
+    ok_step = ProbeConfig.model_validate(minimal_config(campaign={"schedule": "*/5 * * * *"}))
+    assert ok_step.campaign.schedule == "*/5 * * * *"
     ok = ProbeConfig.model_validate(minimal_config(campaign={"schedule": "*/15 0-6 * * 1,3,5"}))
     assert ok.campaign.schedule == "*/15 0-6 * * 1,3,5"
 
@@ -352,6 +359,10 @@ def test_delivery_urls_must_not_carry_literal_query_secrets():
         "https://forge.example/d.git?ref=main&access_token=demo123",
         "https://forge.example/d.git?PRIVATE_TOKEN=demo123",
         "https://forge.example/d.git?api_key=",
+        # percent-encoding the name or the assignment is not an escape hatch
+        "https://forge.example/d.git?%74oken=demo123",
+        "https://forge.example/d.git?token%3Ddemo123",
+        "https://%74oken-value@forge.example/d.git",
     ]:
         with pytest.raises(ValidationError, match="token_env"):
             ProbeConfig.model_validate(remote(bad))
@@ -368,6 +379,12 @@ def test_delivery_urls_must_not_carry_literal_query_secrets():
 def test_mssql_store_requires_url():
     with pytest.raises(ValidationError, match="mssql_url"):
         ProbeConfig.model_validate(minimal_config(store={"backend": "mssql"}))
+    # malformed URLs fail at CONFIG time, not at the first write
+    for bad in ["   ", "not a url at all", "postgresql://localhost/demo"]:
+        with pytest.raises(ValidationError, match="mssql_url|mssql dialect"):
+            ProbeConfig.model_validate(
+                minimal_config(store={"backend": "mssql", "mssql_url": bad})
+            )
     # the store schema comes from CONFIG, never hardcoded; blank is rejected
     ok = ProbeConfig.model_validate(
         minimal_config(
@@ -416,6 +433,14 @@ def test_digest_is_stable_and_secret_redacted():
     # encoded separators still bound the value: what follows %3B is NOT eaten
     bounded = odbc + "demo_pw_one%3BEncrypt%3D"
     assert config_digest(_cfg(bounded + "yes")) != config_digest(_cfg(bounded + "no"))
+    # ... and encoded NAMES or %26 separators cannot dodge the redaction
+    assert config_digest(_cfg("mssql+pymssql://localhost/demo?p%61ssword=demo1")) == (
+        config_digest(_cfg("mssql+pymssql://localhost/demo?p%61ssword=demo2"))
+    )
+    behind_amp = "mssql+pymssql://localhost/demo?opts=a%26password%3D"
+    assert config_digest(_cfg(behind_amp + "demo1")) == config_digest(
+        _cfg(behind_amp + "demo2")
+    )
 
     # semantic changes DO change the digest
     assert config_digest(base) != config_digest(_cfg("mssql+pymssql://sa:demo_pw_one@127.0.0.1/demo"))
@@ -463,6 +488,11 @@ def test_resolution_is_required_for_time_roles_and_labels_the_grain():
     with pytest.raises(ValidationError, match="src_inserted_at"):
         ProbeConfig.model_validate(
             minimal_config(tables=[minimal_table(source_insert_time="src_inserted_at")])
+        )
+    # compare_event_time is a time column too: its resolution is required
+    with pytest.raises(ValidationError, match="order_date_raw"):
+        ProbeConfig.model_validate(
+            minimal_config(tables=[minimal_table(compare_event_time="order_date_raw")])
         )
     # the declared resolutions drive the output grain label: a date column on
     # either side means sub-day arrival detail does not exist

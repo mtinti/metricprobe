@@ -80,11 +80,13 @@ def _failed_prerequisite(left: ParitySide, right: ParitySide) -> tuple[ReasonCod
             )
     for name, side in (("left", left), ("right", right)):
         threshold = side.config.analysis.negative_lag_red_fraction
-        if side.completion.negative_lag_excess_fraction > threshold:
+        # the contract requires the excess to be BELOW the threshold: exactly
+        # AT it is not "below", so the prerequisite fails (>=, not >)
+        if side.completion.negative_lag_excess_fraction >= threshold:
             return (
                 ReasonCode.PARITY_PREREQ_NEGATIVE_LAG,
-                f"negative-lag excess (the backdating proxy) exceeds the threshold "
-                f"on the {name} side ({side.config.probe_name!r})",
+                f"negative-lag excess (the backdating proxy) is not below the "
+                f"threshold on the {name} side ({side.config.probe_name!r})",
             )
     return None
 

@@ -24,10 +24,11 @@ SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
 def test_schema_version_is_pinned():
     # v2: the scan-budget accounting formulas changed (ALGORITHMS section 15);
+    # v3: staged lookup_dup carries the GLOBAL lookup-side max duplication;
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 2
+    assert CANONICAL_SCHEMA_VERSION == 3
 
 
 def test_grouping_ids_are_frozen():
@@ -120,7 +121,8 @@ def _config_batch_alt_keys() -> TableConfig:
             "group_by_alt": "region",
             "key_cols": ["settlement_id", "leg"],
             "compare_event_time": "settled_on_raw",
-            "resolution": {"settled_on": "date", "loaded_at": "datetime"},
+            "resolution": {"settled_on": "date", "loaded_at": "datetime",
+                           "settled_on_raw": "date"},
         }
     )
 
@@ -363,3 +365,21 @@ def test_dual_requires_source_and_direct_event_time():
 
     with pytest.raises(ValueError, match="source_insert_time"):
         build_dual_staging_select(_config_basic(), "duckdb")
+
+
+def test_statistics_io_attribution_is_case_insensitive():
+    """SQL Server identifiers are case-insensitive under the usual collations:
+    a config naming 'ORDERS' while STATISTICS IO reports 'orders' must still
+    attribute the reads (a mismatch would abort a legitimate probe as
+    SCAN_BUDGET_UNVERIFIABLE)."""
+    from metricprobe.extract.canonical import _scratch_reads_from, _target_reads_from
+
+    messages = [
+        "Table 'orders'. Scan count 1, logical reads 120, physical reads 0.",
+        "Table '#MP_Probe___000123'. Scan count 2, logical reads 40.",
+        "Table 'Worktable'. Scan count 0, logical reads 7.",
+    ]
+    assert _target_reads_from(messages, {"ORDERS"}) == 120
+    assert _target_reads_from(messages, {"orders"}) == 120
+    assert _target_reads_from(messages, {"unrelated"}) is None
+    assert _scratch_reads_from(messages, "#mp_probe") == 47

@@ -344,3 +344,25 @@ def test_month_with_only_null_batch_ids_still_appears():
     assert by_month[pd.Period("2024-05", freq="M")].runs == 3
     amber = [s for s in assessment.statuses if s.reason is ReasonCode.NULL_BATCH_IDS]
     assert amber and amber[0].severity is Severity.AMBER
+
+
+def test_batch_canonical_timestamp_includes_null_event_arrivals():
+    """A batch's canonical timestamp is MIN(load_time) over ALL its arrivals:
+    when its earliest wave carries corrupt (NULL) event times, that wave still
+    dates the batch — dropping it would shift every day count derived from it."""
+    df = catalog()["straggler_batch"].healthy()
+    config = table_config(load_batch_col="batch_id")
+    baseline = assess_batch(probe(df, config, AS_OF), config)
+    june_before = {m.month: m for m in baseline.months}[pd.Period("2024-06", freq="M")]
+    assert june_before.days_to[50] == 3  # the day-3 batch dates the median
+
+    june = df[df["event_time"].dt.to_period("M") == "2024-06"]
+    first_batch = june.loc[june["load_time"].idxmin(), "batch_id"]
+    corrupt = june[june["batch_id"] == first_batch].head(5).copy()
+    corrupt["event_time"] = pd.NaT
+    corrupt["load_time"] = pd.Timestamp("2024-07-02")  # day 1 after month end
+    with_early_wave = pd.concat([df, corrupt], ignore_index=True)
+    assessment = assess_batch(probe(with_early_wave, config, AS_OF), config)
+    june_after = {m.month: m for m in assessment.months}[pd.Period("2024-06", freq="M")]
+    # the same batch now dates from its EARLIER (null-event) arrival wave
+    assert june_after.days_to[50] == 1

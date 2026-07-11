@@ -76,6 +76,7 @@ def _config(database: str, schema: str, **overrides) -> TableConfig:
                 via.get("column") if isinstance(via, dict) else None,
                 data.get("load_time"),
                 data.get("source_insert_time"),
+                data.get("compare_event_time"),
             )
             if column
         ]
@@ -131,26 +132,25 @@ def _via_dataset():
     return base, lookup
 
 
-def _via_config(database: str, schema: str) -> TableConfig:
-    return TableConfig.model_validate(
-        {
-            "probe_name": "episodes_via",
-            "database": database,
-            "schema": schema,
-            "table": "events",
-            "load_time": "load_time",
-            "group_by_alt": "region",
-            "event_time_via": {
-                "join_table": f"{database}.{schema}.referrals",
-                "on": [
-                    {"base_col": "referral_id", "lookup_col": "id"},
-                    {"base_col": "site_code", "lookup_col": "site"},
-                ],
-                "column": "referral_date",
-            },
-            "resolution": {"referral_date": "datetime", "load_time": "datetime"},
-        }
-    )
+def _via_config(database: str, schema: str, **overrides) -> TableConfig:
+    data = {
+        "probe_name": "episodes_via",
+        "database": database,
+        "schema": schema,
+        "table": "events",
+        "load_time": "load_time",
+        "group_by_alt": "region",
+        "event_time_via": {
+            "join_table": f"{database}.{schema}.referrals",
+            "on": [
+                {"base_col": "referral_id", "lookup_col": "id"},
+                {"base_col": "site_code", "lookup_col": "site"},
+            ],
+            "column": "referral_date",
+        },
+        "resolution": {"referral_date": "datetime", "load_time": "datetime"},
+    } | overrides
+    return TableConfig.model_validate(data)
 
 
 def test_via_join_and_alt_grouping_match_between_dialects(duckdb_engine, mssql_engine):
@@ -171,18 +171,41 @@ def test_via_join_and_alt_grouping_match_between_dialects(duckdb_engine, mssql_e
 
 
 def test_via_non_unique_lookup_aborts_on_both_dialects(duckdb_engine, mssql_engine):
+    from metricprobe.extract.dual import run_dual_lag
+
     base, lookup = _via_dataset()
     duplicated = pd.concat([lookup, lookup.iloc[:7]], ignore_index=True)
-    for engine, config in (
-        (duckdb_engine, _via_config("memory", "main")),
-        (mssql_engine, _via_config("tempdb", "dbo")),
+    # the dual pass runs on its own connection and must refuse INDEPENDENTLY
+    dual_base = base.assign(source_insert_time=base["load_time"] - pd.Timedelta(days=2))
+    dual_overrides = {
+        "source_insert_time": "source_insert_time",
+        "resolution": {
+            "referral_date": "datetime",
+            "load_time": "datetime",
+            "source_insert_time": "datetime",
+        },
+    }
+    for engine, config, dual_config in (
+        (
+            duckdb_engine,
+            _via_config("memory", "main"),
+            _via_config("memory", "main", **dual_overrides),
+        ),
+        (
+            mssql_engine,
+            _via_config("tempdb", "dbo"),
+            _via_config("tempdb", "dbo", **dual_overrides),
+        ),
     ):
-        g.load_via_sqlalchemy(base, engine, "events")
+        g.load_via_sqlalchemy(dual_base, engine, "events")
         g.load_via_sqlalchemy(duplicated, engine, "referrals")
         with pytest.raises(ProbeAborted) as excinfo:
             run_canonical(engine, config, AS_OF)
         assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
         assert "7 base rows are ambiguous" in excinfo.value.detail
+        with pytest.raises(ProbeAborted) as dual_excinfo:
+            run_dual_lag(engine, dual_config, AS_OF)
+        assert dual_excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
 
 
 def test_volume_assessment_matches_between_dialects(duckdb_engine, mssql_engine):
@@ -442,7 +465,7 @@ def test_mssql_store_shares_the_run_contract(mssql_engine):
     store.commit_run(run_id, manifest_for(meta))
     assert any(m["run_id"] == run_id for m in store.list_runs())
     # the rival's abort of the SAME id must not touch the committed rows
-    rival._staged[run_id] = ["month_volumes"]
+    rival._staged[run_id] = {"claim": "someone-else", "names": ["month_volumes"]}
     rival.abort_run(run_id)
     read_back = store.read_table(run_id, "month_volumes")
     assert read_back["probe"].tolist() == ["a", "b"]
@@ -459,3 +482,89 @@ def test_mssql_store_shares_the_run_contract(mssql_engine):
     assert store.list_runs() == []
     with pytest.raises(FileNotFoundError):
         store.read_table(run_id, "month_volumes")
+
+
+def test_mssql_store_sweeps_are_isolated_and_types_are_frozen(mssql_engine):
+    """The sweeping deletes (abort without in-memory state, prune) must never
+    touch a FOREIGN table that matches 'mp_%' only through LIKE's underscore
+    wildcard; a writer whose staging claim was taken over must refuse to
+    commit; and the frozen snapshot dtypes survive a None-first frame."""
+    import dataclasses
+    import os
+    import uuid
+
+    from metricprobe.cli import _typed
+    from metricprobe.store import MssqlStore, RunMeta, stamp
+
+    url = os.environ["METRICPROBE_MSSQL_URL"]
+    store = MssqlStore(url, schema="dbo")
+
+    def make_meta(run_id, run_at="2026-07-01T06:00:00"):
+        return RunMeta(
+            run_id=run_id, run_at=run_at, as_of="2026-07-01T00:00:00",
+            git_sha="deadbeef", tool_version="0.1.0.dev0", config_digest="abc",
+            schema_version=1, window_start="2024-07-01T00:00:00",
+            window_end="2026-07-01T00:00:00",
+        )
+
+    run_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    # ---- C1: a decoy table the LIKE pattern would match via the _ wildcard
+    with store.engine.begin() as conn:
+        conn.exec_driver_sql(
+            "IF OBJECT_ID('dbo.mpx_audit_foreign') IS NOT NULL "
+            "DROP TABLE dbo.mpx_audit_foreign"
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE dbo.mpx_audit_foreign (run_id varchar(64), payload int)"
+        )
+        conn.exec_driver_sql(
+            f"INSERT INTO dbo.mpx_audit_foreign VALUES ('{run_id}', 42)"
+        )
+    assert "mpx_audit_foreign" not in store._data_tables()
+    store.abort_run(run_id)  # unknown names -> sweeps all metricprobe tables
+    store.prune(keep=0)
+    with store.engine.connect() as conn:
+        survivors = conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM dbo.mpx_audit_foreign"
+        ).scalar()
+    assert survivors == 1  # the foreign row is untouched
+    with store.engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE dbo.mpx_audit_foreign")
+
+    # ---- C2: a takeover invalidates the original writer's commit
+    meta = make_meta(run_id)
+    store.begin_run(meta)
+    frame = stamp(pd.DataFrame({"probe": ["a"], "volume": [1]}), meta)
+    store.write_table(run_id, "month_volumes", frame)
+    usurper = MssqlStore(url, schema="dbo")
+    assert usurper.staging_claim(run_id) is not None  # visible server-side
+    usurper.abort_run(run_id)  # deletes rows AND the claim
+    with pytest.raises(RuntimeError, match="staging claim lost"):
+        store.commit_run(run_id, {**dataclasses.asdict(meta), "stages": {}})
+    # nothing became visible: no manifest, no phantom rows
+    assert not any(m["run_id"] == run_id for m in store.list_runs())
+
+    # ---- H3: None-first frames do not freeze varchar for numeric columns
+    first_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    first = make_meta(first_id)
+    store.begin_run(first)
+    none_frame = _typed(
+        "freshness",
+        pd.DataFrame({"probe": ["p"], "epoch_count": [1], "cadence_median_days": [None]}),
+    )
+    store.write_table(first_id, "freshness", stamp(none_frame, first))
+    store.commit_run(first_id, {**dataclasses.asdict(first), "stages": {}})
+    second_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    second = make_meta(second_id, run_at="2026-07-01T07:00:00")
+    store.begin_run(second)
+    value_frame = _typed(
+        "freshness",
+        pd.DataFrame({"probe": ["p"], "epoch_count": [9], "cadence_median_days": [7.5]}),
+    )
+    store.write_table(second_id, "freshness", stamp(value_frame, second))
+    store.commit_run(second_id, {**dataclasses.asdict(second), "stages": {}})
+    read_back = store.read_table(second_id, "freshness")
+    assert float(read_back["cadence_median_days"].iloc[0]) == 7.5
+    assert not isinstance(read_back["cadence_median_days"].iloc[0], str)
+    assert int(read_back["epoch_count"].iloc[0]) == 9
+    store.prune(keep=0)  # clean up

@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import urllib.parse
 import zoneinfo
 from pathlib import Path
 from typing import Annotated, Literal
@@ -211,8 +212,9 @@ class TableConfig(_Model):
                 f"probe {self.probe_name!r}: resolution declared for unknown column(s) "
                 f"{unknown}; configured time columns are {sorted(time_columns)}"
             )
-        # the per-column resolution declaration is REQUIRED for the metric
-        # roles (event/load/source): outputs label their grain from it
+        # the per-column resolution declaration is REQUIRED for every
+        # configured time column — the metric roles (event/load/source) AND
+        # compare_event_time: outputs label their grain from it
         required = {
             column
             for column in (
@@ -220,6 +222,7 @@ class TableConfig(_Model):
                 self.event_time_via.column if self.event_time_via else None,
                 self.load_time,
                 self.source_insert_time,
+                self.compare_event_time,
             )
             if column
         }
@@ -252,7 +255,7 @@ class TableConfig(_Model):
 
 # minute, hour, day-of-month, month, day-of-week (0-7, both 0 and 7 = Sunday)
 _CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
-_CRON_PART = re.compile(r"^(\*|\d+(?:-\d+)?)(?:/\d+)?$")
+_CRON_PART = re.compile(r"^(\*|\d+(?:-\d+)?)(?:/(\d+))?$")
 
 
 def _validate_cron(value: str) -> None:
@@ -266,7 +269,11 @@ def _validate_cron(value: str) -> None:
                 raise ValueError(
                     f"schedule {value!r} is not a valid cron expression: bad field {field_text!r}"
                 )
-            body = match.group(1)
+            body, step = match.group(1), match.group(2)
+            if step is not None and int(step) < 1:
+                raise ValueError(
+                    f"cron field {field_text!r} has a zero step in schedule {value!r}"
+                )
             if body == "*":
                 continue
             numbers = [int(number) for number in body.split("-")]
@@ -311,8 +318,22 @@ class StoreConfig(_Model):
 
     @model_validator(mode="after")
     def _mssql_needs_url(self) -> StoreConfig:
-        if self.backend == "mssql" and not self.mssql_url:
-            raise ValueError('store backend "mssql" requires mssql_url')
+        if self.backend == "mssql":
+            if not self.mssql_url or not self.mssql_url.strip():
+                raise ValueError('store backend "mssql" requires mssql_url')
+            # a malformed URL should fail at CONFIG time, not at the first
+            # write; ${VAR} references are expanded by the loader before
+            # validation, so what arrives here must already parse
+            try:
+                backend = make_url(self.mssql_url).get_backend_name()
+            except Exception as exc:
+                raise ValueError(
+                    f"mssql_url is not a valid SQLAlchemy URL: {exc}"
+                ) from exc
+            if backend != "mssql":
+                raise ValueError(
+                    f"mssql_url must use an mssql dialect, got {backend!r}"
+                )
         return self
 
 
@@ -348,19 +369,23 @@ class DeliveryRemote(_Model):
     @field_validator("url")
     @classmethod
     def _no_embedded_credentials(cls, value: str) -> str:
-        if _URL_WITH_USERINFO.match(value):
-            raise ValueError(
-                f"delivery remote url {value!r} must not embed credentials; "
-                "supply the token through token_env instead"
-            )
-        for match in _SECRET_QUERY_PARAM.finditer(value):
-            name, literal = match.group(1), match.group(2)
-            if not _ENV_VAR_REFERENCE.match(literal):
+        # detection runs on the raw URL AND its percent-DECODED form: encoding
+        # a credential name (%74oken=...) or separator must not smuggle a
+        # literal secret past the env-var-NAMES-only contract
+        for candidate in dict.fromkeys((value, urllib.parse.unquote(value))):
+            if _URL_WITH_USERINFO.match(candidate):
                 raise ValueError(
-                    f"delivery remote url carries a literal value for query "
-                    f"parameter {name!r}; config holds env var NAMES, never "
-                    "secret values — supply the token through token_env"
+                    f"delivery remote url {value!r} must not embed credentials; "
+                    "supply the token through token_env instead"
                 )
+            for match in _SECRET_QUERY_PARAM.finditer(candidate):
+                name, literal = match.group(1), match.group(2)
+                if not _ENV_VAR_REFERENCE.match(literal):
+                    raise ValueError(
+                        f"delivery remote url carries a literal value for query "
+                        f"parameter {name!r}; config holds env var NAMES, never "
+                        "secret values — supply the token through token_env"
+                    )
         return value
 
 
@@ -462,13 +487,28 @@ def load_config(path: str | Path) -> ProbeConfig:
 
 # any URL userinfo (user, user:password, or bare token) — masked entirely
 _URL_USERINFO = re.compile(r"://[^@/\s]+@")
+
+_SECRET_NAMES = (
+    "password", "passwd", "pwd", "token", "access_token", "secret",
+    "api_key", "apikey", "sig", "signature",
+)
+
+
+def _encoded_spelling(name: str) -> str:
+    """A regex matching the name with ANY subset of its characters
+    percent-encoded (p%61ssword), so an encoded credential name cannot dodge
+    redaction. Case-insensitivity comes from the compiled (?i) flag."""
+    return "".join(f"(?:{re.escape(ch)}|%{ord(ch):02x})" for ch in name)
+
+
 # secret-named query/connection-string parameters, matched in BOTH the raw
-# and the percent-encoded spelling (an encoded assignment behind encoded
-# separators) WITHOUT transforming the rest of the string: a global decode
-# would make distinct configs ('a+b' vs 'a b') hash identically.
+# and the percent-encoded spelling (encoded names, encoded assignments,
+# behind raw or encoded separators & ; %26 %3B) WITHOUT transforming the rest
+# of the string: a global decode would make distinct configs ('a+b' vs
+# 'a b') hash identically.
 _SECRET_PARAM = re.compile(
-    r"(?i)(?:(?<![A-Za-z0-9])|(?<=%3[Bb]))"
-    r"(password|passwd|pwd|token|access_token|secret|api_key|apikey|sig|signature)"
+    r"(?i)(?:(?<![A-Za-z0-9])|(?<=%3[Bb])|(?<=%26))"
+    r"(" + "|".join(_encoded_spelling(name) for name in _SECRET_NAMES) + r")"
     # the value may itself contain percent-escapes (a%2Fb): consume them so the
     # WHOLE secret is redacted, but stop at encoded separators %26/%3B exactly
     # as at their raw spellings

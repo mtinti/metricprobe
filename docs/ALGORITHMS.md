@@ -203,16 +203,22 @@ Duplicates present iff duplicate_rows > 0.
 ## 11. Freshness (staleness core; full metric in Step 5)
 
 - Arrival epochs = distinct batch IDs when `load_batch_col` is configured
-  (canonical batch timestamp = MIN(load_time) within the batch, i.e. the
-  minimum over its per-month cells), else distinct load-time buckets. NEVER
-  per-row gaps: row timestamps measure row frequency, not feed cadence.
-- Requires `freshness_min_epochs` epochs, else INSUFFICIENT_EPOCHS.
+  (canonical batch timestamp = MIN(load_time) over ALL the batch's cells,
+  INCLUDING the null-event-month artifact cells — a batch whose earliest
+  arrivals carry corrupt/null event times still arrived then), else distinct
+  load-time buckets. NEVER per-row gaps: row timestamps measure row
+  frequency, not feed cadence.
+- Requires `max(freshness_min_epochs, 2)` epochs, else INSUFFICIENT_EPOCHS —
+  the floor of 2 exists because the cadence is learned from INTER-epoch gaps
+  and one epoch has none (freshness_min_epochs: 1 is a valid config; it
+  simply cannot make one epoch learnable).
 - Learned cadence = median of inter-epoch gaps; spread =
   `max(robust_sigma(gaps), freshness_zero_mad_tolerance_days)` (perfectly
   regular feeds use the configured fixed tolerance).
-- Staleness: `days_since_last_epoch > cadence + 3 * spread` => RED STALE_FEED,
-  `> cadence + 2 * spread` => AMBER (v1 algorithm constants mirroring the
-  volume defaults).
+- Staleness: `days_since_last_epoch > cadence + freshness_red_mads * spread`
+  => RED STALE_FEED, `> cadence + freshness_amber_mads * spread` => AMBER.
+  The multipliers are AnalysisParams with versioned defaults (2.0 / 3.0,
+  mirroring the volume defaults), not constants.
 - Freshness and volume are independent verdicts: a table can be
   "updating: GREEN" and "volume: RED" simultaneously — the sustained-collapse
   acceptance case requires exactly that, which is only satisfiable when the
@@ -221,8 +227,9 @@ Duplicates present iff duplicate_rows > 0.
 ## 12. Batch metrics (when load_batch_col is configured)
 
 From the (event_month, batch_id) cells; a batch's canonical timestamp is
-MIN(load_time) within the batch — the minimum over its per-month cells, since
-a batch can span cohorts.
+MIN(load_time) within the batch — the minimum over ALL its cells including
+the null-event-month artifact cell, since a batch can span cohorts and its
+earliest arrivals may carry corrupt/null event times.
 
 - Batch cells are keyed by LOAD presence, not curve eligibility: a batch
   whose rows have corrupt/NULL event times is still a real arrival epoch for
@@ -265,7 +272,8 @@ must name the right probe.
       (PARITY_PREREQ_UNIQUENESS),
     * read_uncommitted disabled on both configs
       (PARITY_PREREQ_READ_UNCOMMITTED),
-    * negative-lag excess below threshold on both sides
+    * negative-lag excess strictly BELOW the threshold on both sides —
+      exactly AT the threshold is not below it and fails the prerequisite
       (PARITY_PREREQ_NEGATIVE_LAG — the backdating proxy).
 
 ## 14. Dual lag and the raw-vs-corrected side-stat
@@ -325,6 +333,14 @@ max_lookup_dup): the dual pass runs on its own connection, so it asserts
 uniqueness itself — JOIN_NOT_UNIQUE aborts it exactly like the main pass —
 and its staging spool is measured and enforced under the same
 `staging_pages + 10 x staged_rows` bound.
+CANONICAL_SCHEMA_VERSION 3 / DUAL_SCHEMA_VERSION 3: the staged lookup_dup
+column carries the GLOBAL lookup-side max duplication (a second window layer
+computes MAX(dup) OVER () before the join), so duplicate lookup keys abort
+the probe even when no current base row references them — the uniqueness
+contract covers the lookup table itself, not just the joined keys. Blind
+spot, documented: if NO base row survives the as-of watermark (the join
+produces no staged rows) the guard has nothing to carry the max on; the
+metrics are empty in that degenerate case anyway.
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,

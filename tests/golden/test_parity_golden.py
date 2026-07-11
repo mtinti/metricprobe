@@ -2,6 +2,7 @@
 outer join, the watermarked population, the common-mature-by-time rule,
 prerequisites, and tolerance."""
 
+
 import pandas as pd
 import pytest
 from tests.support import table_config
@@ -177,3 +178,20 @@ def test_null_load_rows_are_informational_never_in_the_diff(base_df):
     result = assess_parity(_left(nulled), _side(nulled, "events_b"), AS_OF)
     assert [s.severity for s in result.statuses] == [Severity.GREEN]
     assert result.null_load_left == result.null_load_right > 0
+
+
+def test_negative_lag_prereq_boundary_is_strict(base_df):
+    """The contract requires the excess to be BELOW the threshold: sitting
+    exactly AT it must fail the prerequisite (INDETERMINATE), never GREEN."""
+    from metricprobe.metrics.parity import _failed_prerequisite
+
+    left = _left(base_df)
+    right = _side(base_df, "events_right")
+    threshold = left.config.analysis.negative_lag_red_fraction  # 0.001
+    left.completion.negative_lag_excess_fraction = threshold  # exactly AT it
+    failed = _failed_prerequisite(left, right)
+    assert failed is not None
+    assert failed[0] is ReasonCode.PARITY_PREREQ_NEGATIVE_LAG
+    # strictly below passes
+    left.completion.negative_lag_excess_fraction = threshold / 2
+    assert _failed_prerequisite(left, right) is None

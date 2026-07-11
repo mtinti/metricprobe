@@ -42,10 +42,21 @@ def assess_batch(canonical: CanonicalResult, table: TableConfig) -> BatchAssessm
     cells = canonical.rows_for("month_batch")
     valid = cells[cells["batch_id"].notna()]
     orphaned = cells[cells["batch_id"].isna()]
-    # canonical batch timestamp: MIN over the batch's month cells (spans cohorts)
+    # canonical batch timestamp: MIN over ALL the batch's cells INCLUDING the
+    # null-event-month artifact cells (rows_for drops them) — a batch whose
+    # EARLIEST arrivals carry corrupt/null event times still arrived then,
+    # and using a later month cell would shift every day count derived from it
+    from metricprobe.extract.canonical import GROUPING_SET_IDS
+
+    all_batch_cells = canonical.frame[
+        canonical.frame["grouping_id"] == GROUPING_SET_IDS["month_batch"]
+    ]
+    all_batch_cells = all_batch_cells[all_batch_cells["batch_id"].notna()]
     batch_ts = {
         batch: pd.to_datetime(stamp)
-        for batch, stamp in valid.groupby("batch_id")["min_load_time"].min().items()
+        for batch, stamp in all_batch_cells.groupby("batch_id")["min_load_time"]
+        .min()
+        .items()
     }
     rows_per_run = {
         batch: int(rows)

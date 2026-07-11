@@ -135,6 +135,12 @@ class ParquetStore:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def staging_claim(self, run_id: str) -> str | None:
+        """A present staging directory is this backend's claim: some writer
+        staged the run and has neither committed nor aborted."""
+        staging = self._staging(run_id)
+        return f"staging directory {staging}" if staging.exists() else None
+
     def begin_run(self, meta: RunMeta) -> None:
         staging = self._staging(meta.run_id)
         if staging.exists() or self._committed(meta.run_id).exists():
@@ -256,10 +262,24 @@ class MssqlStore:
             ).scalar()
         return None if row is None else json.loads(row)
 
+    def staging_claim(self, run_id: str) -> str | None:
+        """The server-side staging claim for this run id, or None. A present
+        claim means SOME writer staged the run and has neither committed nor
+        aborted — it may still be alive, so nothing may touch its rows."""
+        with self.engine.connect() as conn:
+            return conn.execute(
+                sa.text(
+                    f"SELECT claimed_at FROM {self.schema}.{self.STAGING_TABLE} "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            ).scalar()
+
     def begin_run(self, meta: RunMeta) -> None:
         """The staging claim is a SERVER-SIDE primary-key insert: two processes
         can never stage the same run_id, so an abort can never touch another
-        writer's rows."""
+        writer's rows. claimed_at doubles as this writer's claim TOKEN —
+        commit_run refuses when the claim it releases is not its own."""
         validate_run_id(meta.run_id)
         if any(m["run_id"] == meta.run_id for m in self.list_runs()):
             raise FileExistsError(f"run {meta.run_id!r} already exists")
@@ -276,7 +296,7 @@ class MssqlStore:
             raise FileExistsError(
                 f"run {meta.run_id!r} is already staged by another writer"
             ) from exc
-        self._staged[meta.run_id] = []
+        self._staged[meta.run_id] = {"claim": meta.run_at, "names": []}
 
     def write_table(self, run_id: str, name: str, frame: pd.DataFrame) -> None:
         if run_id not in self._staged:
@@ -285,7 +305,7 @@ class MssqlStore:
         frame.to_sql(
             f"mp_{name}", self.engine, schema=self.schema, if_exists="append", index=False
         )
-        self._staged[run_id].append(name)
+        self._staged[run_id]["names"].append(name)
 
     def commit_run(self, run_id: str, manifest: dict) -> None:
         if run_id not in self._staged:
@@ -303,12 +323,21 @@ class MssqlStore:
                     "manifest": json.dumps(manifest, sort_keys=True),
                 },
             )
-            conn.execute(
+            released = conn.execute(
                 sa.text(
-                    f"DELETE FROM {self.schema}.{self.STAGING_TABLE} WHERE run_id = :run_id"
+                    f"DELETE FROM {self.schema}.{self.STAGING_TABLE} "
+                    "WHERE run_id = :run_id AND claimed_at = :claim"
                 ),
-                {"run_id": run_id},
+                {"run_id": run_id, "claim": self._staged[run_id]["claim"]},
             )
+            if released.rowcount != 1:
+                # our claim is gone (another writer aborted/took over this
+                # run id): committing would publish a manifest over rows this
+                # process no longer owns — roll everything back instead
+                raise RuntimeError(
+                    f"run {run_id!r}: staging claim lost to another writer; "
+                    "refusing to commit"
+                )
             conn.execute(
                 sa.text(
                     f"DELETE FROM {self.schema}.{self.REGISTRATION_TABLE} "
@@ -323,7 +352,8 @@ class MssqlStore:
         committed run is never touched) and releases the staging claim. When
         this process never staged the run (crash recovery before a resume),
         the staged-table list is unknown, so every data table is swept."""
-        names = self._staged.pop(run_id, None)
+        staged = self._staged.pop(run_id, None)
+        names = None if staged is None else staged["names"]
         with self.engine.begin() as conn:
             committed = conn.execute(
                 sa.text(
@@ -370,18 +400,22 @@ class MssqlStore:
             )
 
     def _data_tables(self) -> list[str]:
+        # 'mp[_]%' escapes the LIKE underscore WILDCARD (bare 'mp_%' also
+        # matches names like mpx_audit) and the Python-side prefix check
+        # guards the guard: sweeping deletes must never see a foreign table
         with self.engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
                     "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                    "WHERE TABLE_SCHEMA = :s AND TABLE_NAME LIKE 'mp_%'"
+                    "WHERE TABLE_SCHEMA = :s AND TABLE_NAME LIKE 'mp[_]%'"
                 ),
                 {"s": self.schema},
             ).scalars()
             return [
                 name
                 for name in rows
-                if name
+                if name.startswith("mp_")
+                and name
                 not in (self.MANIFEST_TABLE, self.STAGING_TABLE, self.REGISTRATION_TABLE)
             ]
 

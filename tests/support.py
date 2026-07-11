@@ -35,6 +35,7 @@ def table_config(**overrides) -> TableConfig:
                 via.get("column") if isinstance(via, dict) else None,
                 data.get("load_time"),
                 data.get("source_insert_time"),
+                data.get("compare_event_time"),
             )
             if column
         ]

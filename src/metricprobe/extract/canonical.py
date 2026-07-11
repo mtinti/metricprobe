@@ -50,9 +50,11 @@ The staging query carries `(load_time <= :as_of OR load_time IS NULL)` — the
 bare `<=` would silently delete the NULL-load bucket reconciliation requires.
 
 The via-join uniqueness guard piggybacks on the staging pass: the lookup side
-is wrapped with COUNT(*) OVER (PARTITION BY join keys); MAX(lookup_dup) > 1
-aborts the probe (JOIN_NOT_UNIQUE) before any metric is computed from inflated
-rows.
+is wrapped with COUNT(*) OVER (PARTITION BY join keys) and a second layer
+carries MAX(dup) OVER () — the GLOBAL lookup-side worst key — on every joined
+row, so MAX(lookup_dup) > 1 aborts the probe (JOIN_NOT_UNIQUE) even when the
+duplicated key is not referenced by any base row (the uniqueness contract
+covers the lookup table itself).
 """
 
 from __future__ import annotations
@@ -69,8 +71,11 @@ from metricprobe.config import TableConfig
 from metricprobe.status import ReasonCode
 
 # v2: the scan-budget accounting formulas changed (row-linear scratch bound,
-# enforced spool bound) — ALGORITHMS.md section 15 records the history
-CANONICAL_SCHEMA_VERSION = 2
+# enforced spool bound) — ALGORITHMS.md section 15 records the history.
+# v3: the staged lookup_dup carries the GLOBAL lookup-side max duplication
+# (a second window layer), so JOIN_NOT_UNIQUE fires on duplicate lookup keys
+# even when no current base row references them
+CANONICAL_SCHEMA_VERSION = 3
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -351,7 +356,7 @@ def build_staging_select(
             via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
         )
         partition = [lookup.c[pair.lookup_col] for pair in via.on]
-        lk = (
+        lk_inner = (
             sa.select(
                 *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
                 sa.literal(1).label("lk_matched"),
@@ -361,8 +366,16 @@ def build_staging_select(
                 sa.func.row_number()
                 .over(partition_by=partition, order_by=partition)
                 .label("lk_rn"),
-            ).subquery("lk")
+            ).subquery("lk_inner")
         )
+        # the GLOBAL max duplication over the whole lookup side, carried on
+        # every joined row: the uniqueness contract covers the lookup table
+        # itself, so duplicate keys that no base row references must still
+        # surface (window nesting is illegal, hence the second layer)
+        lk = sa.select(
+            *lk_inner.c,
+            sa.func.max(lk_inner.c.lk_dup).over().label("lk_maxdup"),
+        ).subquery("lk")
         event = lk.c[f"lk_{via.column}"]
         matched = lk.c.lk_matched.is_not(None)
         source = base.outerjoin(
@@ -431,7 +444,9 @@ def build_staging_select(
         key_hash = sa.cast(sa.null(), sa.String()).label("key_hash")
     if via:
         unmatched_flag = flag(lk.c.lk_matched.is_(None))
-        lookup_dup = lk.c.lk_dup
+        # staged as the GLOBAL lookup-side max: MAX(lookup_dup) in the result
+        # is then the whole lookup table's worst key, joined-or-not (v3)
+        lookup_dup = lk.c.lk_maxdup
         # pre-join base count: unmatched rows plus the FIRST match per base row
         base_row_flag = flag(sa.or_(lk.c.lk_matched.is_(None), lk.c.lk_rn == 1))
         ambiguous_flag = flag(sa.and_(lk.c.lk_rn == 1, lk.c.lk_dup > 1))
@@ -719,8 +734,15 @@ def _reads_by_table(messages: list[str]) -> dict[str, int]:
 
 
 def _target_reads_from(messages: list[str], target_tables: set[str]) -> int | None:
+    # SQL Server identifiers are case-insensitive under the usual collations:
+    # a config naming the table in different case still executes, so the
+    # STATISTICS IO attribution must fold case too, or a legitimate probe
+    # would abort as unverifiable
     reads = _reads_by_table(messages)
-    matched = {name: count for name, count in reads.items() if name in target_tables}
+    targets = {name.casefold() for name in target_tables}
+    matched = {
+        name: count for name, count in reads.items() if name.casefold() in targets
+    }
     return sum(matched.values()) if matched else None
 
 
@@ -730,10 +752,11 @@ def _scratch_reads_from(messages: list[str], staging_prefix: str) -> int | None:
     reads = _reads_by_table(messages)
     if not reads:
         return None
+    prefix = staging_prefix.casefold()
     return sum(
         count
         for name, count in reads.items()
-        if name.startswith(staging_prefix) or name in ("Worktable", "Workfile")
+        if name.casefold().startswith(prefix) or name in ("Worktable", "Workfile")
     )
 
 

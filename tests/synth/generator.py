@@ -73,6 +73,10 @@ class StepBatches:
             raise ValueError(f"StepBatches fractions must sum to 1, got {total}")
 
 
+# per-month row-id block size: ids are month_index * stride + offset
+_ROW_ID_STRIDE = 10_000_000
+
+
 @dataclass(frozen=True)
 class TableSpec:
     """Full generating parameters for one synthetic table."""
@@ -133,7 +137,15 @@ def _month_frame(spec: TableSpec, index: int, period: pd.Period) -> pd.DataFrame
         arrival = pd.DatetimeIndex(batch_times[choice])
         batch_id = [f"{period}-run{c}" for c in choice]
 
-    frame = pd.DataFrame({"row_id": index * 10_000_000 + np.arange(n), "event_time": event})
+    # row ids are unique BY CONSTRUCTION only under the fixed stride: a month
+    # that overflows it would silently collide with the next month's ids and
+    # corrupt every duplicate-key expectation — fail loudly instead
+    if n >= _ROW_ID_STRIDE:
+        raise ValueError(
+            f"month {period} draws {n} rows >= the {_ROW_ID_STRIDE} row-id "
+            "stride; row ids would collide across months"
+        )
+    frame = pd.DataFrame({"row_id": index * _ROW_ID_STRIDE + np.arange(n), "event_time": event})
     if spec.dual_offset_days is not None:
         frame["source_insert_time"] = arrival
         frame["load_time"] = arrival + pd.Timedelta(days=spec.dual_offset_days)

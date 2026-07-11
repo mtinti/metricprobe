@@ -120,6 +120,7 @@ COVERAGE: dict[str, str] = {
         "test_scan_budget_enforced_through_the_production_runner",
     # ---- probe refusals (fail-closed paths), produced through the runners
     "refusal:join_not_unique": "test_via_non_unique_lookup_aborts_on_both_dialects",
+    "refusal:dual_join_not_unique": "test_via_non_unique_lookup_aborts_on_both_dialects",
     "refusal:result_cell_cap": "test_cell_cap_aborts_on_both_dialects",
     "refusal:scan_budget": "test_scan_budget_refusals_through_the_production_runner",
     # ---- storage + harness
@@ -229,6 +230,17 @@ def test_every_mapped_test_exists():
     assert not dangling, f"coverage map points at nonexistent tests: {dangling}"
 
 
+# every refusal mapping must point at a test whose source shows the refusal
+# actually happening: the reason-code token AND (for pass-specific refusals)
+# the runner that must raise it
+REFUSAL_REQUIRED_TOKENS = {
+    "join_not_unique": ("JOIN_NOT_UNIQUE", "run_canonical"),
+    "dual_join_not_unique": ("JOIN_NOT_UNIQUE", "run_dual_lag"),
+    "result_cell_cap": ("RESULT_CELL_CAP_EXCEEDED",),
+    "scan_budget": ("SCAN_BUDGET",),
+}
+
+
 def test_mappings_are_meaningful_not_arbitrary():
     """A mapping must point at a test that actually exercises its subject."""
     sources = _test_sources()
@@ -240,6 +252,12 @@ def test_mappings_are_meaningful_not_arbitrary():
             entry = subject.split(".", 1)[1]
             if entry not in source:
                 problems.append(f"{item} -> {test_name} never calls {entry}")
+        elif kind == "refusal":
+            for token in REFUSAL_REQUIRED_TOKENS[subject]:
+                if token not in source:
+                    problems.append(
+                        f"{item} -> {test_name} never demonstrates {token}"
+                    )
         elif kind == "scenario":
             # the injector/scenario name must appear, and BOTH twin directions
             # must be exercised (the healthy twin stays silent)

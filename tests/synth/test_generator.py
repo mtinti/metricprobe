@@ -381,3 +381,18 @@ def test_twins_differ_only_in_the_injected_pathology():
     assert set(collapsed["load_time"].unique()) == set(
         pairs["sustained_collapse"].healthy()["load_time"].unique()
     )
+
+
+def test_row_id_stride_overflow_fails_loudly():
+    # a month bigger than the row-id stride would silently collide with the
+    # next month's ids (unintended duplicates in the twins): refuse instead
+    from tests.synth import generator
+
+    spec = generator.TableSpec(
+        name="huge", start_month="2024-01", n_months=2, rows_per_month=2,
+        lag_model=generator.LognormalLag(mu=1.0, sigma=0.5),
+        volume_overrides={0: 6_000_000},  # 12M rows > the 10M stride
+        seed=1,
+    )
+    with pytest.raises(ValueError, match="stride"):
+        generator.generate(spec)

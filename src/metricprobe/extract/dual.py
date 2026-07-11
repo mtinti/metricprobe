@@ -5,8 +5,9 @@ Same execution shape as the canonical pass: stage one scan of narrow derived
 columns into a session temp table, aggregate with GROUPING SETS, drop. The
 scan budget is verified fail-closed on mssql exactly like the main pass.
 
-FROZEN DUAL SCHEMA (v2 — v1 lacked the lookup-uniqueness guard columns and
-used the pages-only scratch budget). Grouping columns and GROUPING() weights:
+FROZEN DUAL SCHEMA (v3 — v1 lacked the lookup-uniqueness guard columns and
+used the pages-only scratch budget; v2's guard saw only joined lookup rows,
+v3 stages the GLOBAL lookup-side max duplication). Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
     1 = (event_month, lag_day)   source-side completion curves, where lag_day
@@ -53,7 +54,7 @@ from metricprobe.extract.canonical import (
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 2
+DUAL_SCHEMA_VERSION = 3
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -132,12 +133,18 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
         )
         partition = [lookup.c[pair.lookup_col] for pair in via.on]
-        lk = sa.select(
+        lk_inner = sa.select(
             *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
             sa.func.count().over(partition_by=partition).label("lk_dup"),
+        ).subquery("lk_inner")
+        # the GLOBAL lookup-side max duplication on every joined row, exactly
+        # like the main pass: the contract covers the lookup table itself
+        lk = sa.select(
+            *lk_inner.c,
+            sa.func.max(lk_inner.c.lk_dup).over().label("lk_maxdup"),
         ).subquery("lk")
         event = lk.c[f"lk_{via.column}"]
-        lookup_dup = lk.c.lk_dup
+        lookup_dup = lk.c.lk_maxdup
         source_from = base.outerjoin(
             lk,
             sa.and_(

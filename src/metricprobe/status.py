@@ -19,7 +19,10 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-STATUS_SCHEMA_VERSION = 1
+# v2: values added after the v1 freeze — Check.PROBE and the reason codes
+# grown by Steps 3-7 (NULL_BATCH_IDS, SCAN_BUDGET_UNVERIFIABLE, ...); the
+# serialized-value set changed, so the wire version changed with it
+STATUS_SCHEMA_VERSION = 2
 
 
 class Severity(StrEnum):

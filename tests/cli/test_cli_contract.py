@@ -458,3 +458,68 @@ def test_multi_config_campaign_composes_and_validates(tmp_path, demo_db):
     assert run_cli("--config", left, "--config", dup, "--as-of", AS_OF) == 1
     # invalid run ids are refused loudly
     assert run_cli("--config", left, "--as-of", AS_OF, "--run-id", "../evil") == 1
+
+
+def test_resume_preserves_the_failed_runs_identity(tmp_path, demo_db, monkeypatch):
+    """A resumed run keeps its registered as_of/window (the run id keeps
+    meaning ONE analysis); conflicting explicit flags refuse; plain --run-id
+    reuse of a registered id refuses without --resume-from."""
+    import metricprobe.cli as cli
+
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("injected analysis failure")
+
+    monkeypatch.setattr(cli, "assess_volume", explode)
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "r-id") == 1
+    monkeypatch.undo()
+    # plain reuse of the registered id (digest guard bypass) is refused
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "r-id") == 1
+    # resuming under a DIFFERENT as_of or window is a different analysis
+    assert (
+        run_cli("--config", config, "--as-of", "2025-01-01",
+                "--resume-from", "analysis", "--run-id", "r-id") == 1
+    )
+    assert (
+        run_cli("--config", config, "--window", "6m",
+                "--resume-from", "analysis", "--run-id", "r-id") == 1
+    )
+    # with no conflicting flags the registration's identity is adopted
+    assert run_cli("--config", config, "--resume-from", "analysis", "--run-id", "r-id") == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    assert manifest["as_of"].startswith(AS_OF)
+
+
+def test_resume_refuses_while_a_staging_claim_exists(tmp_path, demo_db):
+    """A present staging claim means another writer may still be working the
+    run id: resuming must refuse rather than abort its rows (a crashed writer
+    needs explicit cleanup, never a silent takeover)."""
+    from metricprobe.store import SNAPSHOT_SCHEMA_VERSION, RunMeta
+
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    # first, learn the digest of this config by dry-running a real run
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "r-probe") == 0
+    store = ParquetStore(tmp_path / "store")
+    digest = store.list_runs()[0]["config_digest"]
+    # simulate a writer that crashed (or is still alive) mid-stage: claim held
+    meta = RunMeta(
+        run_id="r-crashed", run_at="2025-07-02T00:00:00", as_of=f"{AS_OF}T00:00:00",
+        git_sha="x", tool_version="0", config_digest=digest,
+        schema_version=SNAPSHOT_SCHEMA_VERSION,
+        window_start="2023-07-02T00:00:00", window_end=f"{AS_OF}T00:00:00",
+    )
+    store.register_run(meta)
+    store.begin_run(meta)  # the claim: staging dir exists, never aborted
+    assert store.staging_claim("r-crashed") is not None
+    assert (
+        run_cli("--config", config, "--resume-from", "analysis", "--run-id", "r-crashed")
+        == 1
+    )
+    # cleanup releases the claim; the resume then proceeds
+    store.abort_run("r-crashed")
+    assert store.staging_claim("r-crashed") is None
+    assert (
+        run_cli("--config", config, "--resume-from", "analysis", "--run-id", "r-crashed")
+        == 0
+    )

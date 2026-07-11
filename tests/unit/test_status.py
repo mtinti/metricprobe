@@ -87,10 +87,11 @@ def test_status_round_trips_over_the_wire():
     assert Status.model_validate(status.model_dump(mode="json")) == status
 
 
-def test_wire_values_are_frozen_v1():
+def test_wire_values_are_frozen_v2():
     # These are the SERIALIZED values stored in snapshots; changing any of them
-    # is a schema change and must bump STATUS_SCHEMA_VERSION.
-    assert STATUS_SCHEMA_VERSION == 1
+    # is a schema change and must bump STATUS_SCHEMA_VERSION (v2 = the value
+    # sets below, including Check.PROBE and the Step 3-7 reason codes).
+    assert STATUS_SCHEMA_VERSION == 2
     assert {severity.value for severity in Severity} == {
         "red",
         "amber",
@@ -150,8 +151,8 @@ def test_component_versions_are_pinned():
 
     assert COMPONENT_VERSIONS == {
         "config": 2,  # v2: mssql_schema, freshness MADs, required resolution
-        "status": 1,
-        "canonical": 2,  # v2: row-linear scratch ledger + spool ledger
-        "dual": 2,  # v2: lookup-uniqueness guard columns + ledger split
+        "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
+        "canonical": 3,  # v3: staged lookup_dup is the GLOBAL lookup max
+        "dual": 3,  # v3: same global lookup-uniqueness guard as the main pass
         "snapshot": 2,  # v2: canonical v2 cells, stable probe_runs, grain labels
     }

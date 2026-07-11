@@ -143,7 +143,9 @@ def match_roles(
         for column in pool:
             lowered = column.column.lower()
             for strength, needle in enumerate(needles):
-                if needle in lowered:
+                # matching is case-insensitive on BOTH sides: override
+                # needles arrive in whatever case the user typed
+                if needle.lower() in lowered:
                     scored.append((strength, column.ordinal, column.column))
                     break
         ranked[role] = [name for _, _, name in sorted(scored)]
@@ -202,7 +204,8 @@ def draft_config(
             ", ".join(f"{c.column} ({c.data_type})" for c in datetime_columns)
         )
         probe_name = _unique_probe_name(table_schema, table)
-        lines.append(f"  # {database}.{table_schema}.{table} — date/time columns: {described}")
+        located = _comment_safe(f"{database}.{table_schema}.{table}")
+        lines.append(f"  # {located} — date/time columns: {described}")
         lines.append(f"  - probe_name: {_yaml_str(probe_name)}")
         lines.append(f"    database: {_yaml_str(database)}")
         lines.append(f"    schema: {_yaml_str(table_schema)}")

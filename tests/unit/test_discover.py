@@ -225,3 +225,26 @@ def test_cli_candidate_overrides_and_guarded_output(demo_db, tmp_path, capsys):
               "--out", str(tmp_path / "missing_dir" / "draft.yaml")])
         == 1
     )
+
+
+def test_candidate_overrides_are_case_insensitive(engine):
+    columns = [c for c in scan_columns(engine, "demo", schema="main") if c.table == "ambiguous"]
+    upper = match_roles(columns, candidates={"event_time": ("ONLY_STAMP",)})
+    assert upper["event_time"] == ["only_stamp"]
+
+
+def test_newline_identifiers_do_not_break_draft_comments(tmp_path):
+    # a legal (if hostile) newline-bearing table name must not inject raw
+    # newlines into a YAML comment and split the document mid-line
+    path = tmp_path / "newline.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute('CREATE TABLE "bad\ntable" (event_time DATE, load_time TIMESTAMP)')
+    con.close()
+    engine = sa.create_engine(f"duckdb:///{path}")
+    try:
+        draft = draft_config(engine, "newline", f"duckdb:///{path}", schema="main")
+    finally:
+        engine.dispose()
+    parsed = yaml.safe_load(draft)  # the draft still parses
+    (entry,) = parsed["tables"]
+    assert entry["table"] == "bad\ntable"  # the VALUE round-trips exactly

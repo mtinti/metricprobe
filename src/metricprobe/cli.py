@@ -133,9 +133,10 @@ def _parse_window(args, as_of: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp
     if args.year:
         start = pd.Timestamp(year=args.year, month=1, day=1)
         return start, start + pd.DateOffset(years=1)
-    if not args.window.endswith("m"):
-        raise ConfigError(f"--window must look like '24m', got {args.window!r}")
-    months = int(args.window[:-1])
+    window = args.window or "24m"
+    if not window.endswith("m"):
+        raise ConfigError(f"--window must look like '24m', got {window!r}")
+    months = int(window[:-1])
     return as_of - pd.DateOffset(months=months), as_of
 
 
@@ -376,6 +377,92 @@ def _int_or_none(value):
 # identical no matter which probe outcome writes first
 READ_COLUMNS = ("target_logical_reads", "scan_budget_reads", "scratch_logical_reads")
 
+# the FROZEN snapshot column types (nullable pandas dtypes). Applied to every
+# frame before it is written: to_sql() infers physical column types from the
+# FIRST frame it sees, so a None-first numeric column (e.g. an insufficient
+# run's freshness cadence) would otherwise freeze a varchar that silently
+# turns later numbers into strings. Unlisted columns are strings.
+TYPED_COLUMNS: dict[str, dict[str, str]] = {
+    "statuses": {"status_schema_version": "Int64"},
+    "probe_runs": {
+        "duration_seconds": "Float64",
+        **dict.fromkeys(READ_COLUMNS, "Int64"),
+    },
+    "population_buckets": {
+        "row_count": "Int64",
+        "n_curve_eligible": "Int64",
+        "n_null_event_time": "Int64",
+        "n_null_load_time_only": "Int64",
+        "n_negative_clipped": "Int64",
+        "n_negative_lag_excluded": "Int64",
+        "n_overflow": "Int64",
+        "n_join_unmatched": "Int64",
+        "n_other_exclusions": "Int64",
+        "n_base_rows": "Int64",
+        "n_ambiguous_base_rows": "Int64",
+        "n_compare_mismatch": "Int64",
+        "distinct_keys": "Int64",
+    },
+    "completion_summary": {
+        "learned_wait": "Int64",
+        "horizon": "Int64",
+        "recommended_wait": "Int64",
+        "negative_lag_excess_fraction": "Float64",
+        "p50_mean": "Float64", "p50_std": "Float64",
+        "p90_mean": "Float64", "p90_std": "Float64",
+        "p95_mean": "Float64", "p95_std": "Float64",
+        "p99_mean": "Float64", "p99_std": "Float64",
+    },
+    "volume_summary": {
+        "baseline_median": "Float64",
+        "baseline_sigma": "Float64",
+        "forecast": "Float64",
+        "duplicate_rows": "Int64",
+    },
+    "completion_percentiles": {"pct": "Int64", "days": "Int64", "over_cap": "boolean"},
+    "month_volumes": {
+        "volume": "Int64",
+        "expected_low": "Float64",
+        "expected_high": "Float64",
+        "nowcast": "Float64",
+        "deficit": "boolean",
+    },
+    "month_lag_cells": {"lag_day": "Int64", "row_count": "Int64"},
+    "epoch_cells": {"row_count": "Int64"},
+    "freshness": {
+        "epoch_count": "Int64",
+        "cadence_median_days": "Float64",
+        "cadence_sigma_days": "Float64",
+        "days_since_last": "Float64",
+    },
+    "batch_runs": {"rows": "Int64"},
+    "batch_months": {
+        "runs": "Int64",
+        "null_batch_rows": "Int64",
+        "days_to_p50": "Int64",
+        "days_to_p90": "Int64",
+        "days_to_p95": "Int64",
+        "days_to_p99": "Int64",
+    },
+    "dual_summary": {
+        "n_null_source_only": "Int64",
+        "n_delta_rows": "Int64",
+        "negative_lag_excess_fraction": "Float64",
+    },
+    "dual_lag_cells": {"lag_day": "Int64", "row_count": "Int64"},
+    "dual_percentiles": {"pct": "Int64", "days": "Int64", "over_cap": "boolean"},
+    "dual_delta": {"delta_day": "Int64", "row_count": "Int64"},
+    "compare_mismatch": {"mismatches": "Int64"},
+    "parity_months": {"left_count": "Int64", "right_count": "Int64", "diff": "Int64"},
+}
+
+
+def _typed(name: str, frame: pd.DataFrame) -> pd.DataFrame:
+    for column, dtype in TYPED_COLUMNS.get(name, {}).items():
+        if column in frame.columns:
+            frame[column] = frame[column].astype(dtype)
+    return frame
+
 
 # the contract versions this build writes under — serialized into every run
 # manifest so a stored run names the exact contracts that produced it
@@ -519,8 +606,12 @@ def _stage_analysis(
                 _collect_statuses(frames, table.probe_name, statuses)
                 all_statuses += statuses
         for name, frame in frames.frames().items():
-            store.write_table(meta.run_id, name, stamp(frame, meta))
-        store.write_table(meta.run_id, "probe_runs", stamp(pd.DataFrame(probe_records), meta))
+            store.write_table(meta.run_id, name, stamp(_typed(name, frame), meta))
+        store.write_table(
+            meta.run_id,
+            "probe_runs",
+            stamp(_typed("probe_runs", pd.DataFrame(probe_records)), meta),
+        )
         manifest = {
             **dataclasses.asdict(meta),
             "probes": probe_records,
@@ -644,12 +735,74 @@ def cmd_run(args) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            # the failed stage left nothing partial by contract, but a crashed
-            # process may not have aborted: clear any leftover staging (safe —
-            # abort never touches a committed run), then re-run the stage
-            # under the SAME run_id
+            claim = store.staging_claim(args.run_id)
+            if claim is not None:
+                # a live staging claim means ANOTHER writer may still be
+                # working this run id: aborting it here would delete its rows
+                # while it can still commit — refuse instead. (A clean stage
+                # failure always releases the claim; a present claim is either
+                # an active writer or a crashed one needing explicit cleanup.)
+                print(
+                    f"metricprobe: run {args.run_id!r} still holds a staging "
+                    f"claim ({claim}); another writer may be active. If that "
+                    "writer is dead, remove its staging claim and retry",
+                    file=sys.stderr,
+                )
+                return 1
+            # a resumed run KEEPS its identity: as_of, window and run_at come
+            # from the registration (the run id keeps meaning ONE analysis);
+            # explicitly passed flags must agree or the resume is refused.
+            # git_sha/tool_version are refreshed: they describe the execution.
+            conflicts = []
+            if args.as_of and pd.Timestamp(args.as_of) != pd.Timestamp(
+                registration["as_of"]
+            ):
+                conflicts.append(f"--as-of {args.as_of} != {registration['as_of']}")
+            if args.year or args.window:
+                registered_as_of = pd.Timestamp(registration["as_of"])
+                want_start, want_end = _parse_window(args, registered_as_of)
+                if want_start != pd.Timestamp(
+                    registration["window_start"]
+                ) or want_end != pd.Timestamp(registration["window_end"]):
+                    conflicts.append(
+                        f"window {want_start.date()}..{want_end.date()} != "
+                        f"{registration['window_start']}..{registration['window_end']}"
+                    )
+            if conflicts:
+                print(
+                    f"metricprobe: refusing to resume run {args.run_id!r} under a "
+                    "different identity: " + "; ".join(conflicts),
+                    file=sys.stderr,
+                )
+                return 1
+            meta = RunMeta(
+                **{
+                    **registration,
+                    "git_sha": _git_sha(),
+                    "tool_version": metricprobe.__version__,
+                }
+            )
+            as_of = pd.Timestamp(meta.as_of)
+            window_start = pd.Timestamp(meta.window_start)
+            window_end = pd.Timestamp(meta.window_end)
+            run_id = meta.run_id
+            # no claim exists, so nothing is staged on a claim-checking store;
+            # sweep any orphan rows left by a writer that died mid-statement
             store.abort_run(args.run_id)
             print(f"run {args.run_id!r}: resuming failed analysis stage")
+        elif args.run_id:
+            # a fresh run must not silently reuse an id: the digest guard only
+            # exists if the id keeps pointing at one durable record
+            if store.registration(args.run_id) is not None or any(
+                m["run_id"] == args.run_id for m in store.list_runs()
+            ):
+                print(
+                    f"metricprobe: run id {args.run_id!r} is already registered or "
+                    "committed; pass --resume-from analysis to retry it, or choose "
+                    "a new run id",
+                    file=sys.stderr,
+                )
+                return 1
         store.register_run(meta)
         statuses = _stage_analysis(configs, meta, store, as_of, (window_start, window_end))
     except Exception as error:  # a configured stage failed -> exit 1
@@ -721,7 +874,10 @@ def main(argv=None) -> int:
 
     run = commands.add_parser("run", help="execute all configured probes under one run")
     run.add_argument("--config", action="append", required=True, help="YAML config (repeatable)")
-    run.add_argument("--window", default="24m", help="rolling window, e.g. 24m (default)")
+    # default applied in _parse_window: None distinguishes "not passed" so a
+    # resume can tell an explicit window (must match the registration) from
+    # the default (adopts the registration)
+    run.add_argument("--window", default=None, help="rolling window, e.g. 24m (default)")
     run.add_argument("--year", type=int, help="fixed calendar year instead of --window")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--resume-from", help=f"stage to resume ({', '.join(STAGES)})")
