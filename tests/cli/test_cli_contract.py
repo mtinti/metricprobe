@@ -229,7 +229,7 @@ def test_retention_prunes_after_commit(tmp_path, demo_db):
 
 
 def test_unimplemented_commands_say_so():
-    for command in ("report", "publish", "serve", "discover"):
+    for command in ("report", "publish", "serve"):
         assert main([command]) == 1
 
 

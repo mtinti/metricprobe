@@ -47,8 +47,10 @@ from metricprobe.config import (
     TableConfig,
     compose_campaign,
     config_digest,
+    expand_env,
     load_config,
 )
+from metricprobe.discover import draft_config
 from metricprobe.extract.canonical import ProbeAborted, run_canonical
 from metricprobe.extract.dual import run_dual_lag
 from metricprobe.metrics.batch import assess_batch
@@ -604,6 +606,26 @@ def cmd_run(args) -> int:
     return exit_code_for(statuses)
 
 
+def cmd_discover(args) -> int:
+    try:
+        engine = sa.create_engine(expand_env(args.url))
+        try:
+            draft = draft_config(engine, args.database, args.url, schema=args.schema)
+        finally:
+            engine.dispose()
+    except Exception as error:
+        print(f"metricprobe: discover failed: {error}", file=sys.stderr)
+        return 1
+    if args.out:
+        from pathlib import Path
+
+        Path(args.out).write_text(draft, encoding="utf-8")
+        print(f"draft config written to {args.out}")
+    else:
+        print(draft, end="")
+    return 0
+
+
 def _unimplemented(command: str, step: str):
     def handler(args) -> int:
         print(f"metricprobe {command}: lands in {step}", file=sys.stderr)
@@ -627,11 +649,19 @@ def main(argv=None) -> int:
     run.add_argument("--as-of", help="freeze the analysis cutoff (injectable clock)")
     run.set_defaults(handler=cmd_run)
 
+    discover = commands.add_parser(
+        "discover", help="scan INFORMATION_SCHEMA and emit a draft config"
+    )
+    discover.add_argument("--url", required=True, help="SQLAlchemy URL (env-expandable)")
+    discover.add_argument("--database", required=True)
+    discover.add_argument("--schema", help="restrict the scan to one schema")
+    discover.add_argument("--out", help="write the draft here instead of stdout")
+    discover.set_defaults(handler=cmd_discover)
+
     for command, step in (
         ("report", "Step 9"),
         ("publish", "Step 9"),
         ("serve", "Step 10"),
-        ("discover", "Step 8"),
     ):
         stub = commands.add_parser(command)
         stub.set_defaults(handler=_unimplemented(command, step))

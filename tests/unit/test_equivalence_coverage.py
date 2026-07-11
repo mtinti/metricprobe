@@ -31,7 +31,7 @@ from sqlalchemy.sql.expression import ClauseElement, FunctionElement
 from tests.synth.scenarios import catalog
 
 import metricprobe.metrics as metrics_package
-from metricprobe import cli, config, store
+from metricprobe import cli, config, discover, store
 from metricprobe.extract import canonical, dual
 from metricprobe.status import Check
 
@@ -75,6 +75,7 @@ COVERAGE: dict[str, str] = {
     "dialect_module:store": "test_mssql_store_shares_the_run_contract",
     "dialect_module:cli": "test_scan_budget_enforced_through_the_production_runner",
     "dialect_module:config": "test_mssql_store_shares_the_run_contract",
+    "dialect_module:discover": "test_discover_matches_between_dialects",
     # ---- behaviors beyond single constructs
     "behavior:via_join_composite_unmatched":
         "test_via_join_and_alt_grouping_match_between_dialects",
@@ -122,7 +123,7 @@ def _metric_modules() -> dict[str, set[str]]:
 
 def _dialect_modules() -> set[str]:
     names = set()
-    for module in (canonical, dual, store, cli, config):
+    for module in (canonical, dual, store, cli, config, discover):
         if '"mssql"' in inspect.getsource(module):
             names.add(module.__name__.rsplit(".", 1)[-1])
     return names

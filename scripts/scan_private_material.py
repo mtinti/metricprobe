@@ -118,6 +118,9 @@ def content_violations(path: str, text: str, extra_markers: list[str]) -> list[s
             if "(" in value or ")" in value or "[" in value:
                 continue  # code expression / annotation, not a literal value
             if not value:
+                # Python control-flow tests over a field-named variable are code
+                if re.match(r"\s*(if|elif|while|assert|return)\b", line):
+                    continue
                 violations.append(
                     f"{path}:{lineno}: environment-shaped field {key!r} has no inline value"
                     " (use a placeholder or env-var reference)"

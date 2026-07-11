@@ -73,6 +73,8 @@ def test_equality_comparisons_are_not_assignments():
 
 def test_environment_shaped_field_with_empty_value_is_flagged():
     assert scan.content_violations("cfg.yaml", "ser" + "ver:", [])
+    # ... but Python control flow over a variable named like a field is fine
+    assert scan.content_violations("x.py", "    if schema:", []) == []
 
 
 def test_prefixed_keys_are_detected():

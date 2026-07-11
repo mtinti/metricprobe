@@ -340,3 +340,36 @@ def test_scan_budget_refusals_through_the_production_runner(mssql_engine, monkey
     with pytest.raises(ProbeAborted) as excinfo:
         run_canonical(mssql_engine, config, as_of)
     assert excinfo.value.reason is ReasonCode.SCAN_BUDGET_UNVERIFIABLE
+
+
+def test_discover_matches_between_dialects(duckdb_engine, mssql_engine):
+    """Step 8: the INFORMATION_SCHEMA scanner assigns the same roles from the
+    same column names on both engines, across their different type spellings
+    (DATE/TIMESTAMP vs date/datetime2)."""
+    from metricprobe.discover import datetime_inventory, match_roles, scan_columns
+
+    ddl = {
+        "duckdb": (
+            "CREATE OR REPLACE TABLE disc_orders (order_id BIGINT, event_time DATE, "
+            "load_time TIMESTAMP, batch_id VARCHAR, amount DOUBLE)"
+        ),
+        "mssql": (
+            "IF OBJECT_ID('dbo.disc_orders') IS NOT NULL DROP TABLE dbo.disc_orders; "
+            "CREATE TABLE dbo.disc_orders (order_id bigint, event_time date, "
+            "load_time datetime2, batch_id varchar(20), amount float)"
+        ),
+    }
+    role_maps = []
+    for engine, database, schema in _both(duckdb_engine, mssql_engine):
+        with engine.begin() as conn:
+            conn.exec_driver_sql(ddl[engine.dialect.name])
+        columns = scan_columns(engine, database, schema=schema)
+        table_columns = [c for c in columns if c.table == "disc_orders"]
+        inventory = datetime_inventory(table_columns).get((schema, "disc_orders"), [])
+        assert [c.column for c in inventory] == ["event_time", "load_time"]
+        role_maps.append(match_roles(table_columns))
+    duck_roles, mssql_roles = role_maps
+    assert duck_roles == mssql_roles
+    assert mssql_roles["event_time"] == ["event_time"]
+    assert mssql_roles["load_time"] == ["load_time"]
+    assert mssql_roles["load_batch_col"] == ["batch_id"]
