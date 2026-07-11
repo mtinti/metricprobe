@@ -66,6 +66,11 @@ def test_environment_shaped_fields_with_placeholders_pass():
         assert scan.content_violations("cfg.yaml", field, []) == [], field
 
 
+def test_equality_comparisons_are_not_assignments():
+    # `x.schema == "value"` in test code is a comparison, not a field
+    assert scan.content_violations("t.py", 'assert ok.schema == "whatever_value"', []) == []
+
+
 def test_environment_shaped_field_with_empty_value_is_flagged():
     assert scan.content_violations("cfg.yaml", "ser" + "ver:", [])
 

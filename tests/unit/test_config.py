@@ -335,6 +335,19 @@ def test_delivery_urls_must_not_embed_credentials():
 def test_mssql_store_requires_url():
     with pytest.raises(ValidationError, match="mssql_url"):
         ProbeConfig.model_validate(minimal_config(store={"backend": "mssql"}))
+    # the store schema comes from CONFIG, never hardcoded; blank is rejected
+    ok = ProbeConfig.model_validate(
+        minimal_config(
+            store={"backend": "mssql", "mssql_url": "mssql+pymssql://localhost/demo",
+                   "mssql_schema": "metricprobe_meta"}
+        )
+    )
+    assert ok.store.mssql_schema == "metricprobe_meta"
+    assert ProbeConfig.model_validate(minimal_config()).store.mssql_schema == "dbo"
+    with pytest.raises(ValidationError, match="blank"):
+        ProbeConfig.model_validate(
+            minimal_config(store={"backend": "duckdb", "mssql_schema": " "})
+        )
 
 
 # ------------------------------------------------------------ digest + defaults

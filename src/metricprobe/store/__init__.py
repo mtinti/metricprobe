@@ -179,7 +179,7 @@ class MssqlStore:
     MANIFEST_TABLE = "mp_run_manifest"
     STAGING_TABLE = "mp_run_staging"
 
-    def __init__(self, url: str, schema: str = "dbo"):
+    def __init__(self, url: str, schema: str):
         self.engine = sa.create_engine(url)
         self.schema = schema
         with self.engine.begin() as conn:
@@ -338,5 +338,6 @@ class MssqlStore:
 
 def open_store(config: StoreConfig):
     if config.backend == "mssql":
-        return MssqlStore(expand_env(config.mssql_url))
+        # the schema comes from config, like every database locator
+        return MssqlStore(expand_env(config.mssql_url), schema=config.mssql_schema)
     return ParquetStore(config.path)

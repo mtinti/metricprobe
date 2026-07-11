@@ -68,7 +68,9 @@ from sqlalchemy.sql.expression import ClauseElement, FunctionElement
 from metricprobe.config import TableConfig
 from metricprobe.status import ReasonCode
 
-CANONICAL_SCHEMA_VERSION = 1
+# v2: the scan-budget accounting formulas changed (row-linear scratch bound,
+# enforced spool bound) — ALGORITHMS.md section 15 records the history
+CANONICAL_SCHEMA_VERSION = 2
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -814,6 +816,7 @@ def verify_scan_budget(
 
 
 SCRATCH_ROW_ALLOWANCE = 6  # sort/spool worktable reads per staged row (measured <=2.6)
+SPOOL_ROW_ALLOWANCE = 10  # via-join window spool reads per staged row (measured ~6)
 
 
 def verify_scratch_budget(
@@ -845,6 +848,29 @@ def verify_scratch_budget(
             f"{staging_pages} pages, + {SCRATCH_ROW_ALLOWANCE}/row x {staged_rows} rows)",
         )
     return scratch_reads, budget
+
+
+def verify_spool_budget(
+    spool_reads: int | None, staging_pages: int | None, staged_rows: int, probe_name: str
+) -> tuple[int, int]:
+    """The staging statement's own worktable spool (the via-join uniqueness
+    window functions) is row-proportional; it is ENFORCED fail-closed against
+    a row-linear bound, not merely reported (ALGORITHMS.md section 15)."""
+    if staging_pages is None or spool_reads is None:
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
+            f"probe {probe_name!r}: the staging-spool ledger is unmeasurable; "
+            "refusing to run unbudgeted",
+        )
+    budget = max(staging_pages, 1) + SPOOL_ROW_ALLOWANCE * max(staged_rows, 0)
+    if spool_reads > budget:
+        raise ProbeAborted(
+            ReasonCode.SCAN_BUDGET_EXCEEDED,
+            f"probe {probe_name!r}: {spool_reads} staging-spool logical reads exceed "
+            f"the bound of {budget} ({staging_pages} pages + "
+            f"{SPOOL_ROW_ALLOWANCE}/row x {staged_rows} rows)",
+        )
+    return spool_reads, budget
 
 
 def _staged_row_count(rows: list[tuple], keys, global_id: int) -> int:
@@ -922,10 +948,14 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                 table.probe_name,
             )
             # the staging statement's own worktable spool (the via uniqueness
-            # window functions) is row-proportional: measured and REPORTED,
-            # not branch-bounded (ALGORITHMS.md section 15)
-            spool_reads = _scratch_reads_from(
-                messages[:staging_message_count], staging_table_name(dialect)
+            # window functions) is row-proportional: measured AND enforced
+            spool_reads, _ = verify_spool_budget(
+                _scratch_reads_from(
+                    messages[:staging_message_count], staging_table_name(dialect)
+                ),
+                staging_pages,
+                _staged_row_count(rows, keys, GROUPING_SET_IDS["global"]),
+                table.probe_name,
             )
     frame = pd.DataFrame(rows, columns=list(keys))
     frame["event_month"] = pd.to_datetime(frame["event_month"])

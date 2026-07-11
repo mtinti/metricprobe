@@ -110,10 +110,14 @@ as Plotly figures via a static HTML/PNG report and a Streamlit app.
   encoding with a distinct NULL sentinel** (delimiter concatenation is ambiguous:
   'a|b','c' and 'a','b|c' collide before hashing), and the check is documented as
   probabilistic (SHA-256 collision odds negligible; encoding ambiguity was the real
-  risk). NEVER 32-bit CHECKSUM. Numeric budgets: logical reads <= 3x one full scan
-  per probe (any distinct-count guard is counted); result cells per grouping set
-  capped (config, default 100k) — exceeding either ABORTS the probe with a reason
-  code. The exact result schema incl. GROUPING_ID interpretation is frozen before
+  risk). NEVER 32-bit CHECKSUM. Numeric budgets: logical reads on the PROBED
+  tables <= 3x one full scan per probe, cumulative across passes; the
+  aggregation/distinct-count guard and any join-validation spool run against the
+  probe's own tempdb staging and carry their own enforced fail-closed bounds
+  (ALGORITHMS.md section 15 — a single combined 3x ledger is unsatisfiable for
+  tables narrower than their staging projection); result cells per grouping set
+  capped (config, default 100k) — exceeding ANY of these ABORTS the probe with a
+  reason code. The exact result schema incl. GROUPING_ID interpretation is frozen before
   SQL is written. lag_day is capped with an overflow bucket, and **percentiles are censoring-aware: if the overflow mass exceeds
   (1 − p), the percentile is reported only as "> cap" and NO precise
   recommended_wait is computed from it** (status: insufficient/censored). Dual-lag

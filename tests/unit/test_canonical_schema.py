@@ -22,6 +22,14 @@ from metricprobe.extract.canonical import (
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
 
+def test_schema_version_is_pinned():
+    # v2: the scan-budget accounting formulas changed (ALGORITHMS section 15);
+    # changing any frozen formula must bump this deliberately
+    from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
+
+    assert CANONICAL_SCHEMA_VERSION == 2
+
+
 def test_grouping_ids_are_frozen():
     assert GROUPING_WEIGHTS == {
         "event_month": 16,

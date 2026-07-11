@@ -261,6 +261,7 @@ class StoreConfig(_Model):
     path: NonBlankStr = "./metricprobe_store"
     retention_runs: int | None = Field(default=None, gt=0)  # None = keep all
     mssql_url: str | None = None  # env-expandable; required for backend "mssql"
+    mssql_schema: NonBlankStr = "dbo"  # never hardcoded in SQL — always from config
 
     @model_validator(mode="after")
     def _mssql_needs_url(self) -> StoreConfig:

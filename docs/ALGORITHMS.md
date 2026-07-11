@@ -310,10 +310,15 @@ SCAN_BUDGET_UNVERIFIABLE; exceeded => SCAN_BUDGET_EXCEEDED):
    false-aborted legitimate probes). The bound is a tripwire against
    pathological plans, not decoration.
 
-The staging statement's own worktable spool (the via-join uniqueness window
-functions) is row-proportional and therefore measured and REPORTED
-(`staging_spool_reads`), not branch-bounded — it is tempdb-local, O(base rows),
-and the price of piggybacking join validation instead of a second lookup scan.
+3. **Spool ledger** — the staging statement's own worktable spool (the
+   via-join uniqueness window functions) is row-proportional and ENFORCED
+   fail-closed: `spool_reads <= staging_pages + 10 x staged_rows` (measured
+   ~6 reads/row). It is tempdb-local and the price of piggybacking join
+   validation instead of a second lookup scan.
+
+Formula history: CANONICAL_SCHEMA_VERSION 2 introduced the row-linear scratch
+term and the enforced spool ledger (v1 used a pages-only scratch bound, which
+the Step 7 audit showed false-aborts sort-heavy plans).
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,

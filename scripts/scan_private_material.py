@@ -64,7 +64,7 @@ _ENV_FIELD = re.compile(
     r"""(?<![A-Za-z0-9/])
         (server|hostname|host|address|data[ _-]?source|database|dbname|db_name
          |catalog|initial[ _]catalog|schema|password|passwd|pwd)
-        \s*[:=]\s*["']?([^\s;,"']*)""",
+        \s*[:=](?!=)\s*["']?([^\s;,"']*)""",
     re.IGNORECASE | re.VERBOSE,
 )
 

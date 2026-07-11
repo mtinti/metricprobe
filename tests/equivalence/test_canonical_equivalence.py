@@ -185,6 +185,7 @@ def test_volume_assessment_matches_between_dialects(duckdb_engine, mssql_engine)
         name="events", start_month="2023-01", n_months=30, rows_per_month=2000,
         lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=77,
     )
+    healthy_df = g.generate(trickle)  # the healthy twin
     df = g.inject_duplicate_keys(
         g.generate(g.sustained_collapse(trickle, last_k=15, factor=0.1)),
         fraction=0.01,
@@ -192,6 +193,7 @@ def test_volume_assessment_matches_between_dialects(duckdb_engine, mssql_engine)
     )
     as_of = pd.Timestamp("2025-06-15")  # inside the last event month
     assessments = []
+    healthy_assessments = []
     for engine, database, schema in (
         (duckdb_engine, "memory", "main"),
         (mssql_engine, "tempdb", "dbo"),
@@ -203,7 +205,23 @@ def test_volume_assessment_matches_between_dialects(duckdb_engine, mssql_engine)
         volume = assess_volume(canonical, config, as_of, completion)
         fresh = assess_freshness(canonical, config, as_of)
         assessments.append((volume, fresh))
+        clean_config = _config(
+            database, schema, table="events_healthy", key_cols=["row_id"],
+            load_batch_col=None,
+        )
+        g.load_via_sqlalchemy(healthy_df, engine, "events_healthy")
+        clean_canonical = run_canonical(engine, clean_config, as_of)
+        clean_completion = assess_completion(clean_canonical, clean_config, as_of)
+        healthy_assessments.append(
+            assess_volume(clean_canonical, clean_config, as_of, clean_completion)
+        )
     (duck, duck_fresh), (mssql, mssql_fresh) = assessments
+    duck_healthy, mssql_healthy = healthy_assessments
+    # the healthy twin is silent in the same way on both engines
+    assert duck_healthy.statuses == mssql_healthy.statuses
+    healthy_reasons = {s.reason for s in mssql_healthy.statuses}
+    assert ReasonCode.VOLUME_COLLAPSE not in healthy_reasons
+    assert ReasonCode.DUPLICATE_KEYS not in healthy_reasons
     assert duck.statuses == mssql.statuses
     assert duck.baseline_median == mssql.baseline_median
     assert duck.baseline_sigma == mssql.baseline_sigma
@@ -305,6 +323,23 @@ def test_step5_metrics_match_between_dialects(duckdb_engine, mssql_engine):
                 "compare": compare_mismatch_by_month(canonical),
             }
         )
+    healthy_df = g.inject_raw_vs_corrected(
+        g.generate(spec), fraction=0.0, shift_days=-35, seed=1
+    )  # the healthy twin: the raw column exists but never differs
+    healthy_counts = []
+    for engine, database, schema in (
+        (duckdb_engine, "memory", "main"),
+        (mssql_engine, "tempdb", "dbo"),
+    ):
+        clean_config = _config(
+            database, schema, table="events_healthy",
+            source_insert_time="source_insert_time", compare_event_time="event_time_raw",
+        )
+        g.load_via_sqlalchemy(healthy_df, engine, "events_healthy")
+        clean = run_canonical(engine, clean_config, AS_OF)
+        healthy_counts.append(compare_mismatch_by_month(clean))
+    assert healthy_counts[0] == healthy_counts[1]
+    assert sum(healthy_counts[1].values()) == 0  # silent on the healthy twin
     duck, mssql = results
     assert duck["batch"].months == mssql["batch"].months
     assert duck["batch"].rows_per_run == mssql["batch"].rows_per_run
@@ -379,13 +414,13 @@ def test_mssql_store_shares_the_run_contract(mssql_engine):
         return {**dataclasses.asdict(meta), "stages": {"analysis": {}}}
 
     url = os.environ["METRICPROBE_MSSQL_URL"]
-    store = MssqlStore(url)
+    store = MssqlStore(url, schema="dbo")
     run_id = f"eqv-{uuid.uuid4().hex[:12]}"
     meta = make_meta(run_id)
     frame = stamp(pd.DataFrame({"probe": ["a", "b"], "volume": [1, 2]}), meta)
     store.begin_run(meta)
     # a concurrent writer cannot claim the same run_id even BEFORE the commit
-    rival = MssqlStore(url)
+    rival = MssqlStore(url, schema="dbo")
     with pytest.raises(FileExistsError):
         rival.begin_run(meta)
     store.write_table(run_id, "month_volumes", frame)
