@@ -319,6 +319,12 @@ SCAN_BUDGET_UNVERIFIABLE; exceeded => SCAN_BUDGET_EXCEEDED):
 Formula history: CANONICAL_SCHEMA_VERSION 2 introduced the row-linear scratch
 term and the enforced spool ledger (v1 used a pages-only scratch bound, which
 the Step 7 audit showed false-aborts sort-heavy plans).
+DUAL_SCHEMA_VERSION 2 applies the same three-ledger accounting to the dual
+pass and adds the lookup-uniqueness guard columns (lookup_dup /
+max_lookup_dup): the dual pass runs on its own connection, so it asserts
+uniqueness itself — JOIN_NOT_UNIQUE aborts it exactly like the main pass —
+and its staging spool is measured and enforced under the same
+`staging_pages + 10 x staged_rows` bound.
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,

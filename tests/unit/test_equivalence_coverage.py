@@ -3,16 +3,18 @@
 DuckDB is the fast vehicle; the SQL Server container job is the truth-teller.
 The required list is DERIVED from the code so growth forces coverage:
 
-  * metric:<module>      — every metricprobe.metrics module exposing an
-                           assess_* entry point (a NEW METRIC lands here
-                           automatically and demands an equivalence case)
+  * metric:<module>.<fn> — every assess_* ENTRY POINT in every
+                           metricprobe.metrics module (a NEW METRIC lands
+                           here automatically and demands an equivalence
+                           case — even when added to an EXISTING module)
   * scenario:<name>      — every named twin pair in the pathology catalog;
                            the mapped test must exercise BOTH directions
                            (its source must reference the scenario and the
                            word "healthy")
   * construct:<class>    — every @compiles construct in the extract modules
-  * dialect_module:<mod> — every metricprobe module whose source branches on
-                           "mssql" (new dialect-specific code demands a case)
+  * dialect_branch:<module>.<function> — every FUNCTION (or method) whose
+                           source branches on "mssql" (a new dialect branch
+                           inside an existing module demands a case)
 
 Mapped test names must exist in tests/equivalence, and for metric/scenario
 items the mapped test's SOURCE must actually reference the subject (the
@@ -38,13 +40,14 @@ from metricprobe.status import Check
 EQUIVALENCE_MODULES = (eqv_core, eqv_gaps, eqv_harness)
 
 COVERAGE: dict[str, str] = {
-    # ---- metrics (derived from assess_* entry points)
-    "metric:volume": "test_volume_assessment_matches_between_dialects",
-    "metric:completion": "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "metric:freshness": "test_volume_pathology_scenarios_match",
-    "metric:batch": "test_step5_metrics_match_between_dialects",
-    "metric:dual_lag": "test_step5_metrics_match_between_dialects",
-    "metric:parity": "test_parity_mismatch_and_prereq_verdicts_match",
+    # ---- metrics (derived per assess_* ENTRY POINT)
+    "metric:volume.assess_volume": "test_volume_assessment_matches_between_dialects",
+    "metric:completion.assess_completion":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "metric:freshness.assess_freshness": "test_volume_pathology_scenarios_match",
+    "metric:batch.assess_batch": "test_step5_metrics_match_between_dialects",
+    "metric:dual_lag.assess_dual_lag": "test_step5_metrics_match_between_dialects",
+    "metric:parity.assess_parity": "test_parity_mismatch_and_prereq_verdicts_match",
     # ---- status channels (one per Check member)
     "check:probe": "test_cell_cap_aborts_on_both_dialects",
     "check:volume": "test_volume_assessment_matches_between_dialects",
@@ -63,19 +66,44 @@ COVERAGE: dict[str, str] = {
     "scenario:straggler_batch": "test_straggler_batch_scenario_matches",
     "scenario:raw_vs_corrected": "test_step5_metrics_match_between_dialects",
     "scenario:sustained_collapse": "test_volume_assessment_matches_between_dialects",
+    "scenario:sustained_collapse_short": "test_short_collapse_scenario_matches",
     # ---- dialect-sensitive compiled constructs (@compiles classes)
     "construct:DateDiffDay": "test_canonical_pass_matches_between_duckdb_and_mssql",
     "construct:MonthFloor": "test_canonical_pass_matches_between_duckdb_and_mssql",
     "construct:TimeBucket": "test_censoring_overflow_and_hour_bucket_match",
     "construct:KeyHash": "test_empty_table_and_null_keys_match",
     "construct:GroupingSetsClause": "test_canonical_pass_matches_between_duckdb_and_mssql",
-    # ---- modules with dialect branches (source contains "mssql")
-    "dialect_module:canonical": "test_canonical_pass_matches_between_duckdb_and_mssql",
-    "dialect_module:dual": "test_step5_metrics_match_between_dialects",
-    "dialect_module:store": "test_mssql_store_shares_the_run_contract",
-    "dialect_module:cli": "test_scan_budget_enforced_through_the_production_runner",
-    "dialect_module:config": "test_mssql_store_shares_the_run_contract",
-    "dialect_module:discover": "test_discover_matches_between_dialects",
+    # ---- functions/methods with dialect branches (source contains "mssql")
+    "dialect_branch:canonical._datediff_mssql":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:canonical._month_floor_mssql":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:canonical._time_bucket_mssql":
+        "test_censoring_overflow_and_hour_bucket_match",
+    "dialect_branch:canonical._key_hash_mssql": "test_empty_table_and_null_keys_match",
+    "dialect_branch:canonical._key_column_types": "test_empty_table_and_null_keys_match",
+    "dialect_branch:canonical._table_clause":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:canonical.staging_table_name":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:canonical.staging_sql":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:canonical._dialect_instance":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:canonical.run_canonical":
+        "test_canonical_pass_matches_between_duckdb_and_mssql",
+    "dialect_branch:dual.dual_staging_table_name":
+        "test_step5_metrics_match_between_dialects",
+    "dialect_branch:dual.dual_staging_sql": "test_step5_metrics_match_between_dialects",
+    "dialect_branch:dual.run_dual_lag": "test_dual_via_matches_between_dialects",
+    "dialect_branch:store.open_store": "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:cli._engine_for":
+        "test_scan_budget_enforced_through_the_production_runner",
+    "dialect_branch:cli._table_exists":
+        "test_missing_table_detection_matches_between_dialects",
+    "dialect_branch:config.StoreConfig._mssql_needs_url":
+        "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:discover.scan_columns": "test_discover_matches_between_dialects",
     # ---- behaviors beyond single constructs
     "behavior:via_join_composite_unmatched":
         "test_via_join_and_alt_grouping_match_between_dialects",
@@ -110,8 +138,10 @@ def _compiled_constructs(module) -> set[str]:
     }
 
 
-def _metric_modules() -> dict[str, set[str]]:
-    """metric module name -> its assess_* entry points."""
+def _metric_entry_points() -> dict[str, set[str]]:
+    """metric module name -> its assess_* entry points. Every entry point is
+    its own required item, so a new metric added to an EXISTING module still
+    demands an equivalence case."""
     modules = {}
     for info in pkgutil.iter_modules(metrics_package.__path__):
         module = importlib.import_module(f"metricprobe.metrics.{info.name}")
@@ -121,21 +151,43 @@ def _metric_modules() -> dict[str, set[str]]:
     return modules
 
 
-def _dialect_modules() -> set[str]:
-    names = set()
+def _dialect_branch_functions() -> set[str]:
+    """<module>.<qualname> of every function or method whose SOURCE branches
+    on "mssql" — a new dialect branch anywhere demands a case, not just a new
+    module."""
+    def _source(obj) -> str:
+        try:
+            return inspect.getsource(obj)
+        except (OSError, TypeError):  # generated code (pydantic internals etc.)
+            return ""
+
+    items = set()
     for module in (canonical, dual, store, cli, config, discover):
-        if '"mssql"' in inspect.getsource(module):
-            names.add(module.__name__.rsplit(".", 1)[-1])
-    return names
+        short = module.__name__.rsplit(".", 1)[-1]
+        for name, obj in vars(module).items():
+            if getattr(obj, "__module__", None) != module.__name__:
+                continue
+            if inspect.isfunction(obj):
+                if '"mssql"' in _source(obj):
+                    items.add(f"{short}.{name}")
+            elif inspect.isclass(obj):
+                for method_name, method in vars(obj).items():
+                    if inspect.isfunction(method) and '"mssql"' in _source(method):
+                        items.add(f"{short}.{name}.{method_name}")
+    return items
 
 
 def required_items() -> set[str]:
-    items = {f"metric:{name}" for name in _metric_modules()}
+    items = {
+        f"metric:{module}.{entry}"
+        for module, entries in _metric_entry_points().items()
+        for entry in entries
+    }
     items |= {f"check:{check.value}" for check in Check}
     items |= {f"scenario:{name}" for name in catalog()}
     for module in (canonical, dual):
         items |= {f"construct:{name}" for name in _compiled_constructs(module)}
-    items |= {f"dialect_module:{name}" for name in _dialect_modules()}
+    items |= {f"dialect_branch:{name}" for name in _dialect_branch_functions()}
     return items
 
 
@@ -180,14 +232,14 @@ def test_every_mapped_test_exists():
 def test_mappings_are_meaningful_not_arbitrary():
     """A mapping must point at a test that actually exercises its subject."""
     sources = _test_sources()
-    metrics = _metric_modules()
     problems = []
     for item, test_name in COVERAGE.items():
         source = sources.get(test_name, "")
         kind, _, subject = item.partition(":")
         if kind == "metric":
-            if not any(entry in source for entry in metrics[subject]):
-                problems.append(f"{item} -> {test_name} never calls assess_{subject}")
+            entry = subject.split(".", 1)[1]
+            if entry not in source:
+                problems.append(f"{item} -> {test_name} never calls {entry}")
         elif kind == "scenario":
             # the injector/scenario name must appear, and BOTH twin directions
             # must be exercised (the healthy twin stays silent)

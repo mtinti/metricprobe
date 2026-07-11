@@ -5,7 +5,8 @@ Same execution shape as the canonical pass: stage one scan of narrow derived
 columns into a session temp table, aggregate with GROUPING SETS, drop. The
 scan budget is verified fail-closed on mssql exactly like the main pass.
 
-FROZEN DUAL SCHEMA (v1). Grouping columns and GROUPING() weights:
+FROZEN DUAL SCHEMA (v2 — v1 lacked the lookup-uniqueness guard columns and
+used the pages-only scratch budget). Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
     1 = (event_month, lag_day)   source-side completion curves, where lag_day
@@ -48,10 +49,11 @@ from metricprobe.extract.canonical import (
     _target_reads_from,
     verify_scan_budget,
     verify_scratch_budget,
+    verify_spool_budget,
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 1
+DUAL_SCHEMA_VERSION = 2
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -68,6 +70,7 @@ DUAL_STAGING_COLUMNS = (
     "is_negative_lag_excluded",
     "is_overflow",
     "is_delta_row",
+    "lookup_dup",
 )
 
 DUAL_RESULT_COLUMNS = (
@@ -83,6 +86,7 @@ DUAL_RESULT_COLUMNS = (
     "n_negative_lag_excluded",
     "n_overflow",
     "n_delta_rows",
+    "max_lookup_dup",
 )
 
 
@@ -98,9 +102,12 @@ def _dual_staging_clause(dialect: str):
 
 def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
     """The one target-table scan of the dual pass. event_time_via is supported:
-    the event time is borrowed through the same join shape as the main pass
-    (whose run already asserted lookup uniqueness — join validation piggybacks
-    there); unmatched rows surface as NULL event time here."""
+    the event time is borrowed through the same join shape as the main pass,
+    and lookup uniqueness is asserted HERE too — the passes run on separate
+    connections, so the main pass's guard cannot protect against lookup
+    mutation in between, and a duplicated lookup key would silently multiply
+    rows and distort the source percentiles. Unmatched rows surface as NULL
+    event time."""
     if not table.source_insert_time:
         raise ValueError(f"probe {table.probe_name!r} has no source_insert_time")
     analysis = table.analysis
@@ -124,10 +131,13 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
         lookup = _table_clause(
             via.database, via.table_schema, via.table, sorted(lookup_cols), dialect
         )
+        partition = [lookup.c[pair.lookup_col] for pair in via.on]
         lk = sa.select(
             *[lookup.c[col].label(f"lk_{col}") for col in sorted(lookup_cols)],
+            sa.func.count().over(partition_by=partition).label("lk_dup"),
         ).subquery("lk")
         event = lk.c[f"lk_{via.column}"]
+        lookup_dup = lk.c.lk_dup
         source_from = base.outerjoin(
             lk,
             sa.and_(
@@ -136,6 +146,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
         )
     else:
         event = base.c[table.event_time]
+        lookup_dup = sa.cast(sa.null(), sa.Integer())
         source_from = base
 
     lag = DateDiffDay(event, source)
@@ -177,6 +188,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             flag(is_negative_excluded).label("is_negative_lag_excluded"),
             flag(is_overflow).label("is_overflow"),
             flag(is_delta_row).label("is_delta_row"),
+            lookup_dup.label("lookup_dup"),
         )
         .select_from(source_from)
         # the bare <= would silently delete the NULL-load bucket
@@ -233,6 +245,7 @@ def build_dual_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
             total(staging.c.is_negative_lag_excluded).label("n_negative_lag_excluded"),
             total(staging.c.is_overflow).label("n_overflow"),
             total(staging.c.is_delta_row).label("n_delta_rows"),
+            sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))
@@ -252,6 +265,7 @@ class DualLagResult:
     scan_budget_reads: int | None = None
     scratch_logical_reads: int | None = None
     scratch_budget_reads: int | None = None
+    staging_spool_reads: int | None = None
 
     def rows_for(self, set_name: str) -> pd.DataFrame:
         gid = DUAL_GROUPING_SET_IDS[set_name]
@@ -281,7 +295,7 @@ def run_dual_lag(
     cap = table.analysis.result_cell_cap
     counts: dict[int, int] = {}
     rows = []
-    target_reads = budget = scratch_reads = scratch_budget = None
+    target_reads = budget = scratch_reads = scratch_budget = spool_reads = None
     with engine.connect() as conn:
         messages: list[str] = []
         pages = staging_pages = None
@@ -329,12 +343,33 @@ def run_dual_lag(
                 _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"]),
                 table.probe_name,
             )
+            # the via uniqueness window function spools during staging:
+            # measured and enforced exactly like the main pass
+            spool_reads, _ = verify_spool_budget(
+                _scratch_reads_from(
+                    messages[:staging_message_count], dual_staging_table_name(dialect)
+                ),
+                staging_pages,
+                _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"]),
+                table.probe_name,
+            )
     frame = pd.DataFrame(rows, columns=list(keys))
     frame["event_month"] = pd.to_datetime(frame["event_month"])
-    return DualLagResult(
+    result = DualLagResult(
         frame=frame,
         target_logical_reads=target_reads,
         scan_budget_reads=budget,
         scratch_logical_reads=scratch_reads,
         scratch_budget_reads=scratch_budget,
+        staging_spool_reads=spool_reads,
     )
+    if table.event_time_via is not None:
+        max_dup = result.global_row["max_lookup_dup"]
+        if pd.notna(max_dup) and int(max_dup) > 1:
+            raise ProbeAborted(
+                ReasonCode.JOIN_NOT_UNIQUE,
+                f"probe {table.probe_name!r}: dual pass — lookup side of "
+                f"event_time_via is not unique on the join key (worst key "
+                f"matches {int(max_dup)} rows)",
+            )
+    return result

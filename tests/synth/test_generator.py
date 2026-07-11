@@ -338,6 +338,7 @@ def test_catalog_has_every_planned_pathology():
         "straggler_batch",
         "raw_vs_corrected",
         "sustained_collapse",
+        "sustained_collapse_short",
     }
     for pair in catalog().values():
         assert pair.description and pair.expected_detection

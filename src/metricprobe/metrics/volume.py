@@ -83,6 +83,23 @@ def assess_volume(
     months = sorted(volumes)
     statuses: list[Status] = []
 
+    # ---- uniqueness (from the distinct-count guard, same probe) — BEFORE the
+    # empty-months early exit: a populated table whose rows were all excluded
+    # from the curves can still carry duplicate keys
+    duplicate_rows = None
+    if table.key_cols:
+        g = canonical.global_row
+        duplicate_rows = int(g["row_count"]) - int(g["distinct_keys"])
+        if duplicate_rows > 0:
+            statuses.append(
+                Status(
+                    check=Check.UNIQUENESS,
+                    severity=Severity.RED,
+                    reason=ReasonCode.DUPLICATE_KEYS,
+                    detail=f"{duplicate_rows} duplicate rows over key {list(table.key_cols)}",
+                )
+            )
+
     if not months:
         # zero rows admitted: a hard failure, never a crash or a silent pass
         statuses.append(
@@ -101,7 +118,7 @@ def assess_volume(
             baseline_median=None,
             baseline_sigma=None,
             forecast=None,
-            duplicate_rows=None,
+            duplicate_rows=duplicate_rows,
             statuses=statuses,
         )
 
@@ -122,21 +139,6 @@ def assess_volume(
                 detail="month(s) with zero rows: " + ", ".join(str(m) for m in gaps),
             )
         )
-
-    # ---- uniqueness (from the distinct-count guard, same probe)
-    duplicate_rows = None
-    if table.key_cols:
-        g = canonical.global_row
-        duplicate_rows = int(g["row_count"]) - int(g["distinct_keys"])
-        if duplicate_rows > 0:
-            statuses.append(
-                Status(
-                    check=Check.UNIQUENESS,
-                    severity=Severity.RED,
-                    reason=ReasonCode.DUPLICATE_KEYS,
-                    detail=f"{duplicate_rows} duplicate rows over key {list(table.key_cols)}",
-                )
-            )
 
     # ---- classify months: open (contains as_of or later) / mature / immature
     mature_set = set(completion.mature_months)

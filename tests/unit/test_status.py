@@ -140,3 +140,18 @@ def test_wire_values_are_frozen_v1():
         "join_unmatched_rows",
         "reconciliation_mismatch",
     }
+
+
+def test_component_versions_are_pinned():
+    """Changing ANY contract (config schema, status model, canonical or dual
+    result schema / budget formulas, snapshot shape) must arrive as a visible
+    version bump here — schema versions are wired to what they identify."""
+    from metricprobe.cli import COMPONENT_VERSIONS
+
+    assert COMPONENT_VERSIONS == {
+        "config": 2,  # v2: mssql_schema, freshness MADs, required resolution
+        "status": 1,
+        "canonical": 2,  # v2: row-linear scratch ledger + spool ledger
+        "dual": 2,  # v2: lookup-uniqueness guard columns + ledger split
+        "snapshot": 2,  # v2: canonical v2 cells, stable probe_runs, grain labels
+    }

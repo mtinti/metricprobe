@@ -42,6 +42,7 @@ import sqlalchemy as sa
 
 import metricprobe
 from metricprobe.config import (
+    CONFIG_SCHEMA_VERSION,
     ConfigError,
     ProbeConfig,
     TableConfig,
@@ -51,8 +52,12 @@ from metricprobe.config import (
     load_config,
 )
 from metricprobe.discover import DEFAULT_ROLE_CANDIDATES, draft_config
-from metricprobe.extract.canonical import ProbeAborted, run_canonical
-from metricprobe.extract.dual import run_dual_lag
+from metricprobe.extract.canonical import (
+    CANONICAL_SCHEMA_VERSION,
+    ProbeAborted,
+    run_canonical,
+)
+from metricprobe.extract.dual import DUAL_SCHEMA_VERSION, run_dual_lag
 from metricprobe.metrics.batch import assess_batch
 from metricprobe.metrics.completion import (
     assess_completion,
@@ -63,7 +68,14 @@ from metricprobe.metrics.dual_lag import assess_dual_lag
 from metricprobe.metrics.freshness import assess_freshness
 from metricprobe.metrics.parity import ParitySide, assess_parity
 from metricprobe.metrics.volume import assess_volume
-from metricprobe.status import Check, ReasonCode, Severity, Status, exit_code_for
+from metricprobe.status import (
+    STATUS_SCHEMA_VERSION,
+    Check,
+    ReasonCode,
+    Severity,
+    Status,
+    exit_code_for,
+)
 from metricprobe.store import (
     SNAPSHOT_SCHEMA_VERSION,
     RunMeta,
@@ -250,6 +262,9 @@ def _probe_one(
                     "pct": pct,
                     "days": value.value,
                     "over_cap": value.over_cap,
+                    # the declared grain basis: "date" flags that sub-day
+                    # arrival detail does not exist for this probe
+                    "lag_resolution": table.lag_resolution,
                 },
             )
     for row in volume.months:
@@ -328,6 +343,7 @@ def _probe_one(
                         "pct": pct,
                         "days": value.value,
                         "over_cap": value.over_cap,
+                        "lag_resolution": table.dual_lag_resolution,
                     },
                 )
         for delta_day, count in dual_assessment.delta_histogram.items():
@@ -355,9 +371,33 @@ def _int_or_none(value):
     return None if pd.isna(value) else int(value)
 
 
+# probe_runs read-accounting columns: ALWAYS present (None when the probe was
+# skipped or aborted) so the physical table schema a first to_sql() fixes is
+# identical no matter which probe outcome writes first
+READ_COLUMNS = ("target_logical_reads", "scan_budget_reads", "scratch_logical_reads")
+
+
+# the contract versions this build writes under — serialized into every run
+# manifest so a stored run names the exact contracts that produced it
+COMPONENT_VERSIONS = {
+    "config": CONFIG_SCHEMA_VERSION,
+    "status": STATUS_SCHEMA_VERSION,
+    "canonical": CANONICAL_SCHEMA_VERSION,
+    "dual": DUAL_SCHEMA_VERSION,
+    "snapshot": SNAPSHOT_SCHEMA_VERSION,
+}
+
+
 def _collect_statuses(frames: _Frames, probe: str, statuses: list[Status]) -> None:
     for status in statuses:
-        frames.add("statuses", {"probe": probe, **status.model_dump(mode="json")})
+        frames.add(
+            "statuses",
+            {
+                "probe": probe,
+                **status.model_dump(mode="json"),
+                "status_schema_version": STATUS_SCHEMA_VERSION,
+            },
+        )
 
 
 def _stage_analysis(
@@ -385,7 +425,7 @@ def _stage_analysis(
                     started = _wall()
                     statuses: list[Status] = []
                     extraction = (None, None)
-                    reads = {}
+                    reads = dict.fromkeys(READ_COLUMNS)
                     if not _table_exists(engine, table):
                         severity = Severity.SKIPPED if table.optional else Severity.RED
                         reason = (
@@ -489,6 +529,7 @@ def _stage_analysis(
                 for row in frames.rows.get("statuses", [])
             ],
             "stages": {"analysis": {"completed_at": _wall().isoformat()}},
+            "component_versions": COMPONENT_VERSIONS,
         }
         store.commit_run(meta.run_id, manifest)
     except BaseException:
@@ -564,34 +605,52 @@ def cmd_run(args) -> int:
                 )
                 return 1
             committed = {m["run_id"]: m for m in store.list_runs()}
-            if args.run_id not in committed:
-                # no committed record exists to verify the digest against —
-                # refusing is the only way to honor the matching-digest rule
+            if args.run_id in committed:
+                manifest = committed[args.run_id]
+                if manifest["config_digest"] != digest:
+                    print(
+                        "metricprobe: config digest mismatch — the config changed "
+                        f"since run {args.run_id!r} was created; refusing to resume",
+                        file=sys.stderr,
+                    )
+                    return 1
+                # analysis already committed: idempotent retry has nothing to do
+                statuses = [
+                    Status(
+                        check=Check(row["check"]),
+                        severity=Severity(row["severity"]),
+                        reason=ReasonCode(row["reason"]) if row["reason"] else None,
+                    )
+                    for row in manifest["statuses"]
+                ]
+                print(f"run {args.run_id!r}: analysis already committed; nothing to redo")
+                return exit_code_for(statuses)
+            registration = store.registration(args.run_id)
+            if registration is None:
+                # neither committed nor registered: no durable record exists to
+                # verify the digest against — refusing is the only way to
+                # honor the matching-digest rule
                 print(
-                    f"metricprobe: run {args.run_id!r} has no committed record to "
-                    "resume from; start a fresh run without --resume-from",
+                    f"metricprobe: run {args.run_id!r} has no committed or "
+                    "registered record to resume from; start a fresh run "
+                    "without --resume-from",
                     file=sys.stderr,
                 )
                 return 1
-            manifest = committed[args.run_id]
-            if manifest["config_digest"] != digest:
+            if registration["config_digest"] != digest:
                 print(
                     "metricprobe: config digest mismatch — the config changed "
-                    f"since run {args.run_id!r} was created; refusing to resume",
+                    f"since run {args.run_id!r} was registered; refusing to resume",
                     file=sys.stderr,
                 )
                 return 1
-            # analysis already committed: idempotent retry has nothing to do
-            statuses = [
-                Status(
-                    check=Check(row["check"]),
-                    severity=Severity(row["severity"]),
-                    reason=ReasonCode(row["reason"]) if row["reason"] else None,
-                )
-                for row in manifest["statuses"]
-            ]
-            print(f"run {args.run_id!r}: analysis already committed; nothing to redo")
-            return exit_code_for(statuses)
+            # the failed stage left nothing partial by contract, but a crashed
+            # process may not have aborted: clear any leftover staging (safe —
+            # abort never touches a committed run), then re-run the stage
+            # under the SAME run_id
+            store.abort_run(args.run_id)
+            print(f"run {args.run_id!r}: resuming failed analysis stage")
+        store.register_run(meta)
         statuses = _stage_analysis(configs, meta, store, as_of, (window_start, window_end))
     except Exception as error:  # a configured stage failed -> exit 1
         print(f"metricprobe: analysis stage failed: {error}", file=sys.stderr)

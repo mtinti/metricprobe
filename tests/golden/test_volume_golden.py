@@ -341,3 +341,49 @@ def test_statuses_feed_the_frozen_typed_model():
     for status in assessment.statuses:
         assert isinstance(status, Status)
         assert Status.model_validate(status.model_dump(mode="json")) == status
+
+
+def test_uniqueness_check_runs_even_without_eligible_months():
+    # a populated table whose rows are ALL excluded from the curves (every
+    # event_time NULL) still carries duplicate keys: the global distinct-key
+    # guard must be read BEFORE the empty-months early exit
+    df = catalog()["duplicate_keys"].unhealthy()
+    df = df.copy()
+    df["event_time"] = pd.NaT
+    config = table_config(key_cols=["row_id"])
+    _, assessment = _assess(df, config, AS_OF_MATURE)
+    assert assessment.duplicate_rows == round(0.02 * 30 * 2000)
+    assert {ReasonCode.DUPLICATE_KEYS, ReasonCode.ZERO_ROW_MONTH} <= _reasons(assessment)
+
+
+def test_short_three_month_collapse_with_a_configured_horizon():
+    # The Step 4 spec's SHORT case: only the last 3 months are degraded. The
+    # default 365d horizon can never call any of them mature, so the pair is
+    # probed with lag_cap 52 / cutoff 54 (covering the ~50d batch lag support):
+    # 2024-10 and 2024-11 are mature -> RED collapse; 2024-12 is immature ->
+    # arrival deficit, never collapse; the feed stays freshness=GREEN.
+    pair = catalog()["sustained_collapse_short"]
+    as_of = "2025-01-25"  # 4 days after the last batch (2024-12's +20d batch)
+    config = table_config(
+        load_batch_col="batch_id",
+        analysis={"lag_cap_days": 52, "training_cutoff_days": 54},
+    )
+    canonical, unhealthy = _assess(pair.unhealthy(), config, as_of)
+    collapse = [s for s in unhealthy.statuses if s.reason is ReasonCode.VOLUME_COLLAPSE]
+    assert len(collapse) == 1 and collapse[0].severity is Severity.RED
+    for month in ("2024-10", "2024-11"):
+        assert month in collapse[0].detail
+    assert "2024-12" not in collapse[0].detail
+    deficit = [s for s in unhealthy.statuses if s.reason is ReasonCode.ARRIVAL_DEFICIT]
+    assert deficit and "2024-12" in deficit[0].detail
+    # baseline excludes the evaluation window: the median holds at 2000
+    assert unhealthy.baseline_median == pytest.approx(2000, rel=0.05)
+    fresh = assess_freshness(canonical, config, pd.Timestamp(as_of))
+    assert worst_severity(fresh.statuses) is Severity.GREEN
+
+    _, healthy = _assess(pair.healthy(), config, as_of)
+    assert _reasons(healthy) == set()
+    healthy_fresh = assess_freshness(
+        probe(pair.healthy(), config, as_of), config, pd.Timestamp(as_of)
+    )
+    assert worst_severity(healthy_fresh.statuses) is Severity.GREEN

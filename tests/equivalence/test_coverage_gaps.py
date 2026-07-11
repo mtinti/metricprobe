@@ -389,3 +389,71 @@ def test_discover_matches_between_dialects(duckdb_engine, mssql_engine):
     # timestamp (duckdb), never on mssql where it is binary
     assert duck_roles["event_time"] == ["event_time", "occurred_version"]
     assert "occurred_version" not in mssql_roles["event_time"]
+
+
+def test_short_collapse_scenario_matches(duckdb_engine, mssql_engine):
+    """The sustained_collapse_short pair (3 degraded months under a configured
+    52d cap / 54d cutoff) yields the SAME verdicts on both engines, in both
+    twin directions: RED collapse on the two mature degraded months plus an
+    arrival deficit on the immature one for the unhealthy twin; a silent
+    healthy twin. Freshness is GREEN either way."""
+    from tests.synth.scenarios import catalog
+
+    pair = catalog()["sustained_collapse_short"]
+    as_of = pd.Timestamp("2025-01-25")
+    analysis = {"lag_cap_days": 52, "training_cutoff_days": 54}
+    for df, table, unhealthy in (
+        (pair.unhealthy(), "collapse_short_bad", True),
+        (pair.healthy(), "collapse_short_ok", False),
+    ):
+        results = []
+        for engine, database, schema in _both(duckdb_engine, mssql_engine):
+            config = _config(
+                database, schema, table=table, key_cols=None, analysis=analysis
+            )
+            g.load_via_sqlalchemy(df, engine, table)
+            _, _, volume, freshness = _assess_all(engine, config, as_of)
+            results.append((volume, freshness))
+        (duck_volume, duck_fresh), (ms_volume, ms_fresh) = results
+        assert duck_volume.statuses == ms_volume.statuses
+        assert duck_volume.months == ms_volume.months
+        assert duck_fresh == ms_fresh
+        reasons = {s.reason for s in ms_volume.statuses}
+        if unhealthy:
+            collapse = [
+                s for s in ms_volume.statuses if s.reason is ReasonCode.VOLUME_COLLAPSE
+            ]
+            assert collapse and "2024-10" in collapse[0].detail
+            assert "2024-11" in collapse[0].detail
+            assert ReasonCode.ARRIVAL_DEFICIT in reasons
+        else:
+            assert ReasonCode.VOLUME_COLLAPSE not in reasons
+            assert ReasonCode.ARRIVAL_DEFICIT not in reasons
+        assert not [s for s in ms_fresh.statuses if s.severity is not Severity.GREEN]
+
+
+def test_missing_table_detection_matches_between_dialects(duckdb_engine, mssql_engine):
+    """cli._table_exists drives the missing/skipped probe verdicts; its
+    dialect-specific INFORMATION_SCHEMA query must agree with the standard
+    one for both a present and an absent table."""
+    from metricprobe.cli import _table_exists
+
+    answers = []
+    for engine, database, schema in _both(duckdb_engine, mssql_engine):
+        with engine.begin() as conn:
+            if engine.dialect.name == "mssql":
+                conn.exec_driver_sql(
+                    "IF OBJECT_ID('dbo.exists_probe') IS NULL "
+                    "CREATE TABLE dbo.exists_probe (event_time date, load_time datetime2)"
+                )
+            else:
+                conn.exec_driver_sql(
+                    "CREATE OR REPLACE TABLE exists_probe (event_time DATE, "
+                    "load_time TIMESTAMP)"
+                )
+        present = _config(database, schema, table="exists_probe", key_cols=None,
+                          load_batch_col=None)
+        absent = _config(database, schema, table="mp_no_such_table", key_cols=None,
+                         load_batch_col=None)
+        answers.append((_table_exists(engine, present), _table_exists(engine, absent)))
+    assert answers[0] == answers[1] == (True, False)

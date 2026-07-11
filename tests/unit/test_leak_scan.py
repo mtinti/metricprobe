@@ -108,3 +108,9 @@ def test_markers_parsed_from_env():
 
 def test_this_repo_is_clean():
     assert scan.scan_repo(REPO_ROOT, scan.markers_from_env()) == []
+
+
+def test_placeholder_stems_may_contain_percent_escapes():
+    # digest tests use demo%2Fone-style secrets: still placeholder-stemmed
+    field = "pass" + "word: demo%2Fone"
+    assert scan.content_violations("t.py", field, []) == []

@@ -48,7 +48,10 @@ from pydantic import (
 )
 from sqlalchemy.engine import make_url
 
-CONFIG_SCHEMA_VERSION = 1
+# v2: StoreConfig.mssql_schema, freshness_amber_mads/freshness_red_mads,
+# per-column resolution REQUIRED for the time roles, delivery query-secret
+# rejection (v1 configs without resolution no longer validate)
+CONFIG_SCHEMA_VERSION = 2
 
 
 class ConfigError(Exception):
@@ -130,6 +133,8 @@ class AnalysisParams(_Model):
     freshness_bucket: Literal["day", "hour"] = "day"
     freshness_min_epochs: int = Field(default=5, gt=0)
     freshness_zero_mad_tolerance_days: float = Field(default=1.0, gt=0)
+    freshness_amber_mads: float = Field(default=2.0, gt=0)
+    freshness_red_mads: float = Field(default=3.0, gt=0)
     volume_amber_mads: float = Field(default=2.0, gt=0)
     volume_red_mads: float = Field(default=3.0, gt=0)
     expected_fill_band_mads: float = Field(default=2.0, gt=0)
@@ -148,6 +153,11 @@ class AnalysisParams(_Model):
             raise ValueError(
                 f"volume_red_mads ({self.volume_red_mads}) must be >= "
                 f"volume_amber_mads ({self.volume_amber_mads})"
+            )
+        if self.freshness_red_mads < self.freshness_amber_mads:
+            raise ValueError(
+                f"freshness_red_mads ({self.freshness_red_mads}) must be >= "
+                f"freshness_amber_mads ({self.freshness_amber_mads})"
             )
         return self
 
@@ -201,7 +211,43 @@ class TableConfig(_Model):
                 f"probe {self.probe_name!r}: resolution declared for unknown column(s) "
                 f"{unknown}; configured time columns are {sorted(time_columns)}"
             )
+        # the per-column resolution declaration is REQUIRED for the metric
+        # roles (event/load/source): outputs label their grain from it
+        required = {
+            column
+            for column in (
+                self.event_time,
+                self.event_time_via.column if self.event_time_via else None,
+                self.load_time,
+                self.source_insert_time,
+            )
+            if column
+        }
+        missing = sorted(required - set(self.resolution))
+        if missing:
+            raise ValueError(
+                f"probe {self.probe_name!r}: resolution (date | datetime) must be "
+                f"declared for time column(s) {missing}"
+            )
         return self
+
+    @property
+    def lag_resolution(self) -> str:
+        """The lag grain basis for output labels: 'date' when either side of
+        the lag is a date column (sub-day arrival detail does not exist),
+        else 'datetime'."""
+        event_column = self.event_time or self.event_time_via.column
+        sides = (self.resolution[event_column], self.resolution[self.load_time])
+        return "date" if "date" in sides else "datetime"
+
+    @property
+    def dual_lag_resolution(self) -> str | None:
+        """Same label for the source-side lag (event -> source_insert_time)."""
+        if not self.source_insert_time:
+            return None
+        event_column = self.event_time or self.event_time_via.column
+        sides = (self.resolution[event_column], self.resolution[self.source_insert_time])
+        return "date" if "date" in sides else "datetime"
 
 
 # minute, hour, day-of-month, month, day-of-week (0-7, both 0 and 7 = Sunday)
@@ -272,6 +318,15 @@ class StoreConfig(_Model):
 
 _ENV_VAR_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _URL_WITH_USERINFO = re.compile(r"^[A-Za-z][\w+.-]*://[^/@\s]+@")
+# secret-shaped query parameters in a delivery URL: literal values violate the
+# token-env-var-NAMES-only contract; ${VAR}/$VAR references are names, not values
+_SECRET_QUERY_PARAM = re.compile(
+    r"[?&](token|access_token|private_token|oauth2?_token|password|passwd|pwd"
+    r"|secret|client_secret|api_key|apikey|key|sig|signature|auth|authorization"
+    r"|credential|credentials)=([^&#\s]*)",
+    re.IGNORECASE,
+)
+_ENV_VAR_REFERENCE = re.compile(r"^\$(\{[A-Z_][A-Z0-9_]*\}|[A-Z_][A-Z0-9_]*)$")
 
 
 class DeliveryRemote(_Model):
@@ -298,6 +353,14 @@ class DeliveryRemote(_Model):
                 f"delivery remote url {value!r} must not embed credentials; "
                 "supply the token through token_env instead"
             )
+        for match in _SECRET_QUERY_PARAM.finditer(value):
+            name, literal = match.group(1), match.group(2)
+            if not _ENV_VAR_REFERENCE.match(literal):
+                raise ValueError(
+                    f"delivery remote url carries a literal value for query "
+                    f"parameter {name!r}; config holds env var NAMES, never "
+                    "secret values — supply the token through token_env"
+                )
         return value
 
 
@@ -406,7 +469,10 @@ _URL_USERINFO = re.compile(r"://[^@/\s]+@")
 _SECRET_PARAM = re.compile(
     r"(?i)(?:(?<![A-Za-z0-9])|(?<=%3[Bb]))"
     r"(password|passwd|pwd|token|access_token|secret|api_key|apikey|sig|signature)"
-    r"(=|%3[Dd])([^&;\s\"'%]*)"
+    # the value may itself contain percent-escapes (a%2Fb): consume them so the
+    # WHOLE secret is redacted, but stop at encoded separators %26/%3B exactly
+    # as at their raw spellings
+    r"(=|%3[Dd])((?:%(?!26|3[Bb])[0-9A-Fa-f]{2}|[^&;\s\"'%])*)"
 )
 
 

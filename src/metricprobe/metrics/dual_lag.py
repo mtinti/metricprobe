@@ -79,6 +79,24 @@ def assess_dual_lag(
                 f"{analysis.negative_lag_red_fraction:.4%}",
             )
         )
+    # censoring-aware, same policy as completion: a percentile past the lag
+    # cap is reported only as "> cap" and the check must not read GREEN
+    censored = sorted(
+        month
+        for month, per_month in percentiles.items()
+        if any(p.over_cap for p in per_month.values())
+    )
+    if censored:
+        listed = ", ".join(str(m) for m in censored[:6])
+        statuses.append(
+            Status(
+                check=Check.DUAL_LAG,
+                severity=Severity.INSUFFICIENT_HISTORY,
+                reason=ReasonCode.PERCENTILE_OVER_CAP,
+                detail=f"source-lag percentiles censored past lag_cap_days for "
+                f"{len(censored)} month(s): {listed}",
+            )
+        )
     if not statuses:
         statuses.append(Status(check=Check.DUAL_LAG, severity=Severity.GREEN))
     return DualLagAssessment(

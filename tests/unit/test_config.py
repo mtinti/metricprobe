@@ -24,6 +24,7 @@ def minimal_table(**overrides) -> dict:
         "table": "orders",
         "event_time": "order_date",
         "load_time": "loaded_at",
+        "resolution": {"order_date": "date", "loaded_at": "datetime"},
     } | overrides
 
 
@@ -69,7 +70,8 @@ def test_full_config_loads():
                     optional=True,
                     proxy=True,
                     expect_batchy=True,
-                    resolution={"order_date": "date", "loaded_at": "datetime"},
+                    resolution={"order_date": "date", "loaded_at": "datetime",
+                                "src_inserted_at": "datetime"},
                     suppress_small_counts=True,
                     read_uncommitted=True,
                     analysis={"training_cutoff_days": 400, "lag_cap_days": 400},
@@ -84,6 +86,7 @@ def test_full_config_loads():
                     table="episodes",
                     event_time=None,
                     event_time_via=via_spec(),
+                    resolution={"referral_date": "date", "loaded_at": "datetime"},
                 ),
             ],
             campaign={"schedule": "0 6 * * 1", "timezone": "Europe/London"},
@@ -120,6 +123,9 @@ tables:
     table: orders
     event_time: order_date
     load_time: loaded_at
+    resolution:
+      order_date: date
+      loaded_at: datetime
   - probe_name: episodes_via
     database: demo_health
     schema: dbo
@@ -131,6 +137,9 @@ tables:
         - base_col: referral_id
           lookup_col: id
       column: referral_date
+    resolution:
+      referral_date: date
+      loaded_at: datetime
 """
     )
     config = load_config(path)
@@ -332,6 +341,30 @@ def test_delivery_urls_must_not_embed_credentials():
         )
 
 
+def test_delivery_urls_must_not_carry_literal_query_secrets():
+    # userinfo is not the only smuggling route: literal secret-shaped query
+    # parameters violate the env-var-NAMES-only contract just the same
+    def remote(url):
+        return minimal_config(delivery={"remotes": [{"name": "origin", "url": url}]})
+
+    for bad in [
+        "https://forge.example/d.git?token=demo-literal-value",
+        "https://forge.example/d.git?ref=main&access_token=demo123",
+        "https://forge.example/d.git?PRIVATE_TOKEN=demo123",
+        "https://forge.example/d.git?api_key=",
+    ]:
+        with pytest.raises(ValidationError, match="token_env"):
+            ProbeConfig.model_validate(remote(bad))
+    # ${VAR}/$VAR references are env var NAMES, not values: allowed
+    for ok_url in [
+        "https://forge.example/d.git?token=${DASHBOARD_TOKEN}",
+        "https://forge.example/d.git?token=$DASHBOARD_TOKEN",
+        "https://forge.example/d.git?branch=main",  # not secret-shaped
+    ]:
+        ok = ProbeConfig.model_validate(remote(ok_url))
+        assert ok.delivery.remotes[0].url == ok_url
+
+
 def test_mssql_store_requires_url():
     with pytest.raises(ValidationError, match="mssql_url"):
         ProbeConfig.model_validate(minimal_config(store={"backend": "mssql"}))
@@ -372,6 +405,17 @@ def test_digest_is_stable_and_secret_redacted():
     # ... or a percent-encoded ODBC PWD inside odbc_connect
     odbc = "mssql+pyodbc:///?odbc_connect=DRIVER%3DODBC+Driver+18%3BSERVER%3Dlocalhost%3BPWD%3D"
     assert config_digest(_cfg(odbc + "demo_pw_one")) == config_digest(_cfg(odbc + "demo_pw_two"))
+    # ... including secrets that CONTAIN percent-escapes: the whole value is
+    # redacted, not just the prefix before the first %XX
+    assert config_digest(_cfg("mssql+pymssql://localhost/demo?password=demo%2Fone")) == (
+        config_digest(_cfg("mssql+pymssql://localhost/demo?password=demo%2Ftwo"))
+    )
+    assert config_digest(_cfg(odbc + "demo%2Fpw%2Bone")) == config_digest(
+        _cfg(odbc + "demo%2Fpw%2Btwo")
+    )
+    # encoded separators still bound the value: what follows %3B is NOT eaten
+    bounded = odbc + "demo_pw_one%3BEncrypt%3D"
+    assert config_digest(_cfg(bounded + "yes")) != config_digest(_cfg(bounded + "no"))
 
     # semantic changes DO change the digest
     assert config_digest(base) != config_digest(_cfg("mssql+pymssql://sa:demo_pw_one@127.0.0.1/demo"))
@@ -401,9 +445,40 @@ def test_analysis_defaults_are_frozen_v1():
         "freshness_bucket": "day",
         "freshness_min_epochs": 5,
         "freshness_zero_mad_tolerance_days": 1.0,
+        "freshness_amber_mads": 2.0,
+        "freshness_red_mads": 3.0,
         "volume_amber_mads": 2.0,
         "volume_red_mads": 3.0,
         "expected_fill_band_mads": 2.0,
         "parity_tolerance": 0,
         "result_cell_cap": 100_000,
     }
+
+
+def test_resolution_is_required_for_time_roles_and_labels_the_grain():
+    # the per-column resolution declaration is part of the frozen contract:
+    # a probe without it is an incomplete mapping, not a valid one
+    with pytest.raises(ValidationError, match="resolution"):
+        ProbeConfig.model_validate(minimal_config(tables=[minimal_table(resolution={})]))
+    with pytest.raises(ValidationError, match="src_inserted_at"):
+        ProbeConfig.model_validate(
+            minimal_config(tables=[minimal_table(source_insert_time="src_inserted_at")])
+        )
+    # the declared resolutions drive the output grain label: a date column on
+    # either side means sub-day arrival detail does not exist
+    config = ProbeConfig.model_validate(minimal_config())
+    assert config.tables[0].lag_resolution == "date"  # order_date is a date
+    assert config.tables[0].dual_lag_resolution is None  # no source timestamp
+    dual = ProbeConfig.model_validate(
+        minimal_config(
+            tables=[
+                minimal_table(
+                    source_insert_time="src_inserted_at",
+                    resolution={"order_date": "datetime", "loaded_at": "datetime",
+                                "src_inserted_at": "datetime"},
+                )
+            ]
+        )
+    )
+    assert dual.tables[0].lag_resolution == "datetime"
+    assert dual.tables[0].dual_lag_resolution == "datetime"

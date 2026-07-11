@@ -95,6 +95,34 @@ def test_minimum_epochs_required():
     assert result.cadence_median_days is None
 
 
+def test_min_epochs_one_with_a_single_epoch_is_insufficient_not_a_crash():
+    # freshness_min_epochs: 1 is a VALID config, but one epoch has no
+    # inter-epoch gap: cadence is unlearnable, reported as insufficient
+    config = table_config(analysis={"freshness_min_epochs": 1})
+    result = _fresh(weekly_days_frame(1), config, "2024-02-01")
+    assert result.epoch_count == 1
+    assert result.last_epoch == pd.Timestamp("2024-01-08")
+    assert [s.reason for s in result.statuses] == [ReasonCode.INSUFFICIENT_EPOCHS]
+    assert result.cadence_median_days is None
+    # two epochs = one gap: with min_epochs 1 satisfied, cadence IS learnable
+    two = _fresh(weekly_days_frame(2), config, "2024-01-16")
+    assert two.cadence_median_days == 7.0
+    assert [s.severity for s in two.statuses] == [Severity.GREEN]
+
+
+def test_freshness_thresholds_come_from_config():
+    # same fixture as the boundary test, stricter configured thresholds:
+    # amber > 7 + 1*1 = 8, red > 7 + 1.5*1 = 8.5 (defaults would stay GREEN)
+    config = table_config(
+        analysis={"freshness_amber_mads": 1.0, "freshness_red_mads": 1.5}
+    )
+    df = weekly_days_frame(20)  # last epoch 2024-05-20, sigma floored at 1.0
+    amber = _fresh(df, config, "2024-05-28 06:00")  # 8.25 days
+    assert [s.severity for s in amber.statuses] == [Severity.AMBER]
+    red = _fresh(df, config, "2024-05-28 18:00")  # 8.75 days
+    assert [s.severity for s in red.statuses] == [Severity.RED]
+
+
 def test_zero_mad_fallback_boundaries_hand_calculated():
     # exactly weekly: gaps all 7.0 -> MAD 0 -> sigma = the configured fixed
     # tolerance (1.0 day). Thresholds: amber > 7 + 2*1 = 9, red > 7 + 3*1 = 10.

@@ -24,6 +24,21 @@ def table_config(**overrides) -> TableConfig:
     data.update(overrides)
     if analysis:
         data["analysis"] = analysis
+    if "resolution" not in data:
+        # synthetic fixtures carry full timestamps: default every configured
+        # time role to datetime unless a test declares otherwise
+        via = data.get("event_time_via") or {}
+        columns = [
+            column
+            for column in (
+                data.get("event_time"),
+                via.get("column") if isinstance(via, dict) else None,
+                data.get("load_time"),
+                data.get("source_insert_time"),
+            )
+            if column
+        ]
+        data["resolution"] = dict.fromkeys(columns, "datetime")
     return TableConfig.model_validate(data)
 
 

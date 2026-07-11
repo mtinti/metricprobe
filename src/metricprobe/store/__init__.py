@@ -29,7 +29,9 @@ import sqlalchemy as sa
 
 from metricprobe.config import StoreConfig, expand_env
 
-SNAPSHOT_SCHEMA_VERSION = 1
+# v2: rows persist the canonical v2 / dual v2 cell shapes, probe_runs carries
+# the stable read-accounting columns, percentile frames carry lag_resolution
+SNAPSHOT_SCHEMA_VERSION = 2
 
 STAMP_COLUMNS = (
     "run_id",
@@ -108,12 +110,30 @@ class ParquetStore:
         self.root = Path(root)
         (self.root / "staging").mkdir(parents=True, exist_ok=True)
         (self.root / "runs").mkdir(parents=True, exist_ok=True)
+        (self.root / "registrations").mkdir(parents=True, exist_ok=True)
 
     def _staging(self, run_id: str) -> Path:
         return self.root / "staging" / validate_run_id(run_id)
 
     def _committed(self, run_id: str) -> Path:
         return self.root / "runs" / validate_run_id(run_id)
+
+    def _registration(self, run_id: str) -> Path:
+        return self.root / "registrations" / f"{validate_run_id(run_id)}.json"
+
+    def register_run(self, meta: RunMeta) -> None:
+        """A durable record of the run's identity and config digest, written
+        BEFORE the stage runs and surviving its failure — this is what makes a
+        failed stage resumable under the matching-digest rule."""
+        self._registration(meta.run_id).write_text(
+            json.dumps(asdict(meta), indent=2, sort_keys=True), encoding="utf-8"
+        )
+
+    def registration(self, run_id: str) -> dict | None:
+        path = self._registration(run_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def begin_run(self, meta: RunMeta) -> None:
         staging = self._staging(meta.run_id)
@@ -139,6 +159,7 @@ class ParquetStore:
         tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(staging / "manifest.json")
         staging.rename(self._committed(run_id))
+        self._registration(run_id).unlink(missing_ok=True)
 
     def abort_run(self, run_id: str) -> None:
         staging = self._staging(run_id)
@@ -178,6 +199,7 @@ class MssqlStore:
 
     MANIFEST_TABLE = "mp_run_manifest"
     STAGING_TABLE = "mp_run_staging"
+    REGISTRATION_TABLE = "mp_run_registration"
 
     def __init__(self, url: str, schema: str):
         self.engine = sa.create_engine(url)
@@ -195,7 +217,44 @@ class MssqlStore:
                 "run_id varchar(64) NOT NULL PRIMARY KEY, "
                 "claimed_at varchar(40) NOT NULL)"
             )
+            conn.exec_driver_sql(
+                f"IF OBJECT_ID('{self.schema}.{self.REGISTRATION_TABLE}') IS NULL "
+                f"CREATE TABLE {self.schema}.{self.REGISTRATION_TABLE} ("
+                "run_id varchar(64) NOT NULL PRIMARY KEY, "
+                "meta nvarchar(max) NOT NULL)"
+            )
         self._staged: dict[str, list[str]] = {}
+
+    def register_run(self, meta: RunMeta) -> None:
+        """Same durable pre-stage record as the parquet store (upserted: a
+        resumed run refreshes its run_at)."""
+        validate_run_id(meta.run_id)
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    f"DELETE FROM {self.schema}.{self.REGISTRATION_TABLE} "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": meta.run_id},
+            )
+            conn.execute(
+                sa.text(
+                    f"INSERT INTO {self.schema}.{self.REGISTRATION_TABLE} "
+                    "(run_id, meta) VALUES (:run_id, :meta)"
+                ),
+                {"run_id": meta.run_id, "meta": json.dumps(asdict(meta), sort_keys=True)},
+            )
+
+    def registration(self, run_id: str) -> dict | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    f"SELECT meta FROM {self.schema}.{self.REGISTRATION_TABLE} "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            ).scalar()
+        return None if row is None else json.loads(row)
 
     def begin_run(self, meta: RunMeta) -> None:
         """The staging claim is a SERVER-SIDE primary-key insert: two processes
@@ -250,12 +309,21 @@ class MssqlStore:
                 ),
                 {"run_id": run_id},
             )
+            conn.execute(
+                sa.text(
+                    f"DELETE FROM {self.schema}.{self.REGISTRATION_TABLE} "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
         del self._staged[run_id]
 
     def abort_run(self, run_id: str) -> None:
         """Deletes data rows ONLY when no manifest exists for the id (a
-        committed run is never touched) and releases the staging claim."""
-        names = self._staged.pop(run_id, [])
+        committed run is never touched) and releases the staging claim. When
+        this process never staged the run (crash recovery before a resume),
+        the staged-table list is unknown, so every data table is swept."""
+        names = self._staged.pop(run_id, None)
         with self.engine.begin() as conn:
             committed = conn.execute(
                 sa.text(
@@ -265,10 +333,13 @@ class MssqlStore:
                 {"run_id": run_id},
             ).scalar_one()
             if not committed:
-                for name in set(names):
+                sweep = self._data_tables() if names is None else [
+                    f"mp_{name}" for name in set(names)
+                ]
+                for name in sweep:
                     conn.execute(
                         sa.text(
-                            f"DELETE FROM {self.schema}.mp_{name} WHERE run_id = :run_id"
+                            f"DELETE FROM {self.schema}.{name} WHERE run_id = :run_id"
                         ),
                         {"run_id": run_id},
                     )
@@ -310,7 +381,8 @@ class MssqlStore:
             return [
                 name
                 for name in rows
-                if name not in (self.MANIFEST_TABLE, self.STAGING_TABLE)
+                if name
+                not in (self.MANIFEST_TABLE, self.STAGING_TABLE, self.REGISTRATION_TABLE)
             ]
 
     def prune(self, keep: int) -> list[str]:

@@ -6,6 +6,7 @@ import math
 import statistics
 
 import pandas as pd
+import pytest
 from tests.support import probe, probe_dual, table_config
 from tests.synth import generator as g
 from tests.synth.scenarios import catalog
@@ -89,12 +90,16 @@ def test_dual_clip_cap_and_negative_policy():
         s.severity is Severity.RED and s.reason is ReasonCode.NEGATIVE_LAG_EXCESS
         for s in assessment.statuses
     )
-    # over-cap censoring on the SOURCE curve: a 15-day cap censors p95
+    # over-cap censoring on the SOURCE curve: a 15-day cap censors p95, the
+    # value is reported ONLY as "> cap", and the check must not read GREEN
     tight = _dual_config(analysis={"lag_cap_days": 15})
     censored = assess_dual_lag(probe_dual(df, tight, AS_OF), tight, pd.Timestamp(AS_OF))
     month = next(iter(censored.source_percentiles))
     assert censored.source_percentiles[month][95].over_cap
     assert int(probe_dual(df, tight, AS_OF).global_row["n_overflow"]) > 0
+    over_cap = [s for s in censored.statuses if s.reason is ReasonCode.PERCENTILE_OVER_CAP]
+    assert over_cap and over_cap[0].severity is Severity.INSUFFICIENT_HISTORY
+    assert not any(s.severity is Severity.GREEN for s in censored.statuses)
 
 
 def test_dual_supports_event_time_via():
@@ -134,6 +139,45 @@ def test_dual_supports_event_time_via():
     borrowed = assess_dual_lag(via_dual, via_config, pd.Timestamp(AS_OF))
     assert borrowed.source_percentiles == direct.source_percentiles
     assert borrowed.delta_histogram.equals(direct.delta_histogram)
+
+
+def test_dual_via_asserts_lookup_uniqueness_itself():
+    # the dual pass runs on its OWN connection: the main pass's guard cannot
+    # protect it against lookup mutation in between, so a duplicated lookup
+    # key must abort the dual pass, never silently multiply source rows
+    import sqlalchemy as sa
+
+    from metricprobe.extract.canonical import ProbeAborted
+    from metricprobe.extract.dual import run_dual_lag
+
+    df = g.generate(DUAL)
+    base = pd.DataFrame(
+        {
+            "referral_id": df["row_id"],
+            "load_time": df["load_time"],
+            "source_insert_time": df["source_insert_time"],
+        }
+    )
+    lookup = pd.DataFrame({"id": df["row_id"], "referral_date": df["event_time"]})
+    duplicated = pd.concat([lookup, lookup.head(5)], ignore_index=True)
+    via_config = table_config(
+        event_time=None,
+        source_insert_time="source_insert_time",
+        event_time_via={
+            "join_table": "memory.main.referrals",
+            "on": [{"base_col": "referral_id", "lookup_col": "id"}],
+            "column": "referral_date",
+        },
+    )
+    engine = sa.create_engine("duckdb:///:memory:")
+    try:
+        g.load_via_sqlalchemy(base, engine, "events")
+        g.load_via_sqlalchemy(duplicated, engine, "referrals")
+        with pytest.raises(ProbeAborted) as excinfo:
+            run_dual_lag(engine, via_config, pd.Timestamp(AS_OF))
+    finally:
+        engine.dispose()
+    assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
 
 
 def test_dual_delta_histogram_is_the_exact_offset():
@@ -280,3 +324,23 @@ def test_complete_back_to_is_refused_when_the_wait_is():
     assert assessment.recommended_wait is None
     assert complete_back_to(assessment, pd.Timestamp(AS_OF)) is None
     assert any(s.reason is ReasonCode.PERCENTILE_OVER_CAP for s in assessment.statuses)
+
+
+def test_month_with_only_null_batch_ids_still_appears():
+    # NULL out EVERY batch id in one month: the month must not vanish — it
+    # reports zero runs, its full NULL count, and unreachable percentiles
+    df = catalog()["straggler_batch"].healthy()
+    month_rows = df["event_time"].dt.to_period("M") == "2024-06"
+    nulled = df.copy()
+    nulled.loc[month_rows, "batch_id"] = None
+    config = table_config(load_batch_col="batch_id")
+    assessment = assess_batch(probe(nulled, config, AS_OF), config)
+    by_month = {m.month: m for m in assessment.months}
+    june = by_month[pd.Period("2024-06", freq="M")]
+    assert june.runs == 0 and june.rows_per_run == {}
+    assert june.null_batch_rows == int(month_rows.sum()) == 2000
+    assert all(value is None for value in june.days_to.values())
+    # the neighbouring months are untouched
+    assert by_month[pd.Period("2024-05", freq="M")].runs == 3
+    amber = [s for s in assessment.statuses if s.reason is ReasonCode.NULL_BATCH_IDS]
+    assert amber and amber[0].severity is Severity.AMBER

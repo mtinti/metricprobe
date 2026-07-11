@@ -102,6 +102,7 @@ def _config_basic() -> TableConfig:
             "table": "orders",
             "event_time": "order_date",
             "load_time": "loaded_at",
+            "resolution": {"order_date": "date", "loaded_at": "datetime"},
         }
     )
 
@@ -119,6 +120,7 @@ def _config_batch_alt_keys() -> TableConfig:
             "group_by_alt": "region",
             "key_cols": ["settlement_id", "leg"],
             "compare_event_time": "settled_on_raw",
+            "resolution": {"settled_on": "date", "loaded_at": "datetime"},
         }
     )
 
@@ -139,6 +141,7 @@ def _config_via_composite() -> TableConfig:
                 ],
                 "column": "referral_date",
             },
+            "resolution": {"referral_date": "date", "loaded_at": "datetime"},
         }
     )
 
@@ -310,6 +313,7 @@ def test_dual_schema_is_frozen():
         "n_negative_lag_excluded",
         "n_overflow",
         "n_delta_rows",
+        "max_lookup_dup",
     )
 
 
@@ -323,6 +327,11 @@ def _config_dual() -> TableConfig:
             "event_time": "order_date",
             "load_time": "loaded_at",
             "source_insert_time": "src_inserted_at",
+            "resolution": {
+                "order_date": "date",
+                "loaded_at": "datetime",
+                "src_inserted_at": "datetime",
+            },
         }
     )
 

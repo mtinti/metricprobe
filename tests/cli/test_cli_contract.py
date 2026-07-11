@@ -13,6 +13,7 @@ import yaml
 from tests.synth import generator as g
 
 from metricprobe.cli import main
+from metricprobe.config import CONFIG_SCHEMA_VERSION
 from metricprobe.store import STAMP_COLUMNS, ParquetStore
 
 # just after the last synthetic load: freshness stays GREEN while the
@@ -54,12 +55,13 @@ def table_entry(table: str, probe: str, **overrides) -> dict:
         "table": table,
         "event_time": "event_time",
         "load_time": "load_time",
+        "resolution": {"event_time": "datetime", "load_time": "datetime"},
     } | overrides
 
 
 def write_config(tmp_path, demo_db, tables: list[dict], **top) -> str:
     config = {
-        "schema_version": 1,
+        "schema_version": CONFIG_SCHEMA_VERSION,
         "connection_url": f"duckdb:///{demo_db}",
         "store": {"path": str(tmp_path / "store")},
         "tables": tables,
@@ -97,6 +99,15 @@ def test_exit_0_healthy_run_commits_analysis(tmp_path, demo_db):
         "completion_percentiles", "month_lag_cells", "epoch_cells", "freshness",
         "population_buckets", "volume_summary",
     }
+    # the manifest names the exact contract versions that produced the run,
+    # and every status row carries the status model version
+    from metricprobe.cli import COMPONENT_VERSIONS
+
+    assert manifest["component_versions"] == COMPONENT_VERSIONS
+    assert set(statuses["status_schema_version"]) == {COMPONENT_VERSIONS["status"]}
+    # the declared resolution labels the completion grain in the snapshot
+    percentiles = store.read_table(manifest["run_id"], "completion_percentiles")
+    assert set(percentiles["lag_resolution"]) == {"datetime"}
     # the reconciliation buckets are reproducible from the snapshot alone
     buckets = store.read_table(manifest["run_id"], "population_buckets").iloc[0]
     assert int(buckets["row_count"]) > 0
@@ -211,11 +222,84 @@ def test_resume_is_idempotent_and_digest_guarded(tmp_path, demo_db):
     )
     # resume without a run id is refused
     assert run_cli("--config", config, "--resume-from", "analysis") == 1
-    # an unknown/aborted run id has no committed digest to verify: refused too
+    # an unknown run id has neither a committed manifest nor a registration
+    # to verify the digest against: refused
     assert (
         run_cli("--config", config, "--as-of", AS_OF,
                 "--resume-from", "analysis", "--run-id", "never-ran") == 1
     )
+
+
+def test_failed_analysis_is_resumable_under_the_same_run_id(tmp_path, demo_db, monkeypatch):
+    import metricprobe.cli as cli
+
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("injected analysis failure")
+
+    monkeypatch.setattr(cli, "assess_volume", explode)
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "r-retry") == 1
+    store = ParquetStore(tmp_path / "store")
+    assert store.list_runs() == []  # the failed stage left nothing partial...
+    registration = store.registration("r-retry")
+    assert registration is not None  # ...but the durable registration survives
+    # a changed config cannot resume the failed run (digest guard applies to
+    # registered runs exactly as to committed ones)
+    changed_dir = tmp_path / "changed"
+    changed_dir.mkdir()
+    changed = write_config(
+        changed_dir, demo_db,
+        [table_entry("events", "orders_main", analysis={"lag_cap_days": 200,
+                                                        "training_cutoff_days": 200})],
+        store={"path": str(tmp_path / "store")},  # SAME store, different digest
+    )
+    assert (
+        run_cli("--config", changed, "--as-of", AS_OF,
+                "--resume-from", "analysis", "--run-id", "r-retry") == 1
+    )
+    monkeypatch.undo()
+    # with the failure gone, the retry re-runs the stage under the SAME run_id
+    assert (
+        run_cli("--config", config, "--as-of", AS_OF,
+                "--resume-from", "analysis", "--run-id", "r-retry") == 0
+    )
+    (manifest,) = store.list_runs()
+    assert manifest["run_id"] == "r-retry"
+    # the registration is consumed by the commit; a second resume is the
+    # idempotent already-committed no-op
+    assert store.registration("r-retry") is None
+    assert (
+        run_cli("--config", config, "--as-of", AS_OF,
+                "--resume-from", "analysis", "--run-id", "r-retry") == 0
+    )
+    assert len(store.list_runs()) == 1
+
+
+def test_probe_runs_schema_is_stable_across_outcomes(tmp_path, demo_db):
+    """A skipped/missing/aborted probe writes the SAME probe_runs columns as a
+    healthy one — the first frame a store sees must never fix a narrower
+    physical schema than later appends need."""
+    from metricprobe.cli import READ_COLUMNS
+
+    missing = write_config(
+        tmp_path, demo_db, [table_entry("no_such_table", "ghost_main")]
+    )
+    assert run_cli("--config", missing, "--as-of", AS_OF, "--run-id", "r-ghost") == 2
+    store = ParquetStore(tmp_path / "store")
+    ghost_runs = store.read_table("r-ghost", "probe_runs")
+    healthy_dir = tmp_path / "h"
+    healthy_dir.mkdir()
+    healthy = write_config(healthy_dir, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", healthy, "--as-of", AS_OF, "--run-id", "r-live") == 0
+    live_runs = ParquetStore(healthy_dir / "store").read_table("r-live", "probe_runs")
+    # identical columns in identical order, whatever the probe outcome; the
+    # read columns are None off-mssql (STATISTICS IO does not exist) and for
+    # skipped/aborted probes — present either way
+    assert list(ghost_runs.columns) == list(live_runs.columns)
+    for column in READ_COLUMNS:
+        assert column in ghost_runs.columns
+        assert ghost_runs[column].isna().all()
 
 
 def test_retention_prunes_after_commit(tmp_path, demo_db):
@@ -307,7 +391,11 @@ def test_probe_abort_commits_no_partial_frames(tmp_path, demo_db, monkeypatch):
         demo_db,
         [
             table_entry("events", "orders_main"),
-            table_entry("events_dual", "dual_probe", source_insert_time="source_insert_time"),
+            table_entry(
+                "events_dual", "dual_probe", source_insert_time="source_insert_time",
+                resolution={"event_time": "datetime", "load_time": "datetime",
+                            "source_insert_time": "datetime"},
+            ),
         ],
     )
     assert run_cli("--config", config, "--as-of", AS_OF) == 2  # typed RED, committed

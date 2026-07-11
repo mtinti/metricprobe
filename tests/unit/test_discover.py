@@ -158,6 +158,32 @@ def test_duplicate_table_names_across_schemas_get_unique_probe_names(tmp_path):
     assert len(config.tables) == 2
 
 
+def test_probe_name_dedupe_is_globally_collision_safe(tmp_path):
+    # schema-qualification alone is not enough: alpha.orders qualifies to
+    # alpha_orders_main, which COLLIDES with main.alpha_orders' unqualified
+    # name — the numeric-suffix fallback must keep the draft valid
+    path = tmp_path / "clash.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("CREATE SCHEMA alpha")
+    con.execute("CREATE SCHEMA beta")
+    con.execute("CREATE TABLE alpha.orders (event_time DATE, load_time TIMESTAMP)")
+    con.execute("CREATE TABLE beta.orders (event_time DATE, load_time TIMESTAMP)")
+    con.execute("CREATE TABLE main.alpha_orders (event_time DATE, load_time TIMESTAMP)")
+    con.close()
+    engine = sa.create_engine(f"duckdb:///{path}")
+    try:
+        draft = draft_config(engine, "clash", f"duckdb:///{path}")
+    finally:
+        engine.dispose()
+    parsed = yaml.safe_load(draft)
+    names = [entry["probe_name"] for entry in parsed["tables"]]
+    assert len(names) == len(set(names)) == 3
+    assert sorted(names) == ["alpha_orders_main", "alpha_orders_main_2", "beta_orders_main"]
+    draft_path = tmp_path / "clash.yaml"
+    draft_path.write_text(draft)
+    assert len(load_config(draft_path).tables) == 3
+
+
 def test_draft_declares_per_column_resolution(engine):
     draft = draft_config(engine, "demo", "duckdb:///demo", schema="main")
     parsed = yaml.safe_load(draft)

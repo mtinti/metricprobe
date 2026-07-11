@@ -55,19 +55,32 @@ def _dataset() -> pd.DataFrame:
 
 
 def _config(database: str, schema: str, **overrides) -> TableConfig:
-    return TableConfig.model_validate(
-        {
-            "probe_name": "events_probe",
-            "database": database,
-            "schema": schema,
-            "table": "events",
-            "event_time": "event_time",
-            "load_time": "load_time",
-            "load_batch_col": "batch_id",
-            "key_cols": ["row_id", "batch_id"],
-        }
-        | overrides
-    )
+    data = {
+        "probe_name": "events_probe",
+        "database": database,
+        "schema": schema,
+        "table": "events",
+        "event_time": "event_time",
+        "load_time": "load_time",
+        "load_batch_col": "batch_id",
+        "key_cols": ["row_id", "batch_id"],
+    } | overrides
+    if "resolution" not in data:
+        # synthetic fixtures carry full timestamps: declare every configured
+        # time role as datetime unless a test overrides
+        via = data.get("event_time_via") or {}
+        columns = [
+            column
+            for column in (
+                data.get("event_time"),
+                via.get("column") if isinstance(via, dict) else None,
+                data.get("load_time"),
+                data.get("source_insert_time"),
+            )
+            if column
+        ]
+        data["resolution"] = dict.fromkeys(columns, "datetime")
+    return TableConfig.model_validate(data)
 
 
 def _normalized(frame: pd.DataFrame) -> pd.DataFrame:
@@ -135,6 +148,7 @@ def _via_config(database: str, schema: str) -> TableConfig:
                 ],
                 "column": "referral_date",
             },
+            "resolution": {"referral_date": "datetime", "load_time": "datetime"},
         }
     )
 

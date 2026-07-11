@@ -62,13 +62,24 @@ def assess_batch(canonical: CanonicalResult, table: TableConfig) -> BatchAssessm
         pd.Period(ts, freq="M"): int(count)
         for ts, count in orphaned.groupby("event_month")["n_curve_eligible"].sum().items()
     }
+    # iterate the UNION of months seen with and without batch ids: a month
+    # whose eligible rows ALL carry NULL batch ids must still appear — with
+    # zero runs, its NULL count, and every percentile unreachable — never
+    # silently vanish from the results
+    valid_by_month = {
+        pd.Period(ts, freq="M"): group for ts, group in valid.groupby("event_month")
+    }
     months: list[BatchMonth] = []
-    for month_ts, group in sorted(valid.groupby("event_month"), key=lambda item: item[0]):
-        month = pd.Period(month_ts, freq="M")
-        per_batch = {
-            batch: int(rows)
-            for batch, rows in group.groupby("batch_id")["n_curve_eligible"].sum().items()
-        }
+    for month in sorted(set(valid_by_month) | set(orphaned_by_month)):
+        group = valid_by_month.get(month)
+        per_batch = (
+            {
+                batch: int(rows)
+                for batch, rows in group.groupby("batch_id")["n_curve_eligible"].sum().items()
+            }
+            if group is not None
+            else {}
+        )
         total = finals.get(month, sum(per_batch.values()))
         ordered = sorted(per_batch, key=lambda batch: batch_ts[batch])
         days_to: dict[int, int | None] = {}

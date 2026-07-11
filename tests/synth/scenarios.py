@@ -37,6 +37,11 @@ DUAL_BASE = dataclasses.replace(
     TRICKLE_BASE, name="dual_registry", dual_offset_days=2.0, seed=303
 )
 
+# 24 months ending 2024-12: the short-collapse pair's base (the max batch lag
+# is ~50 days, so a 52d cap / 54d cutoff covers the lag support and makes the
+# two older months of a 3-month collapse mature)
+BATCHY_SHORT = dataclasses.replace(BATCHY_BASE, n_months=24, seed=204)
+
 
 @dataclass(frozen=True)
 class ScenarioPair:
@@ -114,6 +119,22 @@ def catalog() -> dict[str, ScenarioPair]:
             healthy=lambda: g.generate(BATCHY_BASE),
             unhealthy=lambda: g.generate(
                 g.sustained_collapse(BATCHY_BASE, last_k=15, factor=0.1)
+            ),
+        ),
+        ScenarioPair(
+            name="sustained_collapse_short",
+            description="the SHORT degradation from the Step 4 spec: batches keep "
+            "their cadence but only the last 3 months carry ~10x fewer rows. Under "
+            "the DEFAULT 365d horizon none of those months can be mature (mature "
+            "implies stale), so this pair is probed with a configured shorter "
+            "horizon (lag_cap_days 52, training_cutoff_days 54) that still covers "
+            "the ~50d batch lag support: the two mature collapsed months are a RED "
+            "collapse, the immature third is an arrival deficit, freshness GREEN",
+            expected_detection="volume: RED collapse on the 2 mature collapsed months; "
+            "arrival deficit on the immature one; freshness: GREEN",
+            healthy=lambda: g.generate(BATCHY_SHORT),
+            unhealthy=lambda: g.generate(
+                g.sustained_collapse(BATCHY_SHORT, last_k=3, factor=0.1)
             ),
         ),
     ]

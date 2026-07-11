@@ -22,10 +22,6 @@ from metricprobe.extract.canonical import CanonicalResult
 from metricprobe.metrics.robust import robust_sigma
 from metricprobe.status import Check, ReasonCode, Severity, Status
 
-# v1 algorithm constants, mirroring the volume amber/red defaults
-FRESHNESS_AMBER_MADS = 2.0
-FRESHNESS_RED_MADS = 3.0
-
 
 @dataclass
 class FreshnessAssessment:
@@ -61,7 +57,10 @@ def assess_freshness(
 ) -> FreshnessAssessment:
     analysis = table.analysis
     stamps = epoch_timestamps(canonical, table)
-    if len(stamps) < analysis.freshness_min_epochs:
+    # cadence is learned from INTER-epoch gaps: below the configured minimum,
+    # or with fewer than two epochs (no gap exists at all — reachable when
+    # freshness_min_epochs is configured to 1), it cannot be learned
+    if len(stamps) < max(analysis.freshness_min_epochs, 2):
         return FreshnessAssessment(
             epoch_count=len(stamps),
             last_epoch=stamps[-1] if stamps else None,
@@ -73,8 +72,9 @@ def assess_freshness(
                     check=Check.FRESHNESS,
                     severity=Severity.INSUFFICIENT_HISTORY,
                     reason=ReasonCode.INSUFFICIENT_EPOCHS,
-                    detail=f"{len(stamps)} arrival epochs < freshness_min_epochs="
-                    f"{analysis.freshness_min_epochs}",
+                    detail=f"{len(stamps)} arrival epochs < "
+                    f"{max(analysis.freshness_min_epochs, 2)} (configured minimum, "
+                    "floored at 2: cadence needs at least one inter-epoch gap)",
                 )
             ],
         )
@@ -86,9 +86,9 @@ def assess_freshness(
     # zero-MAD fallback: perfectly regular feeds use the configured fixed tolerance
     sigma = max(robust_sigma(gaps), analysis.freshness_zero_mad_tolerance_days)
     days_since = float((as_of - stamps[-1]) / pd.Timedelta(days=1))
-    if days_since > cadence + FRESHNESS_RED_MADS * sigma:
+    if days_since > cadence + analysis.freshness_red_mads * sigma:
         severity = Severity.RED
-    elif days_since > cadence + FRESHNESS_AMBER_MADS * sigma:
+    elif days_since > cadence + analysis.freshness_amber_mads * sigma:
         severity = Severity.AMBER
     else:
         severity = Severity.GREEN
