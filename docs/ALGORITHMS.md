@@ -158,8 +158,37 @@ band(t) = expected(t) ± expected_fill_band_mads * sigma_band(t)
 `duplicate_rows = total_rows - COUNT(DISTINCT key_hash)` where key_hash is
 SHA-256 over a type-tagged, length-prefixed binary encoding with a distinct
 NULL sentinel. Per column: `0x00` for NULL, else `0x01` + length-prefixed TYPE
-TAG (the value's base SQL type: SQL_VARIANT_PROPERTY BaseType on mssql,
-typeof on duckdb) + length-prefixed value bytes. Delimiter concatenation is
+TAG (the column's DECLARED type, fetched once from INFORMATION_SCHEMA and
+embedded as a literal — a per-row type function would reject varchar(max) and
+cost a call per row) + length-prefixed value bytes. Delimiter concatenation is
 ambiguous; the check is documented as probabilistic: SHA-256 collision odds
 are negligible; encoding ambiguity was the real risk. Never 32-bit CHECKSUM.
 Duplicates present iff duplicate_rows > 0.
+
+## 10. Volume baselines and verdicts
+
+- Volumes are the per-month curve-eligible counts from the canonical
+  aggregation's (event_month, lag_day) cells — no separate query.
+- **Baseline** = MATURE months EXCLUDING the evaluation window (the last
+  `evaluation_window_months` OBSERVED months), so a sustained degradation can
+  never normalize itself. Requires `min_mature_months` baseline months, else
+  insufficient history. `baseline_sigma = robust_sigma_floor(baseline
+  volumes)` (section 1); the volume forecast for section 8 is the baseline
+  median (non-seasonal v1; a seasonal month-of-year median requires >= 24
+  mature months and is deferred).
+- **Outliers** (MATURE months only): |volume - baseline_median| >
+  `volume_red_mads * sigma` => RED, > `volume_amber_mads * sigma` => AMBER
+  (reason VOLUME_OUTLIER).
+- **Sustained collapse** (MATURE months only): a run of >= 2 consecutive
+  below-red months ending at the most recent mature month => one RED
+  VOLUME_COLLAPSE verdict (those months are not double-reported as outliers).
+- **Gaps**: interior months with zero rows => RED VOLUME_GAP, rendered
+  explicitly.
+- **Still-filling** (immature CLOSED months): age from MONTH_END
+  (conservative — can only under-alarm); the OPEN month (not yet ended at
+  as_of) is excluded from every check and reported as "open". Observed count
+  below the section-8 band => AMBER ARRIVAL_DEFICIT, phrased "arrival deficit
+  — cause unresolved"; the collapse verdict is mature-only. The inverted
+  nowcast `observed / F_mature(age)` is reported but NEVER fed back into the
+  expectation (tautology guard: a month at 50% of expectation must flag even
+  though its own nowcast is self-consistent).

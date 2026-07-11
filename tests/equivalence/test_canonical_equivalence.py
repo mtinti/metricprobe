@@ -169,6 +169,41 @@ def test_via_non_unique_lookup_aborts_on_both_dialects(duckdb_engine, mssql_engi
         assert "7 base rows are ambiguous" in excinfo.value.detail
 
 
+def test_volume_assessment_matches_between_dialects(duckdb_engine, mssql_engine):
+    """Step 4 equivalence: sustained collapse + injected duplicate keys must
+    yield identical volume verdicts, baselines and still-filling rows from
+    both engines."""
+    from tests.synth.scenarios import BATCHY_BASE
+
+    from metricprobe.metrics.volume import assess_volume
+
+    df = g.inject_duplicate_keys(
+        g.generate(g.sustained_collapse(BATCHY_BASE, last_k=3, factor=0.1)),
+        fraction=0.01,
+        seed=9,
+    )
+    as_of = pd.Timestamp("2026-08-01")
+    assessments = []
+    for engine, database, schema in (
+        (duckdb_engine, "memory", "main"),
+        (mssql_engine, "tempdb", "dbo"),
+    ):
+        config = _config(database, schema, key_cols=["row_id"])
+        g.load_via_sqlalchemy(df, engine, "events")
+        canonical = run_canonical(engine, config, as_of)
+        completion = assess_completion(canonical, config, as_of)
+        assessments.append(assess_volume(canonical, config, as_of, completion))
+    duck, mssql = assessments
+    assert duck.statuses == mssql.statuses
+    assert duck.baseline_median == mssql.baseline_median
+    assert duck.baseline_sigma == mssql.baseline_sigma
+    assert duck.duplicate_rows == mssql.duplicate_rows
+    assert duck.months == mssql.months
+    reasons = {s.reason for s in mssql.statuses}
+    assert ReasonCode.VOLUME_COLLAPSE in reasons
+    assert ReasonCode.DUPLICATE_KEYS in reasons
+
+
 def test_scan_budget_enforced_through_the_production_runner(mssql_engine):
     """run_canonical itself measures target-table logical reads (STATISTICS IO
     via the driver) against 3x one full scan and records both on the result.
