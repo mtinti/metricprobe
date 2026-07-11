@@ -60,7 +60,7 @@ def test_environment_shaped_fields_need_no_marker_list():
 def test_environment_shaped_fields_with_placeholders_pass():
     for value in ["localhost", "localhost:1433", "${PROD_SERVER}", "$PROD_SERVER",
                   "<your-server>", "%SERVER%", "demo_retail", "tempdb", "dbo",
-                  "Metricprobe1!", "example.com"]:
+                  "Metricprobe1!", "example.com", "str"]:  # "str": type annotation in code
         field = "ser" + f"ver: {value}"
         assert scan.content_violations("cfg.yaml", field, []) == [], field
 

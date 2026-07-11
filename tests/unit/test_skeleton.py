@@ -19,6 +19,7 @@ MODULES = [
     "metricprobe.metrics.dual_lag",
     "metricprobe.metrics.batch",
     "metricprobe.metrics.parity",
+    "metricprobe.status",
     "metricprobe.store",
     "metricprobe.viz",
 ]

@@ -83,6 +83,7 @@ _PLACEHOLDER_VALUE = re.compile(
       | server | host | hostname | database | db | dbname | catalog
       | dbo | main | public | master | tempdb | information_schema
       | none | null | true | false | yes | no
+      | str | int | float | bool | bytes | date | datetime   # type annotations
     )$""",
     re.IGNORECASE | re.VERBOSE,
 )
