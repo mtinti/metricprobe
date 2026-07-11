@@ -66,6 +66,12 @@ def test_environment_shaped_fields_with_placeholders_pass():
         assert scan.content_violations("cfg.yaml", field, []) == [], field
 
 
+def test_attribute_references_in_code_pass():
+    # keyword arguments forwarding parsed CLI options are code, not config
+    line = "    draft_config(engine, args.database, schema=args.schema, x=1)"
+    assert scan.content_violations("cli.py", line, []) == []
+
+
 def test_equality_comparisons_are_not_assignments():
     # `x.schema == "value"` in test code is a comparison, not a field
     assert scan.content_violations("t.py", 'assert ok.schema == "whatever_value"', []) == []

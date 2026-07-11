@@ -50,7 +50,7 @@ from metricprobe.config import (
     expand_env,
     load_config,
 )
-from metricprobe.discover import draft_config
+from metricprobe.discover import DEFAULT_ROLE_CANDIDATES, draft_config
 from metricprobe.extract.canonical import ProbeAborted, run_canonical
 from metricprobe.extract.dual import run_dual_lag
 from metricprobe.metrics.batch import assess_batch
@@ -606,23 +606,44 @@ def cmd_run(args) -> int:
     return exit_code_for(statuses)
 
 
+def _parse_candidate_overrides(pairs: list[str] | None) -> dict[str, tuple[str, ...]]:
+    """--candidates role=pattern1,pattern2 (repeatable): override any subset of
+    the shipped role-candidate lists."""
+    overrides: dict[str, tuple[str, ...]] = {}
+    for pair in pairs or []:
+        role, separator, patterns = pair.partition("=")
+        if not separator or role not in DEFAULT_ROLE_CANDIDATES:
+            raise ConfigError(
+                f"--candidates must be role=patterns with role one of "
+                f"{sorted(DEFAULT_ROLE_CANDIDATES)}; got {pair!r}"
+            )
+        needles = tuple(needle.strip() for needle in patterns.split(",") if needle.strip())
+        if not needles:
+            raise ConfigError(f"--candidates {pair!r} lists no patterns")
+        overrides[role] = needles
+    return overrides
+
+
 def cmd_discover(args) -> int:
     try:
+        candidates = _parse_candidate_overrides(args.candidates)
         engine = sa.create_engine(expand_env(args.url))
         try:
-            draft = draft_config(engine, args.database, args.url, schema=args.schema)
+            draft = draft_config(
+                engine, args.database, args.url, schema=args.schema, candidates=candidates
+            )
         finally:
             engine.dispose()
+        if args.out:
+            from pathlib import Path
+
+            Path(args.out).write_text(draft, encoding="utf-8")
+            print(f"draft config written to {args.out}")
+        else:
+            print(draft, end="")
     except Exception as error:
         print(f"metricprobe: discover failed: {error}", file=sys.stderr)
         return 1
-    if args.out:
-        from pathlib import Path
-
-        Path(args.out).write_text(draft, encoding="utf-8")
-        print(f"draft config written to {args.out}")
-    else:
-        print(draft, end="")
     return 0
 
 
@@ -656,6 +677,12 @@ def main(argv=None) -> int:
     discover.add_argument("--database", required=True)
     discover.add_argument("--schema", help="restrict the scan to one schema")
     discover.add_argument("--out", help="write the draft here instead of stdout")
+    discover.add_argument(
+        "--candidates",
+        action="append",
+        help="override a role's candidate patterns, e.g. event_time=admitted,seen "
+        "(repeatable)",
+    )
     discover.set_defaults(handler=cmd_discover)
 
     for command, step in (

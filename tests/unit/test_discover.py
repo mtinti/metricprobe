@@ -112,3 +112,90 @@ def test_cli_discover_writes_a_draft(demo_db, tmp_path, capsys):
     assert "orders_main" in out.read_text()
     # a bad URL is an execution error (1), never the data-health code
     assert main(["discover", "--url", "duckdb:///nope/nope.duckdb", "--database", "x"]) == 1
+
+
+def test_yaml_hostile_identifiers_survive(tmp_path):
+    """Identifiers named `yes` or containing ':' must round-trip as STRINGS."""
+    path = tmp_path / "hostile.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute('CREATE TABLE "yes" ("event: time" TIMESTAMP, "load" TIMESTAMP)')
+    con.close()
+    engine = sa.create_engine(f"duckdb:///{path}")
+    try:
+        draft = draft_config(engine, "hostile", f"duckdb:///{path}", schema="main")
+    finally:
+        engine.dispose()
+    parsed = yaml.safe_load(draft)
+    (entry,) = parsed["tables"]
+    assert entry["table"] == "yes"  # a string, not boolean True
+    assert entry["probe_name"] == "yes_main"
+    assert entry["event_time"] == "event: time"
+    assert entry["resolution"] == {"event: time": "datetime", "load": "datetime"}
+
+
+def test_duplicate_table_names_across_schemas_get_unique_probe_names(tmp_path):
+    path = tmp_path / "multi.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("CREATE SCHEMA alpha")
+    con.execute("CREATE SCHEMA beta")
+    for schema in ("alpha", "beta"):
+        con.execute(
+            f"CREATE TABLE {schema}.orders (event_time DATE, load_time TIMESTAMP)"
+        )
+    con.close()
+    engine = sa.create_engine(f"duckdb:///{path}")
+    try:
+        draft = draft_config(engine, "multi", f"duckdb:///{path}")
+    finally:
+        engine.dispose()
+    parsed = yaml.safe_load(draft)
+    names = sorted(entry["probe_name"] for entry in parsed["tables"])
+    assert names == ["alpha_orders_main", "beta_orders_main"]
+    # the deduplicated draft VALIDATES (campaign-wide probe-name uniqueness)
+    draft_path = tmp_path / "multi.yaml"
+    draft_path.write_text(draft)
+    config = load_config(draft_path)
+    assert len(config.tables) == 2
+
+
+def test_draft_declares_per_column_resolution(engine):
+    draft = draft_config(engine, "demo", "duckdb:///demo", schema="main")
+    parsed = yaml.safe_load(draft)
+    entries = {entry["probe_name"]: entry for entry in parsed["tables"]}
+    # orders: event_time is DATE, load_time is TIMESTAMP
+    assert entries["orders_main"]["resolution"] == {
+        "event_time": "date",
+        "load_time": "datetime",
+    }
+    assert entries["telemetry_main"]["resolution"] == {
+        "recorded_at": "datetime",
+        "ingested_at": "datetime",
+    }
+
+
+def test_cli_candidate_overrides_and_guarded_output(demo_db, tmp_path, capsys):
+    url = f"duckdb:///{demo_db}"
+    # the ambiguous table's lone stamp becomes the event via a CLI override
+    assert (
+        main([
+            "discover", "--url", url, "--database", "demo", "--schema", "main",
+            "--candidates", "event_time=only_stamp",
+        ])
+        == 0
+    )
+    printed = capsys.readouterr().out
+    parsed = yaml.safe_load(printed)
+    entries = {entry["probe_name"]: entry for entry in parsed["tables"]}
+    assert entries["ambiguous_main"]["event_time"] == "only_stamp"
+    # a malformed override is an execution error
+    assert (
+        main(["discover", "--url", url, "--database", "demo",
+              "--candidates", "bogus_role=x"])
+        == 1
+    )
+    # an unwritable output path is an execution error, not a traceback
+    assert (
+        main(["discover", "--url", url, "--database", "demo",
+              "--out", str(tmp_path / "missing_dir" / "draft.yaml")])
+        == 1
+    )

@@ -345,18 +345,23 @@ def test_scan_budget_refusals_through_the_production_runner(mssql_engine, monkey
 def test_discover_matches_between_dialects(duckdb_engine, mssql_engine):
     """Step 8: the INFORMATION_SCHEMA scanner assigns the same roles from the
     same column names on both engines, across their different type spellings
-    (DATE/TIMESTAMP vs date/datetime2)."""
+    (DATE/TIMESTAMP vs date/datetime2). T-SQL `timestamp` is a binary
+    ROWVERSION under a temporal name (INFORMATION_SCHEMA reports rowversion
+    columns as `timestamp`) and must never enter the inventory, while a
+    genuine duckdb TIMESTAMP with the same column name must."""
     from metricprobe.discover import datetime_inventory, match_roles, scan_columns
 
     ddl = {
         "duckdb": (
             "CREATE OR REPLACE TABLE disc_orders (order_id BIGINT, event_time DATE, "
-            "load_time TIMESTAMP, batch_id VARCHAR, amount DOUBLE)"
+            "load_time TIMESTAMP, batch_id VARCHAR, amount DOUBLE, "
+            "occurred_version TIMESTAMP)"
         ),
         "mssql": (
             "IF OBJECT_ID('dbo.disc_orders') IS NOT NULL DROP TABLE dbo.disc_orders; "
             "CREATE TABLE dbo.disc_orders (order_id bigint, event_time date, "
-            "load_time datetime2, batch_id varchar(20), amount float)"
+            "load_time datetime2, batch_id varchar(20), amount float, "
+            "occurred_version rowversion)"
         ),
     }
     role_maps = []
@@ -366,10 +371,21 @@ def test_discover_matches_between_dialects(duckdb_engine, mssql_engine):
         columns = scan_columns(engine, database, schema=schema)
         table_columns = [c for c in columns if c.table == "disc_orders"]
         inventory = datetime_inventory(table_columns).get((schema, "disc_orders"), [])
-        assert [c.column for c in inventory] == ["event_time", "load_time"]
+        if engine.dialect.name == "duckdb":
+            # a genuine TIMESTAMP: inventoried, and its name even matches the
+            # event_time candidates — a real temporal column behaves normally
+            expected = ["event_time", "load_time", "occurred_version"]
+        else:
+            # rowversion: binary, excluded despite the temporal-looking type
+            expected = ["event_time", "load_time"]
+        assert [c.column for c in inventory] == expected
         role_maps.append(match_roles(table_columns))
     duck_roles, mssql_roles = role_maps
-    assert duck_roles == mssql_roles
-    assert mssql_roles["event_time"] == ["event_time"]
-    assert mssql_roles["load_time"] == ["load_time"]
-    assert mssql_roles["load_batch_col"] == ["batch_id"]
+    # the genuine temporal columns rank identically on both engines...
+    assert duck_roles["event_time"][:1] == mssql_roles["event_time"] == ["event_time"]
+    assert duck_roles["load_time"] == mssql_roles["load_time"] == ["load_time"]
+    assert duck_roles["load_batch_col"] == mssql_roles["load_batch_col"] == ["batch_id"]
+    # ...and the rowversion column is a candidate ONLY where it is a real
+    # timestamp (duckdb), never on mssql where it is binary
+    assert duck_roles["event_time"] == ["event_time", "occurred_version"]
+    assert "occurred_version" not in mssql_roles["event_time"]
