@@ -4,6 +4,7 @@ completion percentiles — including via-joins, group_by_alt, and the scan
 budget enforced through the production runner."""
 
 import dataclasses
+import os
 
 import pandas as pd
 import pytest
@@ -225,7 +226,24 @@ def test_scan_budget_enforced_through_the_production_runner(mssql_engine):
     with plenty of headroom; check_scan_budget's abort path is unit-tested."""
     df = g.generate(dataclasses.replace(SPEC, rows_per_month=30_000, seed=62))
     g.load_via_sqlalchemy(df, mssql_engine, "events")
-    result = run_canonical(mssql_engine, _config("tempdb", "dbo"), AS_OF)
+    # exercise the configured isolation: read_uncommitted maps to the mssql
+    # READ UNCOMMITTED isolation level on the extraction engine
+    from metricprobe.cli import _engine_for
+
+    config = _config("tempdb", "dbo", read_uncommitted=True)
+    engine = _engine_for(os.environ["METRICPROBE_MSSQL_URL"], True)
+    with engine.connect() as conn:
+        level = conn.execute(
+            sa.text(
+                "SELECT transaction_isolation_level FROM sys.dm_exec_sessions "
+                "WHERE session_id = @@SPID"
+            )
+        ).scalar_one()
+        assert level == 1  # 1 = READ UNCOMMITTED: the configured flag is honored
+    try:
+        result = run_canonical(engine, config, AS_OF)
+    finally:
+        engine.dispose()
     assert result.target_logical_reads is not None, "budget measurement did not run"
     assert result.scan_budget_reads is not None
     # the SCRATCH ledger (aggregation + distinct-count guard) is measured and
@@ -334,31 +352,61 @@ def test_parity_matches_between_dialects(duckdb_engine, mssql_engine):
 
 def test_mssql_store_shares_the_run_contract(mssql_engine):
     """Step 6: the config-flagged mssql writer honors the same lifecycle —
-    staged rows are invisible until the manifest INSERT commits the run."""
+    staged rows are invisible until the manifest INSERT commits the run, a
+    concurrent writer can never claim the same run_id, an abort never touches
+    a committed run, and retention pruning works. Rerunnable: unique ids plus
+    prune-based cleanup."""
+    import dataclasses
     import os
+    import uuid
 
     from metricprobe.store import MssqlStore, RunMeta, stamp
 
-    store = MssqlStore(os.environ["METRICPROBE_MSSQL_URL"])
-    meta = RunMeta(
-        run_id="eqv-run-1",
-        run_at="2026-07-01T06:00:00",
-        as_of="2026-07-01T00:00:00",
-        git_sha="deadbeef",
-        tool_version="0.1.0.dev0",
-        config_digest="abc",
-        schema_version=1,
-        window_start="2024-07-01T00:00:00",
-        window_end="2026-07-01T00:00:00",
-    )
+    def make_meta(run_id, run_at="2026-07-01T06:00:00"):
+        return RunMeta(
+            run_id=run_id,
+            run_at=run_at,
+            as_of="2026-07-01T00:00:00",
+            git_sha="deadbeef",
+            tool_version="0.1.0.dev0",
+            config_digest="abc",
+            schema_version=1,
+            window_start="2024-07-01T00:00:00",
+            window_end="2026-07-01T00:00:00",
+        )
+
+    def manifest_for(meta):
+        return {**dataclasses.asdict(meta), "stages": {"analysis": {}}}
+
+    url = os.environ["METRICPROBE_MSSQL_URL"]
+    store = MssqlStore(url)
+    run_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    meta = make_meta(run_id)
     frame = stamp(pd.DataFrame({"probe": ["a", "b"], "volume": [1, 2]}), meta)
     store.begin_run(meta)
-    store.write_table("eqv-run-1", "month_volumes", frame)
-    assert store.list_runs() == []  # staged rows invisible before the commit
-    store.commit_run("eqv-run-1", {"run_id": "eqv-run-1", "run_at": meta.run_at})
-    assert [m["run_id"] for m in store.list_runs()] == ["eqv-run-1"]
-    read_back = store.read_table("eqv-run-1", "month_volumes")
+    # a concurrent writer cannot claim the same run_id even BEFORE the commit
+    rival = MssqlStore(url)
+    with pytest.raises(FileExistsError):
+        rival.begin_run(meta)
+    store.write_table(run_id, "month_volumes", frame)
+    assert not any(m["run_id"] == run_id for m in store.list_runs())  # staged: invisible
+    store.commit_run(run_id, manifest_for(meta))
+    assert any(m["run_id"] == run_id for m in store.list_runs())
+    # the rival's abort of the SAME id must not touch the committed rows
+    rival._staged[run_id] = ["month_volumes"]
+    rival.abort_run(run_id)
+    read_back = store.read_table(run_id, "month_volumes")
     assert read_back["probe"].tolist() == ["a", "b"]
     assert read_back["git_sha"].tolist() == ["deadbeef", "deadbeef"]
     with pytest.raises(FileExistsError):
         store.begin_run(meta)
+    # retention pruning shares the parquet contract — and cleans this test up
+    newer_id = f"eqv-{uuid.uuid4().hex[:12]}"
+    newer = make_meta(newer_id, run_at="2026-07-01T07:00:00")
+    store.begin_run(newer)
+    store.write_table(newer_id, "month_volumes", stamp(pd.DataFrame({"probe": ["c"]}), newer))
+    store.commit_run(newer_id, manifest_for(newer))
+    store.prune(keep=0)
+    assert store.list_runs() == []
+    with pytest.raises(FileNotFoundError):
+        store.read_table(run_id, "month_volumes")

@@ -35,7 +35,6 @@ import re
 import zoneinfo
 from pathlib import Path
 from typing import Annotated, Literal
-from urllib.parse import unquote_plus
 
 import yaml
 from pydantic import (
@@ -350,17 +349,12 @@ class ProbeConfig(_Model):
         if duplicates:
             raise ValueError(f"duplicate probe_name(s): {duplicates}")
         for table in self.tables:
-            if table.parity_with is None:
-                continue
             if table.parity_with == table.probe_name:
                 raise ValueError(
                     f"probe {table.probe_name!r}: parity_with must not reference itself"
                 )
-            if table.parity_with not in names:
-                raise ValueError(
-                    f"probe {table.probe_name!r}: parity_with references unknown probe "
-                    f"{table.parity_with!r}; known probes: {sorted(names)}"
-                )
+        # parity_with targets are CAMPAIGN-WIDE and may live in another config
+        # file: existence is validated by compose_campaign()
         return self
 
 
@@ -404,12 +398,14 @@ def load_config(path: str | Path) -> ProbeConfig:
 
 # any URL userinfo (user, user:password, or bare token) — masked entirely
 _URL_USERINFO = re.compile(r"://[^@/\s]+@")
-# secret-named query/connection-string parameters; strings are percent-decoded
-# first so percent-encoded forms canonicalize to their plain spelling before
-# masking. Over-masking is safe here, under-masking is not.
+# secret-named query/connection-string parameters, matched in BOTH the raw
+# and the percent-encoded spelling (an encoded assignment behind encoded
+# separators) WITHOUT transforming the rest of the string: a global decode
+# would make distinct configs ('a+b' vs 'a b') hash identically.
 _SECRET_PARAM = re.compile(
-    r"(?i)\b(password|passwd|pwd|token|access_token|secret|api_key|apikey|sig|signature)"
-    r"=([^&;\s\"']*)"
+    r"(?i)(?:(?<![A-Za-z0-9])|(?<=%3[Bb]))"
+    r"(password|passwd|pwd|token|access_token|secret|api_key|apikey|sig|signature)"
+    r"(=|%3[Dd])([^&;\s\"'%]*)"
 )
 
 
@@ -419,9 +415,8 @@ def _redact(value):
     if isinstance(value, list):
         return [_redact(item) for item in value]
     if isinstance(value, str):
-        value = unquote_plus(value)  # canonical decoded form for hashing
         value = _URL_USERINFO.sub("://***@", value)
-        return _SECRET_PARAM.sub(lambda m: f"{m.group(1)}=***", value)
+        return _SECRET_PARAM.sub(lambda m: f"{m.group(1)}{m.group(2)}***", value)
     return value
 
 
@@ -431,3 +426,28 @@ def config_digest(config: ProbeConfig) -> str:
     canonical = _redact(config.model_dump(mode="json", by_alias=True))
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def compose_campaign(configs: list[ProbeConfig]) -> None:
+    """Validate repeatable --config files as ONE campaign: probe names are
+    campaign-wide unique, parity_with targets exist campaign-wide, and every
+    file shares one store (the runner has exactly one snapshot store)."""
+    if not configs:
+        raise ConfigError("at least one config is required")
+    names = [table.probe_name for config in configs for table in config.tables]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ConfigError(f"duplicate probe_name(s) across config files: {duplicates}")
+    for config in configs:
+        for table in config.tables:
+            if table.parity_with is not None and table.parity_with not in names:
+                raise ConfigError(
+                    f"probe {table.probe_name!r}: parity_with references unknown "
+                    f"probe {table.parity_with!r}; campaign probes: {sorted(names)}"
+                )
+    stores = {config.store for config in configs}
+    if len(stores) > 1:
+        raise ConfigError(
+            "all config files in one campaign must declare the SAME store; "
+            f"found {len(stores)} distinct store configurations"
+        )

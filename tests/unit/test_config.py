@@ -10,6 +10,7 @@ from metricprobe.config import (
     AnalysisParams,
     ConfigError,
     ProbeConfig,
+    compose_campaign,
     config_digest,
     load_config,
 )
@@ -203,15 +204,42 @@ def test_duplicate_probe_names_rejected():
         )
 
 
-def test_parity_with_must_reference_an_existing_other_probe():
-    with pytest.raises(ValidationError, match="parity_with"):
-        ProbeConfig.model_validate(
-            minimal_config(tables=[minimal_table(parity_with="no_such_probe")])
-        )
+def test_parity_with_must_reference_an_existing_campaign_probe():
+    # existence is CAMPAIGN-WIDE (validated at composition, so the target may
+    # live in another config file); self-reference is rejected per file
+    dangling = ProbeConfig.model_validate(
+        minimal_config(tables=[minimal_table(parity_with="no_such_probe")])
+    )
+    with pytest.raises(ConfigError, match="no_such_probe"):
+        compose_campaign([dangling])
     with pytest.raises(ValidationError, match="itself"):
         ProbeConfig.model_validate(
             minimal_config(tables=[minimal_table(parity_with="orders_main")])
         )
+
+
+def test_campaign_composition_across_files():
+    left = ProbeConfig.model_validate(
+        minimal_config(tables=[minimal_table(parity_with="orders_replica")])
+    )
+    right = ProbeConfig.model_validate(
+        minimal_config(
+            tables=[minimal_table(probe_name="orders_replica", database="demo_copy")]
+        )
+    )
+    compose_campaign([left, right])  # cross-file parity reference is valid
+    # campaign-wide duplicate probe names are rejected
+    with pytest.raises(ConfigError, match="duplicate probe_name"):
+        compose_campaign([left, left])
+    # every file must share ONE store
+    other_store = ProbeConfig.model_validate(
+        minimal_config(
+            tables=[minimal_table(probe_name="orders_replica")],
+            store={"path": "./elsewhere"},
+        )
+    )
+    with pytest.raises(ConfigError, match="SAME store"):
+        compose_campaign([left, other_store])
 
 
 def test_training_cutoff_must_cover_lag_support():
@@ -338,6 +366,14 @@ def test_digest_is_stable_and_secret_redacted():
         minimal_config(tables=[minimal_table(analysis={"lag_cap_days": 200})])
     )
     assert config_digest(base) != config_digest(other_analysis)
+
+
+def test_digest_distinguishes_plus_from_space():
+    # a global percent-decode would make 'a+b' and 'a b' hash identically —
+    # two semantically different configs must never share a resume digest
+    plus = ProbeConfig.model_validate(minimal_config(store={"path": "demo a+b"}))
+    space = ProbeConfig.model_validate(minimal_config(store={"path": "demo a b"}))
+    assert config_digest(plus) != config_digest(space)
 
 
 def test_analysis_defaults_are_frozen_v1():

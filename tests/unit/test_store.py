@@ -5,7 +5,13 @@ import pandas as pd
 import pytest
 
 from metricprobe.cli import check_monotonic_publication
-from metricprobe.store import STAMP_COLUMNS, ParquetStore, RunMeta, stamp
+from metricprobe.store import (
+    STAMP_COLUMNS,
+    ParquetStore,
+    RunMeta,
+    stamp,
+    validate_run_id,
+)
 
 
 def meta(run_id: str, run_at: str = "2026-07-01T06:00:00") -> RunMeta:
@@ -22,14 +28,24 @@ def meta(run_id: str, run_at: str = "2026-07-01T06:00:00") -> RunMeta:
     )
 
 
+def manifest_for(run_meta: RunMeta) -> dict:
+    import dataclasses
+
+    return {**dataclasses.asdict(run_meta), "stages": {"analysis": {}}}
+
+
+def frame(run_meta: RunMeta, **columns) -> "pd.DataFrame":
+    return stamp(pd.DataFrame(columns or {"probe": ["a"]}), run_meta)
+
+
 def test_readers_see_only_committed_runs(tmp_path):
     store = ParquetStore(tmp_path)
     store.begin_run(meta("r1"))
-    store.write_table("r1", "statuses", pd.DataFrame({"probe": ["a"]}))
+    store.write_table("r1", "statuses", frame(meta("r1")))
     assert store.list_runs() == []  # staged but NOT committed: invisible
     with pytest.raises(FileNotFoundError):
         store.read_table("r1", "statuses")
-    store.commit_run("r1", {"run_id": "r1", "run_at": "2026-07-01T06:00:00"})
+    store.commit_run("r1", manifest_for(meta("r1")))
     assert [m["run_id"] for m in store.list_runs()] == ["r1"]
     assert store.read_table("r1", "statuses")["probe"].tolist() == ["a"]
 
@@ -37,7 +53,7 @@ def test_readers_see_only_committed_runs(tmp_path):
 def test_abort_leaves_nothing_partial(tmp_path):
     store = ParquetStore(tmp_path)
     store.begin_run(meta("r1"))
-    store.write_table("r1", "statuses", pd.DataFrame({"probe": ["a"]}))
+    store.write_table("r1", "statuses", frame(meta("r1")))
     store.abort_run("r1")
     assert store.list_runs() == []
     assert list((tmp_path / "staging").iterdir()) == []
@@ -65,8 +81,8 @@ def test_retention_prunes_oldest_committed_runs(tmp_path):
     for i, hour in enumerate(("01", "02", "03")):
         run_meta = meta(f"r{i}", run_at=f"2026-07-01T{hour}:00:00")
         store.begin_run(run_meta)
-        store.write_table(f"r{i}", "statuses", pd.DataFrame({"probe": ["a"]}))
-        store.commit_run(f"r{i}", {"run_id": f"r{i}", "run_at": run_meta.run_at})
+        store.write_table(f"r{i}", "statuses", frame(run_meta))
+        store.commit_run(f"r{i}", manifest_for(run_meta))
     dropped = store.prune(keep=2)
     assert dropped == ["r0"]
     assert [m["run_id"] for m in store.list_runs()] == ["r1", "r2"]
@@ -79,3 +95,29 @@ def test_monotonic_publication_guard():
         check_monotonic_publication(
             "2026-07-01T00:00:00", ["2026-06-30T00:00:00", "2026-07-02T00:00:00"]
         )
+    # timestamps are compared as INSTANTS, never lexicographically: the
+    # candidate string sorts later but is 19h OLDER in UTC than the published
+    with pytest.raises(RuntimeError, match="newer run"):
+        check_monotonic_publication(
+            "2026-07-02T00:00:00+10:00",  # = 2026-07-01T14:00Z
+            ["2026-07-01T20:00:00+00:00"],
+        )
+
+
+def test_run_ids_cannot_traverse_the_store(tmp_path):
+    store = ParquetStore(tmp_path)
+    for evil in ("../evil", "/abs/path", "a/b", "..", ".hidden", "x" * 65):
+        with pytest.raises(ValueError, match="invalid run_id"):
+            store.begin_run(meta(evil))
+    validate_run_id("20260701T060000-abc123")  # the normal shape passes
+
+
+def test_store_enforces_the_frozen_snapshot_schema(tmp_path):
+    store = ParquetStore(tmp_path)
+    store.begin_run(meta("r1"))
+    with pytest.raises(ValueError, match="stamp column"):
+        store.write_table("r1", "statuses", pd.DataFrame({"probe": ["a"]}))
+    store.write_table("r1", "statuses", frame(meta("r1")))
+    with pytest.raises(ValueError, match="manifest is missing"):
+        store.commit_run("r1", {"run_id": "r1", "run_at": "2026-07-01T06:00:00"})
+    store.commit_run("r1", manifest_for(meta("r1")))

@@ -34,6 +34,11 @@ def demo_db(tmp_path_factory):
     con = duckdb.connect(str(path))
     healthy_df = g.generate(HEALTHY)
     g.load_into_duckdb(healthy_df, con, "events")
+    import dataclasses
+
+    g.load_into_duckdb(
+        g.generate(dataclasses.replace(HEALTHY, dual_offset_days=2.0)), con, "events_dual"
+    )
     # the dropped month must be MATURE at AS_OF: index 10 = 2023-11
     g.load_into_duckdb(g.generate(g.volume_drop(HEALTHY, 10, factor=0.1)), con, "events_bad")
     g.load_into_duckdb(healthy_df, con, "events_copy")
@@ -90,7 +95,19 @@ def test_exit_0_healthy_run_commits_analysis(tmp_path, demo_db):
     assert set(store.table_names(manifest["run_id"])) >= {
         "statuses", "probe_runs", "month_volumes", "completion_summary",
         "completion_percentiles", "month_lag_cells", "epoch_cells", "freshness",
+        "population_buckets", "volume_summary",
     }
+    # the reconciliation buckets are reproducible from the snapshot alone
+    buckets = store.read_table(manifest["run_id"], "population_buckets").iloc[0]
+    assert int(buckets["row_count"]) > 0
+    assert int(buckets["row_count"]) == (
+        int(buckets["n_curve_eligible"])
+        + int(buckets["n_null_event_time"])
+        + int(buckets["n_null_load_time_only"])
+        + int(buckets["n_negative_lag_excluded"])
+        + int(buckets["n_join_unmatched"])
+        + int(buckets["n_other_exclusions"])
+    )
 
 
 def test_exit_2_red_run_still_commits_first(tmp_path, demo_db):
@@ -194,6 +211,11 @@ def test_resume_is_idempotent_and_digest_guarded(tmp_path, demo_db):
     )
     # resume without a run id is refused
     assert run_cli("--config", config, "--resume-from", "analysis") == 1
+    # an unknown/aborted run id has no committed digest to verify: refused too
+    assert (
+        run_cli("--config", config, "--as-of", AS_OF,
+                "--resume-from", "analysis", "--run-id", "never-ran") == 1
+    )
 
 
 def test_retention_prunes_after_commit(tmp_path, demo_db):
@@ -234,3 +256,117 @@ def test_exit_codes_through_a_real_process(tmp_path, demo_db):
     broken = invoke("--config", str(tmp_path / "missing.yaml"))
     assert broken.returncode == 1
     assert "metricprobe:" in broken.stderr
+
+
+def test_malformed_invocations_never_return_the_data_health_code():
+    # argparse would exit 2 on usage errors, but 2 means "committed with RED"
+    assert main(["run"]) == 1  # missing --config
+    assert main(["run", "--bogus-flag"]) == 1
+    assert main(["bogus-command"]) == 1
+    assert main(["--version"]) == 0
+
+
+def test_year_window_bounds_reported_completion_results(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF, "--year", "2023") == 0
+    store = ParquetStore(tmp_path / "store")
+    (manifest,) = store.list_runs()
+    months = store.read_table(manifest["run_id"], "completion_percentiles")["month"]
+    assert months.str.startswith("2023").all()  # the probe window bounds results
+    # volume history stays FULL HISTORY by contract, stamped with the window
+    volumes = store.read_table(manifest["run_id"], "month_volumes")
+    assert volumes["month"].str.startswith("2025").any()
+    assert manifest["window_start"].startswith("2023-01-01")
+
+
+def test_frozen_clock_makes_run_metadata_deterministic(tmp_path, demo_db, monkeypatch):
+    monkeypatch.setenv("METRICPROBE_RUN_AT", "2025-07-02T06:00:00")
+    monkeypatch.setenv("METRICPROBE_GIT_SHA", "cafe1234")
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "frozen-run") == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    assert manifest["run_at"] == "2025-07-02T06:00:00"
+    assert manifest["git_sha"] == "cafe1234"
+    (probe,) = manifest["probes"]
+    assert probe["duration_seconds"] == 0.0  # every timestamp is the frozen clock
+    assert probe["extraction_started"] == probe["extraction_finished"]
+    assert manifest["stages"]["analysis"]["completed_at"] == "2025-07-02T06:00:00"
+
+
+def test_probe_abort_commits_no_partial_frames(tmp_path, demo_db, monkeypatch):
+    import metricprobe.cli as cli
+    from metricprobe.extract.canonical import ProbeAborted
+    from metricprobe.status import ReasonCode
+
+    def abort_dual(*args, **kwargs):
+        raise ProbeAborted(ReasonCode.SCAN_BUDGET_EXCEEDED, "injected dual abort")
+
+    monkeypatch.setattr(cli, "run_dual_lag", abort_dual)
+    config = write_config(
+        tmp_path,
+        demo_db,
+        [
+            table_entry("events", "orders_main"),
+            table_entry("events_dual", "dual_probe", source_insert_time="source_insert_time"),
+        ],
+    )
+    assert run_cli("--config", config, "--as-of", AS_OF) == 2  # typed RED, committed
+    store = ParquetStore(tmp_path / "store")
+    (manifest,) = store.list_runs()
+    aborted = [s for s in manifest["statuses"] if s["probe"] == "dual_probe"]
+    assert aborted == [
+        {"probe": "dual_probe", "check": "probe", "severity": "red",
+         "reason": "scan_budget_exceeded"}
+    ]
+    # NO partial metric output from the aborted probe reached the snapshot
+    for table in ("completion_summary", "month_volumes", "month_lag_cells"):
+        frame = store.read_table(manifest["run_id"], table)
+        assert "dual_probe" not in set(frame["probe"])
+
+
+def test_failure_at_the_commit_boundary_leaves_nothing_partial(tmp_path, demo_db, monkeypatch):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+
+    def boom(*args, **kwargs):
+        raise OSError("injected commit failure")
+
+    monkeypatch.setattr(ParquetStore, "commit_run", boom)
+    assert run_cli("--config", config, "--as-of", AS_OF) == 1
+    store_root = tmp_path / "store"
+    monkeypatch.undo()
+    assert ParquetStore(store_root).list_runs() == []
+    assert list((store_root / "staging").iterdir()) == []
+
+    monkeypatch.setattr(ParquetStore, "write_table", boom)
+    assert run_cli("--config", config, "--as-of", AS_OF) == 1
+    monkeypatch.undo()
+    assert ParquetStore(store_root).list_runs() == []
+    assert list((store_root / "staging").iterdir()) == []
+
+
+def test_multi_config_campaign_composes_and_validates(tmp_path, demo_db):
+    left_dir = tmp_path / "left"
+    right_dir = tmp_path / "right"
+    left_dir.mkdir(), right_dir.mkdir()
+    shared_store = {"path": str(tmp_path / "store")}
+    left = write_config(
+        left_dir, demo_db,
+        [table_entry("events", "orders_main", parity_with="orders_copy",
+                     key_cols=["row_id"])],
+        store=shared_store,
+    )
+    right = write_config(
+        right_dir, demo_db,
+        [table_entry("events_copy", "orders_copy", key_cols=["row_id"])],
+        store=shared_store,
+    )
+    # cross-file parity composes and runs green
+    assert run_cli("--config", left, "--config", right, "--as-of", AS_OF) == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    parity = [s for s in manifest["statuses"] if s["check"] == "parity"]
+    assert parity and parity[0]["severity"] == "green"
+    # campaign-wide duplicate names are refused before anything runs
+    dup = write_config(right_dir, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", left, "--config", dup, "--as-of", AS_OF) == 1
+    # invalid run ids are refused loudly
+    assert run_cli("--config", left, "--as-of", AS_OF, "--run-id", "../evil") == 1
