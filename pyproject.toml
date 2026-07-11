@@ -29,6 +29,8 @@ export = ["kaleido>=1.0"]
 dev = [
     "pytest>=8.2",
     "ruff>=0.5",
+    # the render suites export real PNGs/SVGs; CI runners ship Chrome
+    "kaleido>=1.0",
     # Pure-pip SQL Server driver for the CI equivalence job (no system ODBC setup);
     # production connections use pyodbc via the `mssql` extra.
     "pymssql>=2.3",

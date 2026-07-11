@@ -4,7 +4,7 @@ readers only ever see manifest-committed runs; every row is stamped."""
 import pandas as pd
 import pytest
 
-from metricprobe.cli import check_monotonic_publication
+from metricprobe.publish import check_monotonic_publication
 from metricprobe.store import (
     STAMP_COLUMNS,
     ParquetStore,

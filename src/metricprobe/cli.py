@@ -1,10 +1,12 @@
 """Command-line interface and the ONE orchestration state machine.
 
 The campaign command (`metricprobe run`) owns the whole lifecycle in one
-process: analyse -> ANALYSIS_COMMITTED (atomic manifest) [-> ARTIFACTS_RENDERED
--> PUBLISHED once the emitters exist, Step 9]. Exit codes are relative to the
-CONFIGURED stages — at this step the only configured terminal state is
-ANALYSIS_COMMITTED (no renderer exists yet; claiming more would be a lie):
+process and is the SOLE delivery owner: analyse -> ANALYSIS_COMMITTED (atomic
+manifest) -> ARTIFACTS_RENDERED (dashboard emitted into the delivery
+worktree) -> PUBLISHED (pushed to every configured remote; claimed only after
+the actual delivery succeeded). Render + publish are CONFIGURED exactly when
+`delivery:` is; without it the only configured stage is analysis. Exit codes
+are relative to the CONFIGURED stages:
 
     0 = all configured stages completed, no data-health RED
     2 = all configured stages completed, at least one RED (committed FIRST)
@@ -84,7 +86,15 @@ from metricprobe.store import (
     validate_run_id,
 )
 
-STAGES = ("analysis",)  # render + delivery join in Step 9 with the emitters
+# the full lifecycle; a campaign without delivery: configures only "analysis"
+STAGES = ("analysis", "render", "publish")
+
+
+def _configured_stages(config: ProbeConfig) -> tuple[str, ...]:
+    """Exit codes are relative to the CONFIGURED stages: render + publish are
+    configured exactly when delivery is (the campaign command is the sole
+    delivery owner; PUBLISHED is claimed only after the actual push)."""
+    return STAGES if config.delivery is not None else ("analysis",)
 
 BUCKET_COLUMNS = (
     "row_count",
@@ -647,22 +657,93 @@ def _stage_analysis(
     return all_statuses
 
 
-def _as_utc(value: str) -> pd.Timestamp:
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
-def check_monotonic_publication(candidate_run_at: str, published_run_ats: list[str]) -> None:
-    """Delivery guard (wired to real delivery in Step 9): an older run may never
-    overwrite a dashboard published from a newer run. Timestamps are compared
-    as INSTANTS (offset-aware), never as strings."""
-    candidate = _as_utc(candidate_run_at)
-    newer = [stamp for stamp in published_run_ats if _as_utc(stamp) > candidate]
-    if newer:
-        raise RuntimeError(
-            f"refusing to publish run from {candidate_run_at}: a newer run "
-            f"({max(newer, key=_as_utc)}) is already published"
+def _statuses_from_manifest(manifest: dict) -> list[Status]:
+    return [
+        Status(
+            check=Check(row["check"]),
+            severity=Severity(row["severity"]),
+            reason=ReasonCode(row["reason"]) if row["reason"] else None,
         )
+        for row in manifest["statuses"]
+    ]
+
+
+def _artifacts_dir(config: ProbeConfig):
+    from pathlib import Path
+
+    return Path(config.delivery.worktree) / "artifacts"
+
+
+def _stage_render(config: ProbeConfig, store, run_id: str):
+    """ARTIFACTS_RENDERED: emit the dashboard into the delivery worktree,
+    atomically (build in a tmp dir, one rename), then record the stage."""
+    import shutil
+
+    from metricprobe.publish import emit_dashboard
+
+    final = _artifacts_dir(config)
+    tmp = final.with_name("artifacts.tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    emit_dashboard(store, run_id, config, tmp)
+    if final.exists():
+        shutil.rmtree(final)
+    tmp.rename(final)
+    store.record_stage(
+        run_id, "render", {"completed_at": _wall().isoformat(), "artifacts": str(final)}
+    )
+    return final
+
+
+def _stage_publish(config: ProbeConfig, store, run_id: str, run_at: str) -> list[str]:
+    """PUBLISHED: push the rendered dashboard to every configured remote
+    (monotonic-publication guard enforced per remote inside deliver);
+    the stage is recorded only after EVERY push succeeded."""
+    from metricprobe.publish import deliver
+
+    pushed = deliver(_artifacts_dir(config), config.delivery, run_id, run_at)
+    store.record_stage(
+        run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": pushed}
+    )
+    return pushed
+
+
+def _run_finishing_stages(
+    config: ProbeConfig, store, run_id: str, run_at: str, start_stage: str
+) -> int | None:
+    """Render + publish for a committed run. Returns None on success, 1 on a
+    stage failure (everything before it stays committed and recorded)."""
+    if start_stage in ("analysis", "render"):
+        try:
+            _stage_render(config, store, run_id)
+            print(f"run {run_id}: artifacts rendered")
+        except Exception as error:
+            print(f"metricprobe: render stage failed: {error}", file=sys.stderr)
+            return 1
+    else:
+        # resuming publish alone: the rendered artifacts must exist AND belong
+        # to this run — anything else needs --resume-from render
+        import json as _json
+
+        from metricprobe.publish import PUBLISHED_MARKER
+
+        marker = _artifacts_dir(config) / PUBLISHED_MARKER
+        if not marker.exists() or _json.loads(marker.read_text())["run_id"] != run_id:
+            print(
+                f"metricprobe: no rendered artifacts for run {run_id!r}; "
+                "resume from the render stage instead",
+                file=sys.stderr,
+            )
+            return 1
+    try:
+        pushed = _stage_publish(config, store, run_id, run_at)
+        print(f"run {run_id}: published to {', '.join(pushed)}")
+    except Exception as error:
+        print(f"metricprobe: publish stage failed: {error}", file=sys.stderr)
+        return 1
+    return None
 
 
 def cmd_run(args) -> int:
@@ -671,7 +752,12 @@ def cmd_run(args) -> int:
         compose_campaign(configs)
         if args.run_id:
             validate_run_id(args.run_id)
-    except (ConfigError, ValueError) as error:
+        if configs[0].delivery is not None:
+            # fail BEFORE a long analysis, with the actionable install hint
+            from metricprobe.report import ensure_static_export_available
+
+            ensure_static_export_available()
+    except (ConfigError, ValueError, RuntimeError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
         return 1
     run_at = _wall()
@@ -702,16 +788,17 @@ def cmd_run(args) -> int:
         window_start=window_start.isoformat(),
         window_end=window_end.isoformat(),
     )
+    configured = _configured_stages(configs[0])
     try:
         store = open_store(configs[0].store)
         if args.resume_from:
             if not args.run_id:
                 print("metricprobe: --resume-from requires --run-id", file=sys.stderr)
                 return 1
-            if args.resume_from not in STAGES:
+            if args.resume_from not in configured:
                 print(
                     f"metricprobe: unknown stage {args.resume_from!r}; configured "
-                    f"stages: {', '.join(STAGES)}",
+                    f"stages: {', '.join(configured)}",
                     file=sys.stderr,
                 )
                 return 1
@@ -725,17 +812,27 @@ def cmd_run(args) -> int:
                         file=sys.stderr,
                     )
                     return 1
-                # analysis already committed: idempotent retry has nothing to do
-                statuses = [
-                    Status(
-                        check=Check(row["check"]),
-                        severity=Severity(row["severity"]),
-                        reason=ReasonCode(row["reason"]) if row["reason"] else None,
+                # analysis is committed: the idempotent retry redoes only the
+                # configured stages AFTER it
+                statuses = _statuses_from_manifest(manifest)
+                if len(configured) == 1:
+                    print(
+                        f"run {args.run_id!r}: analysis already committed; "
+                        "nothing to redo"
                     )
-                    for row in manifest["statuses"]
-                ]
-                print(f"run {args.run_id!r}: analysis already committed; nothing to redo")
-                return exit_code_for(statuses)
+                    return exit_code_for(statuses)
+                failure = _run_finishing_stages(
+                    configs[0], store, args.run_id, manifest["run_at"], args.resume_from
+                )
+                return failure if failure is not None else exit_code_for(statuses)
+            if args.resume_from != "analysis":
+                print(
+                    f"metricprobe: run {args.run_id!r} has no committed analysis; "
+                    f"the {args.resume_from} stage needs one — resume from "
+                    "analysis instead",
+                    file=sys.stderr,
+                )
+                return 1
             registration = store.registration(args.run_id)
             if registration is None:
                 # neither committed nor registered: no durable record exists to
@@ -836,6 +933,12 @@ def cmd_run(args) -> int:
             print(f"metricprobe: warning: retention pruning failed: {error}", file=sys.stderr)
     reds = [s for s in statuses if s.severity is Severity.RED]
     print(f"run {run_id}: analysis committed — {len(statuses)} statuses, {len(reds)} red")
+    if len(configured) > 1:
+        failure = _run_finishing_stages(
+            configs[0], store, run_id, meta.run_at, "analysis"
+        )
+        if failure is not None:
+            return failure
     return exit_code_for(statuses)
 
 
@@ -876,6 +979,67 @@ def cmd_discover(args) -> int:
             print(draft, end="")
     except Exception as error:
         print(f"metricprobe: discover failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _latest_run_id(store, run_id: str | None) -> str:
+    if run_id:
+        return run_id
+    runs = store.list_runs()
+    if not runs:
+        raise ConfigError("the store holds no committed runs")
+    return runs[-1]["run_id"]
+
+
+def cmd_report(args) -> int:
+    """Standalone re-render of a committed run's interactive report."""
+    from metricprobe.report import ensure_static_export_available, generate_report
+
+    try:
+        configs = [load_config(path) for path in args.config]
+        compose_campaign(configs)
+        ensure_static_export_available()
+        store = open_store(configs[0].store)
+        run_id = _latest_run_id(store, args.run_id)
+        path = generate_report(store, run_id, configs[0], args.out)
+    except (ConfigError, ValueError, RuntimeError, FileNotFoundError) as error:
+        print(f"metricprobe: {error}", file=sys.stderr)
+        return 1
+    print(f"run {run_id}: report written to {path}")
+    return 0
+
+
+def cmd_publish(args) -> int:
+    """Standalone re-render (and optional re-delivery) of a committed run's
+    dashboard — the campaign command calls the same code."""
+    from metricprobe.publish import deliver, emit_dashboard
+    from metricprobe.report import ensure_static_export_available
+
+    try:
+        configs = [load_config(path) for path in args.config]
+        compose_campaign(configs)
+        ensure_static_export_available()
+        store = open_store(configs[0].store)
+        run_id = _latest_run_id(store, args.run_id)
+        readme = emit_dashboard(store, run_id, configs[0], args.out)
+        print(f"run {run_id}: dashboard written to {readme.parent}")
+        if args.deliver:
+            if configs[0].delivery is None:
+                print("metricprobe: --deliver requires a delivery config", file=sys.stderr)
+                return 1
+            manifest = next(m for m in store.list_runs() if m["run_id"] == run_id)
+            pushed = deliver(
+                readme.parent, configs[0].delivery, run_id, manifest["run_at"]
+            )
+            store.record_stage(
+                run_id,
+                "publish",
+                {"completed_at": _wall().isoformat(), "remotes": pushed},
+            )
+            print(f"run {run_id}: published to {', '.join(pushed)}")
+    except (ConfigError, ValueError, RuntimeError, FileNotFoundError) as error:
+        print(f"metricprobe: {error}", file=sys.stderr)
         return 1
     return 0
 
@@ -950,6 +1114,26 @@ def main(argv=None) -> int:
     )
     discover.set_defaults(handler=cmd_discover)
 
+    report = commands.add_parser(
+        "report", help="render a committed run's self-contained HTML report"
+    )
+    report.add_argument("--config", action="append", required=True, help="YAML config")
+    report.add_argument("--run-id", help="default: the latest committed run")
+    report.add_argument("--out", required=True, help="output directory")
+    report.set_defaults(handler=cmd_report)
+
+    publish = commands.add_parser(
+        "publish", help="emit (and optionally deliver) the markdown dashboard"
+    )
+    publish.add_argument("--config", action="append", required=True, help="YAML config")
+    publish.add_argument("--run-id", help="default: the latest committed run")
+    publish.add_argument("--out", required=True, help="output directory")
+    publish.add_argument(
+        "--deliver", action="store_true",
+        help="push to the configured delivery remotes (monotonic guard enforced)",
+    )
+    publish.set_defaults(handler=cmd_publish)
+
     abort = commands.add_parser(
         "abort",
         help="release a crashed run's staging claim and delete its partial "
@@ -959,11 +1143,7 @@ def main(argv=None) -> int:
     abort.add_argument("--run-id", required=True)
     abort.set_defaults(handler=cmd_abort)
 
-    for command, step in (
-        ("report", "Step 9"),
-        ("publish", "Step 9"),
-        ("serve", "Step 10"),
-    ):
+    for command, step in (("serve", "Step 10"),):
         stub = commands.add_parser(command)
         stub.set_defaults(handler=_unimplemented(command, step))
 

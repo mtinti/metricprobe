@@ -186,6 +186,18 @@ class ParquetStore:
         staging.rename(self._committed(run_id))
         self._registration(run_id).unlink(missing_ok=True)
 
+    def record_stage(self, run_id: str, stage: str, info: dict) -> None:
+        """Record a post-commit lifecycle stage (render/publish) on the
+        committed manifest, atomically (tmp + replace)."""
+        path = self._committed(run_id) / "manifest.json"
+        if not path.exists():
+            raise FileNotFoundError(f"run {run_id!r} is not committed")
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest.setdefault("stages", {})[stage] = info
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+
     def abort_run(self, run_id: str) -> None:
         staging = self._staging(run_id)
         if staging.exists():
@@ -435,6 +447,29 @@ class MssqlStore:
                 {"run_id": run_id},
             )
         del self._staged[run_id]
+
+    def record_stage(self, run_id: str, stage: str, info: dict) -> None:
+        """Same post-commit stage record as the parquet store: one UPDATE of
+        the committed manifest row."""
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    f"SELECT manifest FROM {self.schema}.{self.MANIFEST_TABLE} "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            ).scalar()
+            if row is None:
+                raise FileNotFoundError(f"run {run_id!r} is not committed")
+            manifest = json.loads(row)
+            manifest.setdefault("stages", {})[stage] = info
+            conn.execute(
+                sa.text(
+                    f"UPDATE {self.schema}.{self.MANIFEST_TABLE} "
+                    "SET manifest = :manifest WHERE run_id = :run_id"
+                ),
+                {"manifest": json.dumps(manifest, sort_keys=True), "run_id": run_id},
+            )
 
     def abort_run(self, run_id: str) -> None:
         """Deletes data rows ONLY when no manifest exists for the id (a

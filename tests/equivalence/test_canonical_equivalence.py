@@ -464,6 +464,14 @@ def test_mssql_store_shares_the_run_contract(mssql_engine):
     assert not any(m["run_id"] == run_id for m in store.list_runs())  # staged: invisible
     store.commit_run(run_id, manifest_for(meta))
     assert any(m["run_id"] == run_id for m in store.list_runs())
+    # post-commit lifecycle stages update the committed manifest in place
+    store.record_stage(run_id, "render", {"completed_at": "2026-07-01T06:05:00"})
+    store.record_stage(run_id, "publish", {"remotes": ["origin"]})
+    recorded = next(m for m in store.list_runs() if m["run_id"] == run_id)
+    assert recorded["stages"]["render"]["completed_at"] == "2026-07-01T06:05:00"
+    assert recorded["stages"]["publish"]["remotes"] == ["origin"]
+    with pytest.raises(FileNotFoundError):
+        store.record_stage("never-committed", "render", {})
     # the rival's abort of the SAME id must not touch the committed rows
     rival._staged[run_id] = {"claim": "someone-else", "names": ["month_volumes"]}
     rival.abort_run(run_id)

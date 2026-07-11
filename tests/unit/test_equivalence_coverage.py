@@ -129,6 +129,8 @@ COVERAGE: dict[str, str] = {
         "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
     "dialect_branch:store.MssqlStore.commit_run":
         "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.record_stage":
+        "test_mssql_store_shares_the_run_contract",
     "dialect_branch:store.MssqlStore.abort_run":
         "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
     "dialect_branch:store.MssqlStore.list_runs":
