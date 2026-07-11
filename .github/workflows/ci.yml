@@ -17,7 +17,11 @@ jobs:
       - run: python3 -m venv .venv
       - run: .venv/bin/python -m pip install --upgrade pip
       - run: .venv/bin/python -m pip install -e ".[dev]"
+      # The repo secret METRICPROBE_LEAK_MARKERS may hold a comma-separated list of
+      # private names to reject; it lives in forge settings, never in the repo.
       - run: .venv/bin/python scripts/scan_private_material.py
+        env:
+          METRICPROBE_LEAK_MARKERS: ${{ secrets.METRICPROBE_LEAK_MARKERS }}
       - run: .venv/bin/python -m ruff check .
       - run: .venv/bin/python -m pytest -m "not equivalence"
 

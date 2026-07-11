@@ -48,10 +48,42 @@ def test_unc_path_is_flagged():
     assert scan.content_violations("doc.md", f"data lives on {unc}", [])
 
 
-def test_env_markers_extend_the_scan():
-    text = "server: realhost42"
-    assert scan.content_violations("cfg.yaml", text, []) == []
-    assert scan.content_violations("cfg.yaml", text, ["realhost42"])
+def test_environment_shaped_fields_need_no_marker_list():
+    # A plain server/database/schema field with a real-looking value must fail
+    # even though CI has no private marker list to compare against.
+    for key in ["server", "database", "schema", "hostname", "password", "Data Source"]:
+        field = key + ": realhost42"
+        assert scan.content_violations("cfg.yaml", field, []), field
+        assert scan.content_violations("cfg.yaml", field.replace(": ", "="), []), field
+
+
+def test_environment_shaped_fields_with_placeholders_pass():
+    for value in ["localhost", "localhost:1433", "${PROD_SERVER}", "$PROD_SERVER",
+                  "<your-server>", "%SERVER%", "demo_retail", "tempdb", "dbo",
+                  "Metricprobe1!", "example.com"]:
+        field = "ser" + f"ver: {value}"
+        assert scan.content_violations("cfg.yaml", field, []) == [], field
+
+
+def test_environment_shaped_field_with_empty_value_is_flagged():
+    assert scan.content_violations("cfg.yaml", "ser" + "ver:", [])
+
+
+def test_prefixed_keys_are_detected():
+    field = "DB_HO" + "ST=prod01"
+    assert scan.content_violations(".env.example", field, [])
+
+
+def test_literal_ip_addresses_are_flagged():
+    ip = ".".join(["10", "11", "12", "13"])
+    assert scan.content_violations("doc.md", f"connect to {ip}", [])
+    assert scan.content_violations("doc.md", "bind to 127.0.0.1 or 0.0.0.0", []) == []
+
+
+def test_env_markers_extend_the_scan_case_insensitively():
+    text = "see the wiki page about realhost42 for details"
+    assert scan.content_violations("doc.md", text, []) == []
+    assert scan.content_violations("doc.md", text, ["RealHost42"])
 
 
 def test_markers_parsed_from_env():
