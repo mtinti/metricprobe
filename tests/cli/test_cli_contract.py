@@ -1,0 +1,236 @@
+"""CLI contract (Step 6): exit codes are relative to the CONFIGURED stages —
+here the only configured terminal state is ANALYSIS_COMMITTED. 0/2 = analysis
+committed without/with RED (outputs committed FIRST); 1 = stage failure with
+nothing partial. Verified both in-process and through `python -m metricprobe`
+(the exact invocation an Actions-style runner uses)."""
+
+import subprocess
+import sys
+
+import duckdb
+import pytest
+import yaml
+from tests.synth import generator as g
+
+from metricprobe.cli import main
+from metricprobe.store import STAMP_COLUMNS, ParquetStore
+
+# just after the last synthetic load: freshness stays GREEN while the
+# first 18 months are mature under the 365d horizon
+AS_OF = "2025-07-02"
+
+HEALTHY = g.TableSpec(
+    name="events", start_month="2023-01", n_months=30, rows_per_month=1000,
+    lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=101,
+)
+
+
+@pytest.fixture(scope="module")
+def demo_db(tmp_path_factory):
+    """One duckdb database file (catalog name = file stem 'demo') holding a
+    healthy table, an unhealthy (dropped-month outlier) table, and a pair."""
+    root = tmp_path_factory.mktemp("db")
+    path = root / "demo.duckdb"
+    con = duckdb.connect(str(path))
+    healthy_df = g.generate(HEALTHY)
+    g.load_into_duckdb(healthy_df, con, "events")
+    # the dropped month must be MATURE at AS_OF: index 10 = 2023-11
+    g.load_into_duckdb(g.generate(g.volume_drop(HEALTHY, 10, factor=0.1)), con, "events_bad")
+    g.load_into_duckdb(healthy_df, con, "events_copy")
+    con.close()
+    return path
+
+
+def table_entry(table: str, probe: str, **overrides) -> dict:
+    return {
+        "probe_name": probe,
+        "database": "demo",
+        "schema": "main",
+        "table": table,
+        "event_time": "event_time",
+        "load_time": "load_time",
+    } | overrides
+
+
+def write_config(tmp_path, demo_db, tables: list[dict], **top) -> str:
+    config = {
+        "schema_version": 1,
+        "connection_url": f"duckdb:///{demo_db}",
+        "store": {"path": str(tmp_path / "store")},
+        "tables": tables,
+    } | top
+    path = tmp_path / "probe.yaml"
+    path.write_text(yaml.safe_dump(config))
+    return str(path)
+
+
+def run_cli(*argv) -> int:
+    return main(["run", *argv])
+
+
+def test_exit_0_healthy_run_commits_analysis(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF) == 0
+    store = ParquetStore(tmp_path / "store")
+    runs = store.list_runs()
+    assert len(runs) == 1
+    manifest = runs[0]
+    # the manifest carries the full provenance + per-probe wall clocks
+    assert manifest["as_of"].startswith(AS_OF)
+    assert manifest["config_digest"] and manifest["git_sha"]
+    (probe,) = manifest["probes"]
+    assert probe["probe"] == "orders_main"
+    assert probe["duration_seconds"] >= 0
+    assert probe["extraction_started"] <= probe["extraction_finished"]
+    assert manifest["stages"]["analysis"]["completed_at"]
+    # every stored row is stamped
+    statuses = store.read_table(manifest["run_id"], "statuses")
+    for column in STAMP_COLUMNS:
+        assert column in statuses.columns
+    assert set(store.table_names(manifest["run_id"])) >= {
+        "statuses", "probe_runs", "month_volumes", "completion_summary",
+        "completion_percentiles", "month_lag_cells", "epoch_cells", "freshness",
+    }
+
+
+def test_exit_2_red_run_still_commits_first(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events_bad", "orders_bad")])
+    assert run_cli("--config", config, "--as-of", AS_OF) == 2
+    runs = ParquetStore(tmp_path / "store").list_runs()
+    assert len(runs) == 1  # committed BEFORE exiting red
+    assert any(s["severity"] == "red" for s in runs[0]["statuses"])
+
+
+def test_missing_optional_table_is_skipped_exit_0(tmp_path, demo_db):
+    config = write_config(
+        tmp_path,
+        demo_db,
+        [
+            table_entry("events", "orders_main"),
+            table_entry("absent", "ghost_probe", optional=True),
+        ],
+    )
+    assert run_cli("--config", config, "--as-of", AS_OF) == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    ghost = [s for s in manifest["statuses"] if s["probe"] == "ghost_probe"]
+    assert ghost == [
+        {"probe": "ghost_probe", "check": "probe", "severity": "skipped",
+         "reason": "optional_table_absent"}
+    ]
+
+
+def test_missing_required_table_is_red_exit_2(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("absent", "ghost_probe")])
+    assert run_cli("--config", config, "--as-of", AS_OF) == 2
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    assert manifest["statuses"][0]["reason"] == "missing_table"
+
+
+def test_parity_indeterminate_reduces_to_exit_0(tmp_path, demo_db):
+    config = write_config(
+        tmp_path,
+        demo_db,
+        [
+            table_entry(
+                "events", "orders_main",
+                parity_with="orders_copy", read_uncommitted=True, key_cols=["row_id"],
+            ),
+            table_entry("events_copy", "orders_copy", key_cols=["row_id"]),
+        ],
+    )
+    assert run_cli("--config", config, "--as-of", AS_OF) == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    parity = [s for s in manifest["statuses"] if s["check"] == "parity"]
+    assert parity and parity[0]["severity"] == "indeterminate"
+    assert parity[0]["reason"] == "parity_prereq_read_uncommitted"
+
+
+def test_dry_run_touches_nothing(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF, "--dry-run") == 0
+    assert not (tmp_path / "store" / "runs").exists() or not any(
+        (tmp_path / "store" / "runs").iterdir()
+    )
+
+
+def test_injected_failure_leaves_nothing_partial(tmp_path, demo_db, monkeypatch):
+    import metricprobe.cli as cli
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("injected analysis failure")
+
+    monkeypatch.setattr(cli, "assess_volume", explode)
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF) == 1
+    store_root = tmp_path / "store"
+    assert ParquetStore(store_root).list_runs() == []
+    assert list((store_root / "staging").iterdir()) == []  # staging cleaned
+
+
+def test_config_error_is_exit_1(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("schema_version: 99\n")
+    assert run_cli("--config", str(bad)) == 1
+
+
+def test_resume_is_idempotent_and_digest_guarded(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "r-fixed") == 0
+    # idempotent retry: analysis already committed, nothing redone, same exit
+    assert (
+        run_cli("--config", config, "--as-of", AS_OF,
+                "--resume-from", "analysis", "--run-id", "r-fixed") == 0
+    )
+    assert len(ParquetStore(tmp_path / "store").list_runs()) == 1
+    # a changed config means a different digest: refuse the resume
+    changed = write_config(
+        tmp_path, demo_db,
+        [table_entry("events", "orders_main", analysis={"lag_cap_days": 200,
+                                                        "training_cutoff_days": 200})],
+    )
+    assert (
+        run_cli("--config", changed, "--as-of", AS_OF,
+                "--resume-from", "analysis", "--run-id", "r-fixed") == 1
+    )
+    # resume without a run id is refused
+    assert run_cli("--config", config, "--resume-from", "analysis") == 1
+
+
+def test_retention_prunes_after_commit(tmp_path, demo_db):
+    config = write_config(
+        tmp_path, demo_db, [table_entry("events", "orders_main")],
+        store={"path": str(tmp_path / "store"), "retention_runs": 2},
+    )
+    for suffix in ("a", "b", "c"):
+        assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", f"r-{suffix}") == 0
+    assert len(ParquetStore(tmp_path / "store").list_runs()) == 2
+
+
+def test_unimplemented_commands_say_so():
+    for command in ("report", "publish", "serve", "discover"):
+        assert main([command]) == 1
+
+
+def test_exit_codes_through_a_real_process(tmp_path, demo_db):
+    """The Actions-style contract: ONE invocation of `python -m metricprobe`,
+    exit code read by the workflow. (Re-verified on Gitea in the private
+    bootstrap.)"""
+    healthy = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    red_dir = tmp_path / "red"
+    red_dir.mkdir()
+    red = write_config(red_dir, demo_db, [table_entry("events_bad", "orders_bad")])
+
+    def invoke(*argv):
+        return subprocess.run(
+            [sys.executable, "-m", "metricprobe", "run", *argv],
+            capture_output=True,
+            text=True,
+        )
+
+    ok = invoke("--config", healthy, "--as-of", AS_OF)
+    assert ok.returncode == 0, ok.stderr
+    bad = invoke("--config", red, "--as-of", AS_OF)
+    assert bad.returncode == 2, bad.stderr
+    broken = invoke("--config", str(tmp_path / "missing.yaml"))
+    assert broken.returncode == 1
+    assert "metricprobe:" in broken.stderr

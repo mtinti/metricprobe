@@ -100,6 +100,7 @@ def test_wire_values_are_frozen_v1():
         "green",
     }
     assert {check.value for check in Check} == {
+        "probe",
         "volume",
         "completion",
         "freshness",

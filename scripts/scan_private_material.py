@@ -80,7 +80,8 @@ _PLACEHOLDER_VALUE = re.compile(
       | 127\.0\.0\.1(?::\d+)?(?:/.*)?
       | :[A-Za-z_][A-Za-z0-9_]*:?                             # :bind_param / :memory:
       | (?:your|example|demo|sample|synth|fake|mock|dummy|placeholder|metricprobe|test)[\w.!-]*
-      | server | host | hostname | database | db | dbname | catalog
+      | server | host | hostname | database | db | dbname | catalog | schema
+      | self\.[\w.]+                                          # attribute refs in code
       | dbo | main | public | master | tempdb | memory | information_schema
       | none | null | true | false | yes | no
       | str | int | float | bool | bytes | date | datetime   # type annotations

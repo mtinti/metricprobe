@@ -330,3 +330,35 @@ def test_parity_matches_between_dialects(duckdb_engine, mssql_engine):
     assert duck.rows == mssql.rows
     assert duck.statuses == mssql.statuses
     assert any(s.reason is ReasonCode.PARITY_ONE_SIDED_MONTH for s in mssql.statuses)
+
+
+def test_mssql_store_shares_the_run_contract(mssql_engine):
+    """Step 6: the config-flagged mssql writer honors the same lifecycle —
+    staged rows are invisible until the manifest INSERT commits the run."""
+    import os
+
+    from metricprobe.store import MssqlStore, RunMeta, stamp
+
+    store = MssqlStore(os.environ["METRICPROBE_MSSQL_URL"])
+    meta = RunMeta(
+        run_id="eqv-run-1",
+        run_at="2026-07-01T06:00:00",
+        as_of="2026-07-01T00:00:00",
+        git_sha="deadbeef",
+        tool_version="0.1.0.dev0",
+        config_digest="abc",
+        schema_version=1,
+        window_start="2024-07-01T00:00:00",
+        window_end="2026-07-01T00:00:00",
+    )
+    frame = stamp(pd.DataFrame({"probe": ["a", "b"], "volume": [1, 2]}), meta)
+    store.begin_run(meta)
+    store.write_table("eqv-run-1", "month_volumes", frame)
+    assert store.list_runs() == []  # staged rows invisible before the commit
+    store.commit_run("eqv-run-1", {"run_id": "eqv-run-1", "run_at": meta.run_at})
+    assert [m["run_id"] for m in store.list_runs()] == ["eqv-run-1"]
+    read_back = store.read_table("eqv-run-1", "month_volumes")
+    assert read_back["probe"].tolist() == ["a", "b"]
+    assert read_back["git_sha"].tolist() == ["deadbeef", "deadbeef"]
+    with pytest.raises(FileExistsError):
+        store.begin_run(meta)

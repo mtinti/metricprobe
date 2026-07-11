@@ -43,6 +43,7 @@ SEVERITY_PRECEDENCE: tuple[Severity, ...] = (
 
 
 class Check(StrEnum):
+    PROBE = "probe"  # probe-level refusals: scan budget, cell caps, join guards
     VOLUME = "volume"
     COMPLETION = "completion"
     FRESHNESS = "freshness"
