@@ -441,6 +441,21 @@ def test_digest_is_stable_and_secret_redacted():
     assert config_digest(_cfg(behind_amp + "demo1")) == config_digest(
         _cfg(behind_amp + "demo2")
     )
+    # COMPOUND names containing a secret word are secrets too
+    # (s3_secret_access_key must not hash its value)
+    compound = "duckdb:///:memory:?s3_access_key_id=demo-principal&s3_secret_access_key="
+    assert config_digest(_cfg(compound + "one")) == config_digest(_cfg(compound + "two"))
+    # ... in the encoded spelling as well
+    enc_compound = "duckdb:///:memory:?s3_secret%5Faccess%5Fkey="
+    assert config_digest(_cfg(enc_compound + "one")) == config_digest(
+        _cfg(enc_compound + "two")
+    )
+    # the PRINCIPAL half of the pair stays semantic: a different identity may
+    # see different rows, so it must hash differently
+    principal = "duckdb:///:memory:?s3_access_key_id={}&s3_secret_access_key=one"
+    assert config_digest(_cfg(principal.format("alice"))) != config_digest(
+        _cfg(principal.format("bob"))
+    )
 
     # semantic changes DO change the digest
     assert config_digest(base) != config_digest(_cfg("mssql+pymssql://sa:demo_pw_one@127.0.0.1/demo"))

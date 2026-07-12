@@ -505,12 +505,19 @@ def test_mssql_store_shares_the_run_contract(mssql_engine):
         store.table_names("never-committed")
     # post-commit lifecycle stages update the committed manifest in place
     store.record_stage(run_id, "render", {"completed_at": "2026-07-01T06:05:00"})
-    store.record_stage(run_id, "publish", {"remotes": ["origin"]})
+    # the publish record is TWO-PHASE: prepare front-loads the fallible work
+    # before any push; nothing is visible until the finalize runs
+    finalize = store.prepare_stage(run_id, "publish", {"remotes": ["origin"]})
+    staged = next(m for m in store.list_runs() if m["run_id"] == run_id)
+    assert "publish" not in staged["stages"]
+    finalize()
     recorded = next(m for m in store.list_runs() if m["run_id"] == run_id)
     assert recorded["stages"]["render"]["completed_at"] == "2026-07-01T06:05:00"
     assert recorded["stages"]["publish"]["remotes"] == ["origin"]
     with pytest.raises(FileNotFoundError):
         store.record_stage("never-committed", "render", {})
+    with pytest.raises(FileNotFoundError):
+        store.prepare_stage("never-committed", "publish", {})
     # the rival's abort of the SAME id must not touch the committed rows
     rival._staged[run_id] = {"claim": "someone-else", "names": ["month_volumes"]}
     rival.abort_run(run_id)

@@ -1,6 +1,6 @@
 # metricprobe dashboard
 
-**Generated at:** 2025-07-24T06:00:00+00:00 · **Run:** `demo-0001` · **Git:** `demo0000demo` · **Tool:** 0.1.3
+**Generated at:** 2025-07-24T06:00:00+00:00 · **Run:** `demo-0001` · **Git:** `demo0000demo` · **Tool:** 0.1.4
 
 **Analysed window:** 2023-07-24 → 2025-07-24 · **as-of:** 2025-07-24
 
@@ -21,6 +21,7 @@ Legend: ✅ green · ⚠️ amber · 🔴 red · ❓ indeterminate · ⏳ insuff
 | --- | --- | :---: | :---: | --- | --- | --- |
 | main.episodes | episodes | ✅ | ✅ | 2025-06-08 | 41 ± 2 d | 1.4 mo |
 | main.registry | registry | ✅ | ✅ | 2025-06-11 | 38 ± 2 d | 1.3 mo |
+| main.episodes | episodes_capped | ⏳ | ✅ | — | > 15 d | > 0.5 mo |
 
 ## demo_retail
 
@@ -139,4 +140,11 @@ Full interactive report: [report.html](report.html) (download to open).
 ![registry percentiles](img/registry_percentiles.svg)
 ![registry dual_overlay](img/registry_dual_overlay.svg)
 ![registry dual_delta](img/registry_dual_delta.svg)
+
+### episodes_capped
+
+![episodes_capped volume](img/episodes_capped_volume.svg)
+![episodes_capped completion_curves](img/episodes_capped_completion_curves.svg)
+![episodes_capped completion_heatmap](img/episodes_capped_completion_heatmap.svg)
+![episodes_capped percentiles](img/episodes_capped_percentiles.svg)
 

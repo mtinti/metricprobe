@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -242,3 +243,12 @@ def test_p95_cells_render_every_edge(dashboard_run):
     }
     assert _p95_cells(insufficient, "p", table) == ("—", "—")
     assert _p95_cells({}, "p", table) == ("—", "—")
+
+
+def test_committed_demo_exercises_the_censored_p95_state():
+    """The committed demo dashboard must show the censored "> cap" p95 cells
+    (a truncated curve renders an inequality, never a fabricated number) —
+    the state exists in the repo the user actually sees, not only in test
+    fixtures. Cheap pin; the CI byte-diff proves the rest of the file."""
+    readme = Path(__file__).resolve().parents[2] / "reports" / "README.md"
+    assert re.search(r"\| > \d+ d \| > [\d.]+ mo \|", readme.read_text(encoding="utf-8"))

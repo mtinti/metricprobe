@@ -727,15 +727,20 @@ def _stage_publish(configs: list[ProbeConfig], store, run_id: str, run_at: str) 
     retry converges (no-change commits, monotonic guard passes equal runs)."""
     from metricprobe.publish import PartialDelivery, deliver
 
+    # the publish record is STAGED before anything is pushed: a failure in
+    # the record itself (missing run, bad store, full disk) aborts while no
+    # remote has been touched. Inside the delivery envelope runs only the
+    # finalize — one atomic rename — and if even that fails, the rollback
+    # restores the remotes.
+    remotes = [remote.name for remote in configs[0].delivery.remotes]
+    finalize_record = store.prepare_stage(
+        run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": remotes}
+    )
+
     def record_published(names: list[str]) -> None:
-        store.record_stage(
-            run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": names}
-        )
+        finalize_record()
 
     try:
-        # the stage record runs INSIDE the delivery envelope: a record
-        # failure rolls the pushed remotes back, so the pushed-but-unrecorded
-        # state cannot exist (single-remote atomicity)
         pushed = deliver(
             _artifacts_dir(configs[0], run_id),
             configs[0].delivery,

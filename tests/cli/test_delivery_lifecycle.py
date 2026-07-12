@@ -404,28 +404,109 @@ def test_failed_rollback_is_recorded_as_partial(campaign, tmp_path, monkeypatch)
     assert "README.md" in _pushed_files(bare)  # origin genuinely still holds it
 
 
-def test_publish_record_failure_rolls_the_remote_back(campaign, monkeypatch):
-    """PUBLISHED is a RECORDED fact, not a pushed one: if recording the
-    publish stage fails after the push landed, the remote is rolled back to
-    its prior (here: empty) state, no publish stage exists, and the retry
-    publishes cleanly."""
+def test_publish_record_failure_aborts_before_any_push(campaign, monkeypatch):
+    """The publish record is STAGED before anything is pushed: a failing
+    record aborts the stage while the remote is still untouched — no push,
+    no rollback needed, nothing recorded — and the retry publishes."""
     from metricprobe.store import ParquetStore as PS
 
     config, store_root, bare = campaign
 
-    real_record = PS.record_stage
+    real_prepare = PS.prepare_stage
 
-    def failing_record(self, run_id, stage, info):
+    def failing_prepare(self, run_id, stage, info):
         if stage == "publish":
             raise RuntimeError("injected publish-record failure")
-        return real_record(self, run_id, stage, info)
+        return real_prepare(self, run_id, stage, info)
 
-    monkeypatch.setattr(PS, "record_stage", failing_record)
+    monkeypatch.setattr(PS, "prepare_stage", failing_prepare)
     assert main(["run", "--config", str(config), "--as-of", AS_OF,
                  "--run-id", "r-rec"]) == 1
-    # the push was compensated: the remote holds no dashboard
-    assert _pushed_files(bare) == {}
+    # nothing was ever pushed: the record failed before delivery started,
+    # so the remote does not even have the branch
+    assert _git(bare, "ls-remote", "--heads", str(bare), "main") == ""
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert "publish" not in manifest["stages"]
+    assert "publish_partial" not in manifest["stages"]
     monkeypatch.undo()
     assert main(["run", "--config", str(config), "--as-of", AS_OF,
                  "--resume-from", "publish", "--run-id", "r-rec"]) == 0
+    assert "README.md" in _pushed_files(bare)
+
+
+def test_record_finalize_failure_rolls_the_remote_back(campaign, monkeypatch):
+    """The residual window after staging: the finalize (one atomic rename)
+    fails AFTER the push landed. The compensating rollback restores the
+    single remote — atomicity holds — and the retry publishes cleanly."""
+    from metricprobe.store import ParquetStore as PS
+
+    config, store_root, bare = campaign
+
+    real_prepare = PS.prepare_stage
+
+    def sabotaged_prepare(self, run_id, stage, info):
+        finalize = real_prepare(self, run_id, stage, info)
+        if stage != "publish":
+            return finalize
+
+        def failing_finalize():
+            raise RuntimeError("injected finalize failure")
+
+        return failing_finalize
+
+    monkeypatch.setattr(PS, "prepare_stage", sabotaged_prepare)
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--run-id", "r-fin"]) == 1
+    # the push was compensated: the remote holds no dashboard
+    assert _pushed_files(bare) == {}
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert "publish" not in manifest["stages"]
+    assert "publish_partial" not in manifest["stages"]
+    monkeypatch.undo()
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--resume-from", "publish", "--run-id", "r-fin"]) == 0
+    assert "README.md" in _pushed_files(bare)
+
+
+def test_finalize_and_rollback_both_failing_is_honest_partial(
+    campaign, monkeypatch
+):
+    """The unavoidable residue: finalize fails after the push AND the
+    compensation cannot reach the remote. The manifest records
+    publish_partial — never PUBLISHED — and the retry converges."""
+    import metricprobe.publish as publish_module
+    from metricprobe.store import ParquetStore as PS
+
+    config, store_root, bare = campaign
+
+    real_prepare = PS.prepare_stage
+
+    def sabotaged_prepare(self, run_id, stage, info):
+        finalize = real_prepare(self, run_id, stage, info)
+        if stage != "publish":
+            return finalize
+
+        def failing_finalize():
+            raise RuntimeError("injected finalize failure")
+
+        return failing_finalize
+
+    real_git = publish_module._git
+
+    def hostile_git(clone, *args, **kwargs):
+        if args[0] == "push" and any("force-with-lease" in str(a) for a in args):
+            raise RuntimeError("rollback also failed")
+        return real_git(clone, *args, **kwargs)
+
+    monkeypatch.setattr(PS, "prepare_stage", sabotaged_prepare)
+    monkeypatch.setattr(publish_module, "_git", hostile_git)
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--run-id", "r-res"]) == 1
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert "publish" not in manifest["stages"]  # PUBLISHED never claimed
+    assert manifest["stages"]["publish_partial"]["remotes"] == ["origin"]
+    assert "README.md" in _pushed_files(bare)  # honestly still holds the run
+    monkeypatch.undo()
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--resume-from", "publish", "--run-id", "r-res"]) == 0
     assert "README.md" in _pushed_files(bare)

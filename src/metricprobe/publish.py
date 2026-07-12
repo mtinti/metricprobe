@@ -361,10 +361,11 @@ def deliver(
 
     names = [remote.name for remote, _, _, _ in pushed]
     if on_delivered is not None:
-        # the caller's stage record runs INSIDE the delivery envelope: the
-        # push is only allowed to stand once it is recorded — a record
-        # failure rolls every remote back (single-remote atomicity holds;
-        # PUBLISHED is claimed only after delivery AND its record succeed)
+        # the caller's stage-record FINALIZE runs INSIDE the delivery
+        # envelope (the fallible record work was staged before any push):
+        # the push is only allowed to stand once recorded — a finalize
+        # failure rolls every remote back; PUBLISHED is claimed only after
+        # delivery AND its record succeed
         try:
             on_delivered(names)
         except Exception as error:

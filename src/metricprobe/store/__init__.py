@@ -192,14 +192,28 @@ class ParquetStore:
     def record_stage(self, run_id: str, stage: str, info: dict) -> None:
         """Record a post-commit lifecycle stage (render/publish) on the
         committed manifest, atomically (tmp + replace)."""
+        self.prepare_stage(run_id, stage, info)()
+
+    def prepare_stage(self, run_id: str, stage: str, info: dict):
+        """Two-phase stage record. Everything fallible — the committed-run
+        check, the JSON round-trip, the full disk write — happens NOW; the
+        returned finalize is a single atomic rename. A caller with an
+        irreversible side effect (the dashboard push) stages the record
+        BEFORE acting, so a record failure aborts while nothing has been
+        published yet. A staged-but-never-finalized .tmp is inert: readers
+        only open manifest.json."""
         path = self._committed(run_id) / "manifest.json"
         if not path.exists():
             raise FileNotFoundError(f"run {run_id!r} is not committed")
         manifest = json.loads(path.read_text(encoding="utf-8"))
         manifest.setdefault("stages", {})[stage] = info
-        tmp = path.with_suffix(".json.tmp")
+        tmp = path.with_suffix(f".{stage}.tmp")
         tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+
+        def finalize() -> None:
+            tmp.replace(path)
+
+        return finalize
 
     def abort_run(self, run_id: str) -> None:
         staging = self._staging(run_id)
@@ -490,6 +504,15 @@ class MssqlStore:
     def record_stage(self, run_id: str, stage: str, info: dict) -> None:
         """Same post-commit stage record as the parquet store: one UPDATE of
         the committed manifest row."""
+        self.prepare_stage(run_id, stage, info)()
+
+    def prepare_stage(self, run_id: str, stage: str, info: dict):
+        """Two-phase stage record, same shape as the parquet store. The
+        prepare half front-loads the committed-run check, the JSON merge,
+        and a live connection round-trip; the finalize is the one UPDATE.
+        Unlike the file store the last write cannot be reduced to a rename,
+        so the residual window is a failed UPDATE — the caller's compensation
+        path covers it."""
         with self.engine.begin() as conn:
             row = conn.execute(
                 sa.text(
@@ -498,17 +521,23 @@ class MssqlStore:
                 ),
                 {"run_id": run_id},
             ).scalar()
-            if row is None:
-                raise FileNotFoundError(f"run {run_id!r} is not committed")
-            manifest = json.loads(row)
-            manifest.setdefault("stages", {})[stage] = info
-            conn.execute(
-                sa.text(
-                    f"UPDATE {self.schema}.{self.MANIFEST_TABLE} "
-                    "SET manifest = :manifest WHERE run_id = :run_id"
-                ),
-                {"manifest": json.dumps(manifest, sort_keys=True), "run_id": run_id},
-            )
+        if row is None:
+            raise FileNotFoundError(f"run {run_id!r} is not committed")
+        manifest = json.loads(row)
+        manifest.setdefault("stages", {})[stage] = info
+        payload = json.dumps(manifest, sort_keys=True)
+
+        def finalize() -> None:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        f"UPDATE {self.schema}.{self.MANIFEST_TABLE} "
+                        "SET manifest = :manifest WHERE run_id = :run_id"
+                    ),
+                    {"manifest": payload, "run_id": run_id},
+                )
+
+        return finalize
 
     def abort_run(self, run_id: str) -> None:
         """Deletes data rows ONLY when no manifest exists for the id (a

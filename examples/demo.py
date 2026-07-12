@@ -27,7 +27,8 @@ Unhealthy tables are parameter-matched TWINS of their healthy siblings (same
 generating parameters and seed, differing only in the injected pathology), so
 every verdict fires against a like-for-like control. The dashboard exercises
 the FULL vocabulary: green, amber, red (missing month / stale feed /
-collapse), indeterminate, insufficient history, and skipped.
+collapse), indeterminate, insufficient history, skipped, and the censored
+p95 ("> cap", via a lag-capped variant probe on the episodes feed).
 
 `serve` (the Streamlit app) is deliberately NOT part of this demo: Step 10
 was skipped by the plan owner; the self-contained report.html is the
@@ -173,6 +174,26 @@ WORLD: dict[str, list[tuple[g.TableSpec, dict]]] = {
     ],
 }
 
+# extra VARIANT probes on existing tables (variants are first-class): a
+# lag-capped view of the episodes feed whose true p95 (~40 days for
+# mu=2.2/sigma=0.9) exceeds the 15-day cap — overflow mass ~29% > 5%, so the
+# dashboard's p95 columns render the censored "> cap" state, never a precise
+# number computed from a truncated curve
+VARIANTS: dict[str, list[dict]] = {
+    "demo_health": [
+        {
+            "probe_name": "episodes_capped",
+            "database": "demo_health",
+            "schema": "main",
+            "table": "episodes",
+            "event_time": "event_time",
+            "load_time": "load_time",
+            "resolution": {"event_time": "datetime", "load_time": "datetime"},
+            "analysis": {"lag_cap_days": 15, "training_cutoff_days": 365},
+        }
+    ],
+}
+
 # probes whose TABLE deliberately does not exist (optional -> skipped ➖)
 ABSENT: dict[str, list[dict]] = {
     "demo_retail": [
@@ -218,6 +239,7 @@ def build_world(work: Path) -> list[str]:
         for spec, overrides in tables:
             g.load_into_duckdb(g.generate(spec), con, spec.name)
             entries.append(_entry(database, spec, overrides))
+        entries.extend(VARIANTS.get(database, ()))
         entries.extend(ABSENT.get(database, ()))
         con.close()
         config_path = work / f"{database}.yaml"

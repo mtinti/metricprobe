@@ -526,10 +526,14 @@ def _encoded_spelling(name: str) -> str:
 # and the percent-encoded spelling (encoded names, encoded assignments,
 # behind raw or encoded separators & ; %26 %3B) WITHOUT transforming the rest
 # of the string: a global decode would make distinct configs ('a+b' vs
-# 'a b') hash identically.
+# 'a b') hash identically. A matched secret token may CONTINUE with
+# underscore-joined words (s3_secret_access_key, token_expiry) — a compound
+# name containing a secret word is treated as a secret; over-redaction only
+# makes the digest blind to that value, under-redaction hashes a credential.
 _SECRET_PARAM = re.compile(
     r"(?i)(?:(?<![A-Za-z0-9])|(?<=%3[Bb])|(?<=%26))"
     r"(" + "|".join(_encoded_spelling(name) for name in _SECRET_NAMES) + r")"
+    r"((?:(?:_|%5[Ff])(?:[A-Za-z0-9]|%[3-6][0-9A-Fa-f])*)*)"
     # the value may itself contain percent-escapes (a%2Fb): consume them so the
     # WHOLE secret is redacted, but stop at encoded separators %26/%3B exactly
     # as at their raw spellings
@@ -545,7 +549,9 @@ def _redact(value):
     if isinstance(value, str):
         value = _URL_USERINFO_WITH_PASSWORD.sub(r"://\1:***@", value)
         value = _URL_USERINFO_BARE.sub("://***@", value)
-        return _SECRET_PARAM.sub(lambda m: f"{m.group(1)}{m.group(2)}***", value)
+        return _SECRET_PARAM.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}***", value
+        )
     return value
 
 

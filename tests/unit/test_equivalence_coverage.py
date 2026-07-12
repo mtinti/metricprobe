@@ -131,6 +131,8 @@ COVERAGE: dict[str, str] = {
         "test_mssql_store_shares_the_run_contract",
     "dialect_branch:store.MssqlStore.record_stage":
         "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore.prepare_stage":
+        "test_mssql_store_shares_the_run_contract",
     "dialect_branch:store.MssqlStore.table_names":
         "test_mssql_store_shares_the_run_contract",
     "dialect_branch:store.MssqlStore.abort_run":
