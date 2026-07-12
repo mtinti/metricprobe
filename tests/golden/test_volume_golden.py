@@ -396,3 +396,26 @@ def test_key_column_metadata_match_is_case_insensitive():
     config = table_config(key_cols=["orderref"])
     _, assessment = _assess(df, config, AS_OF_MATURE)
     assert assessment.duplicate_rows == 0
+
+
+def test_missing_latest_mature_month_breaks_the_collapse_claim():
+    """The reviewer's shape: low MATURE months, then the LATEST possible
+    mature month entirely ABSENT (an interior gap — immature months follow),
+    must not read as 'a collapse ending at the most recent mature month'.
+    The gap is RED on its own; both firing together would be false."""
+    base = g.TableSpec(
+        name="events", start_month="2024-01", n_months=12, rows_per_month=2000,
+        lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=75,
+    )
+    # as_of 2025-10-02, horizon 365d -> months through 2024-09 are mature;
+    # 2024-10..12 are immature and PRESENT (low: deficits, not collapse)
+    as_of = "2025-10-02"
+    spec = g.missing_month(g.sustained_collapse(base, last_k=7, factor=0.1), 8)
+    _, assessment = _assess(g.generate(spec), table_config(), as_of)
+    reasons = _reasons(assessment)
+    assert ReasonCode.VOLUME_GAP in reasons  # 2024-09 is an interior gap...
+    assert ReasonCode.VOLUME_COLLAPSE not in reasons  # ...NOT a live collapse
+    # control: with 2024-09 present, the same shape IS a collapse
+    control = g.sustained_collapse(base, last_k=7, factor=0.1)
+    _, with_month = _assess(g.generate(control), table_config(), as_of)
+    assert ReasonCode.VOLUME_COLLAPSE in _reasons(with_month)

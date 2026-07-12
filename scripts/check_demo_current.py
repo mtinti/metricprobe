@@ -14,6 +14,7 @@ The committed artifacts are themselves BUILT on that same image family
 
 from __future__ import annotations
 
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:
+    machine = platform.machine().lower()
+    if platform.system() != "Linux" or machine not in ("x86_64", "amd64"):
+        # SVG text metrics come from the renderer's platform fonts: the
+        # committed bytes are produced on linux/amd64 and only compare
+        # meaningfully there (locally: regenerate inside a linux/amd64
+        # container, per the README)
+        print(
+            f"demo diff check requires linux/x86_64 (this is "
+            f"{platform.system()}/{machine}); refusing a meaningless diff",
+            file=sys.stderr,
+        )
+        return 1
     build = subprocess.run(
         [sys.executable, str(REPO_ROOT / "examples" / "demo.py"), "--out",
          str(REPO_ROOT / "reports")],

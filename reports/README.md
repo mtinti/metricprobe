@@ -27,14 +27,18 @@ Legend: ✅ green · ⚠️ amber · 🔴 red · ❓ indeterminate · ⏳ insuff
 | Table | Probe | Healthy? | Updating? | Complete back to |
 | --- | --- | :---: | :---: | --- |
 | main.orders | orders | ✅ | ✅ | 2025-07-03 |
-| main.returns | returns | 🔴 | ✅ | 2025-06-28 |
+| main.returns | returns | 🔴 | ✅ | 2025-07-02 |
+| main.shipments | shipments | ❓ | ✅ | 2025-07-09 |
+| main.shipments_replica | shipments_replica | ✅ | ✅ | 2025-07-09 |
+| main.decommissioned_feed | decommissioned_feed | ➖ | ➖ | — |
 
 ## demo_sensors
 
 | Table | Probe | Healthy? | Updating? | Complete back to |
 | --- | --- | :---: | :---: | --- |
 | main.telemetry | telemetry | ✅ | ✅ | 2025-07-20 |
-| main.device_pings | device_pings | 🔴 | 🔴 | 2025-07-21 |
+| main.device_pings | device_pings | 🔴 | 🔴 | 2025-07-20 |
+| main.gateway_logs | gateway_logs | ⚠️ | ✅ | 2025-07-20 |
 | main.new_feed | new_feed | ⏳ | ✅ | — |
 
 Full interactive report: [report.html](report.html) (download to open).
@@ -54,6 +58,25 @@ Full interactive report: [report.html](report.html) (download to open).
 ![returns completion_curves](img/returns_completion_curves.svg)
 ![returns completion_heatmap](img/returns_completion_heatmap.svg)
 ![returns percentiles](img/returns_percentiles.svg)
+![returns dual_overlay](img/returns_dual_overlay.svg)
+![returns dual_delta](img/returns_dual_delta.svg)
+
+### shipments
+
+![shipments volume](img/shipments_volume.svg)
+![shipments completion_curves](img/shipments_completion_curves.svg)
+![shipments completion_heatmap](img/shipments_completion_heatmap.svg)
+![shipments percentiles](img/shipments_percentiles.svg)
+
+### shipments_replica
+
+![shipments_replica volume](img/shipments_replica_volume.svg)
+![shipments_replica completion_curves](img/shipments_replica_completion_curves.svg)
+![shipments_replica completion_heatmap](img/shipments_replica_completion_heatmap.svg)
+![shipments_replica percentiles](img/shipments_replica_percentiles.svg)
+
+### decommissioned_feed
+
 
 ### telemetry
 
@@ -68,6 +91,13 @@ Full interactive report: [report.html](report.html) (download to open).
 ![device_pings completion_curves](img/device_pings_completion_curves.svg)
 ![device_pings completion_heatmap](img/device_pings_completion_heatmap.svg)
 ![device_pings percentiles](img/device_pings_percentiles.svg)
+
+### gateway_logs
+
+![gateway_logs volume](img/gateway_logs_volume.svg)
+![gateway_logs completion_curves](img/gateway_logs_completion_curves.svg)
+![gateway_logs completion_heatmap](img/gateway_logs_completion_heatmap.svg)
+![gateway_logs percentiles](img/gateway_logs_percentiles.svg)
 
 ### new_feed
 

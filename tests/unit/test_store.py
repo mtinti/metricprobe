@@ -121,3 +121,32 @@ def test_store_enforces_the_frozen_snapshot_schema(tmp_path):
     with pytest.raises(ValueError, match="manifest is missing"):
         store.commit_run("r1", {"run_id": "r1", "run_at": "2026-07-01T06:00:00"})
     store.commit_run("r1", manifest_for(meta("r1")))
+
+
+def test_prune_protects_the_completing_run(tmp_path):
+    import pandas as pd
+
+    from metricprobe.store import ParquetStore, RunMeta, stamp
+
+    store = ParquetStore(tmp_path)
+    for index, run_id in enumerate(["r-old", "r-mid", "r-new"]):
+        meta = RunMeta(
+            run_id=run_id, run_at=f"2026-07-0{index + 1}T00:00:00+00:00",
+            as_of="2026-07-04T00:00:00", git_sha="x", tool_version="0",
+            config_digest="d", schema_version=1,
+            window_start="2024-07-04T00:00:00", window_end="2026-07-04T00:00:00",
+        )
+        store.begin_run(meta)
+        store.write_table(run_id, "statuses", stamp(pd.DataFrame({"probe": ["p"]}), meta))
+        store.commit_run(run_id, {
+            "run_id": run_id, "run_at": meta.run_at, "as_of": meta.as_of,
+            "git_sha": "x", "tool_version": "0", "config_digest": "d",
+            "schema_version": 1, "window_start": meta.window_start,
+            "window_end": meta.window_end, "stages": {},
+        })
+    # keep 1: the oldest run survives because the CALLER is still completing
+    # it (a resumed old run must not be pruned before its render stage)
+    dropped = store.prune(keep=1, protect="r-old")
+    assert dropped == ["r-mid"]
+    remaining = {m["run_id"] for m in store.list_runs()}
+    assert remaining == {"r-old", "r-new"}

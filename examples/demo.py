@@ -5,18 +5,33 @@ single-industry — the tool is generic) with healthy AND unhealthy twins, runs
 the full metricprobe campaign over them, and publishes the markdown dashboard
 that is committed under reports/ in this repository:
 
-    demo_retail    orders feed (lognormal trickle, dual timestamps:
-                   order placed vs warehouse-loaded) + a returns feed with a
-                   missing month
-    demo_sensors   IoT telemetry (near-real-time with straggler devices),
-                   a ping feed that silently STOPPED (freshness red), and a
-                   feed too young to classify (insufficient history)
+    demo_retail    orders feed (lognormal trickle, dual timestamps: order
+                   placed vs warehouse-loaded); returns — orders' TWIN (same
+                   generating parameters + seed) with a missing month; a
+                   shipments pair whose parity prerequisite fails
+                   (read_uncommitted -> indeterminate); and an optional
+                   decommissioned feed that no longer exists (skipped)
+    demo_sensors   IoT telemetry (near-real-time with straggler devices);
+                   device_pings — telemetry's twin that silently STOPPED
+                   (freshness red); gateway_logs — telemetry's twin with one
+                   mature month mildly spiked (amber); and a feed too young
+                   to classify (insufficient history)
     demo_finance   card settlements (monthly step batches with a batch-run
-                   id, healthy) and a disputes feed in sustained volume
-                   collapse (updating green / volume red)
+                   id, healthy) and card_disputes — settlements' twin in
+                   sustained volume collapse (updating green / volume red)
     demo_health    episode records (slow trickle over weeks with a long
                    tail, dual timestamps) and a registry-like table whose
                    UPSTREAM lag dominates the local ingestion lag
+
+Unhealthy tables are parameter-matched TWINS of their healthy siblings (same
+generating parameters and seed, differing only in the injected pathology), so
+every verdict fires against a like-for-like control. The dashboard exercises
+the FULL vocabulary: green, amber, red (missing month / stale feed /
+collapse), indeterminate, insufficient history, and skipped.
+
+`serve` (the Streamlit app) is deliberately NOT part of this demo: Step 10
+was skipped by the plan owner; the self-contained report.html is the
+interactive artifact.
 
 The build is BYTE-DETERMINISTIC: data comes from fixed seeds, the clock /
 run id / git metadata are injected, SVG output is canonicalized, and the
@@ -33,6 +48,7 @@ Run from a repository checkout (the synthetic generator lives in tests/).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import sys
 import tempfile
@@ -60,44 +76,54 @@ GIT_SHA = "demo0000demo0000"
 FULL = 31  # 2023-01 .. 2025-07
 BATCHY = 30  # 2023-01 .. 2025-06 (June's last batch loads 2025-07-21)
 
+ORDERS = g.TableSpec(
+    name="orders", start_month="2023-01", n_months=FULL, rows_per_month=1500,
+    lag_model=g.LognormalLag(mu=1.6, sigma=0.8), dual_offset_days=1.0, seed=1101,
+)
+SHIPMENTS = g.TableSpec(
+    name="shipments", start_month="2023-01", n_months=FULL, rows_per_month=1000,
+    lag_model=g.LognormalLag(mu=1.4, sigma=0.7), seed=1103,
+)
+TELEMETRY = g.TableSpec(
+    name="telemetry", start_month="2023-01", n_months=FULL, rows_per_month=3000,
+    # near-real-time with straggler devices: hours-scale median, wide sigma
+    # gives the long device tail
+    lag_model=g.LognormalLag(mu=-1.0, sigma=1.2), seed=1201,
+)
+SETTLEMENTS = g.TableSpec(
+    name="settlements", start_month="2023-01", n_months=BATCHY, rows_per_month=2000,
+    lag_model=g.StepBatches(schedule=((3.0, 0.6), (10.0, 0.3), (20.0, 0.1))),
+    seed=1301,
+)
+
 WORLD: dict[str, list[tuple[g.TableSpec, dict]]] = {
     "demo_retail": [
+        (ORDERS, {"source_insert_time": "source_insert_time", "key_cols": ["row_id"]}),
         (
-            g.TableSpec(
-                name="orders", start_month="2023-01", n_months=FULL,
-                rows_per_month=1500, lag_model=g.LognormalLag(mu=1.6, sigma=0.8),
-                dual_offset_days=1.0, seed=1101,
-            ),
-            {"source_insert_time": "source_insert_time", "key_cols": ["row_id"]},
+            # orders' parameter-matched TWIN: identical spec and seed, one
+            # mature month (2023-10) simply absent
+            g.missing_month(dataclasses.replace(ORDERS, name="returns"), 9),
+            {"source_insert_time": "source_insert_time"},
         ),
-        (
-            g.missing_month(
-                g.TableSpec(
-                    name="returns", start_month="2023-01", n_months=FULL,
-                    rows_per_month=400, lag_model=g.LognormalLag(mu=1.8, sigma=0.8),
-                    seed=1102,
-                ),
-                9,  # 2023-10: a MATURE month is simply absent
-            ),
-            {},
-        ),
+        (SHIPMENTS, {"key_cols": ["row_id"],
+                     "parity_with": "shipments_replica",
+                     "read_uncommitted": True}),
+        (dataclasses.replace(SHIPMENTS, name="shipments_replica"),
+         {"key_cols": ["row_id"]}),
     ],
     "demo_sensors": [
+        (TELEMETRY, {}),
         (
-            g.TableSpec(
-                name="telemetry", start_month="2023-01", n_months=FULL,
-                rows_per_month=3000,
-                # near-real-time with straggler devices: hours-scale median,
-                # wide sigma gives the long device tail
-                lag_model=g.LognormalLag(mu=-1.0, sigma=1.2), seed=1201,
-            ),
+            # telemetry's twin that silently STOPPED five months before as_of
+            dataclasses.replace(TELEMETRY, name="device_pings", n_months=26),
             {},
         ),
         (
-            g.TableSpec(
-                name="device_pings", start_month="2023-01", n_months=26,
-                rows_per_month=2500, lag_model=g.LognormalLag(mu=-1.0, sigma=0.8),
-                seed=1202,  # ends 2025-02: the feed silently STOPPED
+            # telemetry's twin with ONE mature month mildly spiked: the
+            # constant baseline's sigma floor is 5% of the median, so a 12%
+            # spike sits between 2 and 3 robust deviations -> AMBER
+            g.volume_spike(
+                dataclasses.replace(TELEMETRY, name="gateway_logs"), 12, factor=1.12
             ),
             {},
         ),
@@ -111,28 +137,13 @@ WORLD: dict[str, list[tuple[g.TableSpec, dict]]] = {
         ),
     ],
     "demo_finance": [
+        (SETTLEMENTS, {"load_batch_col": "batch_id", "expect_batchy": True,
+                       "key_cols": ["row_id"]}),
         (
-            g.TableSpec(
-                name="settlements", start_month="2023-01", n_months=BATCHY,
-                rows_per_month=2000,
-                lag_model=g.StepBatches(schedule=((3.0, 0.6), (10.0, 0.3), (20.0, 0.1))),
-                seed=1301,
-            ),
-            {"load_batch_col": "batch_id", "expect_batchy": True,
-             "key_cols": ["row_id"]},
-        ),
-        (
+            # settlements' twin: batches keep their cadence, rows collapse ~10x
             g.sustained_collapse(
-                g.TableSpec(
-                    name="card_disputes", start_month="2023-01", n_months=BATCHY,
-                    rows_per_month=1800,
-                    lag_model=g.StepBatches(
-                        schedule=((3.0, 0.6), (10.0, 0.3), (20.0, 0.1))
-                    ),
-                    seed=1302,
-                ),
-                last_k=15,  # batches keep their cadence; rows collapse ~10x
-                factor=0.1,
+                dataclasses.replace(SETTLEMENTS, name="card_disputes"),
+                last_k=15, factor=0.1,
             ),
             {"load_batch_col": "batch_id"},
         ),
@@ -159,6 +170,22 @@ WORLD: dict[str, list[tuple[g.TableSpec, dict]]] = {
             ),
             {"source_insert_time": "source_insert_time"},
         ),
+    ],
+}
+
+# probes whose TABLE deliberately does not exist (optional -> skipped ➖)
+ABSENT: dict[str, list[dict]] = {
+    "demo_retail": [
+        {
+            "probe_name": "decommissioned_feed",
+            "database": "demo_retail",
+            "schema": "main",
+            "table": "decommissioned_feed",
+            "event_time": "event_time",
+            "load_time": "load_time",
+            "resolution": {"event_time": "datetime", "load_time": "datetime"},
+            "optional": True,
+        }
     ],
 }
 
@@ -191,6 +218,7 @@ def build_world(work: Path) -> list[str]:
         for spec, overrides in tables:
             g.load_into_duckdb(g.generate(spec), con, spec.name)
             entries.append(_entry(database, spec, overrides))
+        entries.extend(ABSENT.get(database, ()))
         con.close()
         config_path = work / f"{database}.yaml"
         config_path.write_text(

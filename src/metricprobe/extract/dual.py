@@ -5,10 +5,11 @@ Same execution shape as the canonical pass: stage one scan of narrow derived
 columns into a session temp table, aggregate with GROUPING SETS, drop. The
 scan budget is verified fail-closed on mssql exactly like the main pass.
 
-FROZEN DUAL SCHEMA (v4 — v1 lacked the lookup-uniqueness guard columns and
+FROZEN DUAL SCHEMA (v5 — v1 lacked the lookup-uniqueness guard columns and
 used the pages-only scratch budget; v2's guard saw only joined lookup rows;
 v3 staged a windowed global max; v4 uses the main pass's FULL OUTER shape:
-every lookup row is staged, guard-only artifact rows carry is_probe_row = 0).
+every lookup row is staged, guard-only artifact rows carry is_probe_row = 0;
+v5 watermarks the base BEFORE the join and adds the physical n_staged_rows).
 Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
@@ -56,7 +57,7 @@ from metricprobe.extract.canonical import (
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 4
+DUAL_SCHEMA_VERSION = 5
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -91,6 +92,7 @@ DUAL_RESULT_COLUMNS = (
     "n_overflow",
     "n_delta_rows",
     "max_lookup_dup",
+    "n_staged_rows",  # physical COUNT(*): probe rows + guard-only artifacts
 )
 
 
@@ -130,11 +132,23 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
     )
     if via:
         # same FULL OUTER shape as the main pass: lookup-only rows exist only
-        # for the uniqueness guard and contribute to no bucket
-        base = sa.select(
-            *[base.c[column] for column in sorted(base_columns)],
-            sa.literal(1).label("mp_base_marker"),
-        ).subquery("b")
+        # for the uniqueness guard and contribute to no bucket. The as_of
+        # watermark applies HERE, before the join (a post-join filter would
+        # delete duplicate lookup keys whose only matches were watermarked out)
+        raw_load = base.c[table.load_time]
+        base = (
+            sa.select(
+                *[base.c[column] for column in sorted(base_columns)],
+                sa.literal(1).label("mp_base_marker"),
+            )
+            .where(
+                sa.or_(
+                    raw_load <= sa.bindparam("as_of", type_=sa.DateTime()),
+                    raw_load.is_(None),
+                )
+            )
+            .subquery("b")
+        )
     load = base.c[table.load_time]
     source = base.c[table.source_insert_time]
     if via:
@@ -193,7 +207,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
         "delta_day"
     )
 
-    return (
+    select = (
         sa.select(
             month_key,
             lag_key,
@@ -209,9 +223,14 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             lookup_dup.label("lookup_dup"),
         )
         .select_from(source_from)
-        # the bare <= would silently delete the NULL-load bucket
-        .where(sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None)))
     )
+    if via is None:
+        # the bare <= would silently delete the NULL-load bucket. (Via probes
+        # carry this predicate INSIDE the base subquery, before the join.)
+        select = select.where(
+            sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None))
+        )
+    return select
 
 
 def dual_staging_sql(table: TableConfig, dialect: str, as_of=None) -> str:
@@ -265,6 +284,7 @@ def build_dual_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
             total(staging.c.is_overflow).label("n_overflow"),
             total(staging.c.is_delta_row).label("n_delta_rows"),
             sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
+            sa.func.count().label("n_staged_rows"),
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))

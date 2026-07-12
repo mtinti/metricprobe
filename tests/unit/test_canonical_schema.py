@@ -24,11 +24,12 @@ SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 
 def test_schema_version_is_pinned():
     # v2: the scan-budget accounting formulas changed (ALGORITHMS section 15);
-    # v3: windowed global lookup max; v4: FULL OUTER lookup guard;
+    # v3: windowed global lookup max; v4: FULL OUTER lookup guard; v5:
+    # pre-join watermark for via probes + physical n_staged_rows;
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 4
+    assert CANONICAL_SCHEMA_VERSION == 5
 
 
 def test_grouping_ids_are_frozen():
@@ -71,6 +72,7 @@ def test_result_columns_are_frozen():
         "max_lookup_dup",
         "distinct_keys",
         "min_load_time",
+        "n_staged_rows",
     )
     assert STAGING_COLUMNS == (
         "event_month",
@@ -317,6 +319,7 @@ def test_dual_schema_is_frozen():
         "n_overflow",
         "n_delta_rows",
         "max_lookup_dup",
+        "n_staged_rows",
     )
 
 

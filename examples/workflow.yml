@@ -10,6 +10,13 @@
 # which table and why); 1 = a stage failed (whatever committed before the
 # failure remains committed and honestly reported; retry with
 # `--resume-from <stage> --run-id <id>`).
+#
+# RETRY NEEDS A PERSISTENT STORE: on an ephemeral runner, a store configured
+# as a local path (the default) disappears with the job, taking the
+# registration/manifest that --resume-from verifies. To make retry real,
+# point store at the mssql backend (store.mssql_url) or persist the store
+# directory (a mounted volume on a self-hosted runner). With a purely
+# ephemeral local store, treat exit 1 as "re-run from scratch".
 
 name: metricprobe campaign
 on:
@@ -28,4 +35,5 @@ jobs:
         env:
           METRICPROBE_DB_URL: ${{ secrets.METRICPROBE_DB_URL }}
           DASHBOARD_PUSH_TOKEN: ${{ secrets.DASHBOARD_PUSH_TOKEN }}
+          METRICPROBE_SCHEDULED: "1"  # campaign.manual_run_behavior: forbid honors this
         run: .venv/bin/metricprobe run --config probe.yaml

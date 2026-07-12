@@ -28,7 +28,7 @@ SUPPRESSIBLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "dual_lag_cells": ("row_count",),
     "dual_delta": ("row_count",),
     "batch_runs": ("rows",),
-    "batch_months": ("null_batch_rows",),
+    "batch_months": ("null_batch_rows", "runs"),
     "parity_months": ("left_count", "right_count", "diff"),
     "compare_mismatch": ("mismatches",),
     "volume_summary": ("duplicate_rows", "baseline_median", "baseline_sigma", "forecast"),
@@ -83,7 +83,9 @@ def suppress_small_counts(name: str, frame: pd.DataFrame) -> pd.DataFrame:
     for column in SUPPRESSIBLE_COLUMNS.get(name, ()):
         if column in out.columns:
             values = pd.to_numeric(out[column], errors="coerce")
-            out[column] = values.mask(values < SUPPRESSION_THRESHOLD)
+            # by MAGNITUDE: a signed count (a parity diff of -100) is a large
+            # disclosure-safe value, while ±small must still blank
+            out[column] = values.mask(values.abs() < SUPPRESSION_THRESHOLD)
     return out
 
 

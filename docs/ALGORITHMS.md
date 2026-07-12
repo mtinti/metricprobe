@@ -333,14 +333,17 @@ max_lookup_dup): the dual pass runs on its own connection, so it asserts
 uniqueness itself — JOIN_NOT_UNIQUE aborts it exactly like the main pass —
 and its staging spool is measured and enforced under the same
 `staging_pages + 10 x staged_rows` bound.
-CANONICAL_SCHEMA_VERSION 3 / DUAL_SCHEMA_VERSION 3: the staged lookup_dup
-column carries the GLOBAL lookup-side max duplication (a second window layer
-computes MAX(dup) OVER () before the join), so duplicate lookup keys abort
-the probe even when no current base row references them — the uniqueness
-contract covers the lookup table itself, not just the joined keys. Blind
-spot, documented: if NO base row survives the as-of watermark (the join
-produces no staged rows) the guard has nothing to carry the max on; the
-metrics are empty in that degenerate case anyway.
+CANONICAL/DUAL v3 carried the global lookup max via a second window layer
+(blind to lookup keys with zero staged join rows). v4 replaced it with a
+FULL OUTER join: every lookup row is staged — joined, or as a guard-only
+artifact with is_probe_row = 0 excluded from row_count and every bucket —
+so MAX(lookup_dup) covers the WHOLE lookup side, including keys no base row
+references and an entirely empty base. v5 moved the as-of watermark INSIDE
+the base subquery for via probes (a post-join filter deleted duplicate
+lookup keys whose only matches were watermarked out) and added the physical
+n_staged_rows count, which the scratch/spool row allowances scale by (the
+admitted probe-row count undercounts when guard-only artifact rows are
+staged).
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,

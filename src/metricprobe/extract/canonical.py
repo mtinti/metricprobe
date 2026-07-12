@@ -77,8 +77,12 @@ from metricprobe.status import ReasonCode
 # window layer. v4 replaces that with a FULL OUTER join: lookup-only rows are
 # staged as guard-only artifacts (is_probe_row = 0, excluded from row_count
 # and every bucket), so JOIN_NOT_UNIQUE fires on duplicate lookup keys even
-# when NO base row — admitted or otherwise — references them
-CANONICAL_SCHEMA_VERSION = 4
+# when NO base row — admitted or otherwise — references them.
+# v5: the as_of watermark moved INSIDE the base subquery for via probes (a
+# post-join filter deleted duplicate lookup keys whose only matches were
+# watermarked out), and n_staged_rows (physical COUNT(*)) joined the result
+# so the scratch/spool row allowances scale with what was actually staged
+CANONICAL_SCHEMA_VERSION = 5
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -146,6 +150,7 @@ RESULT_COLUMNS = (
     "max_lookup_dup",
     "distinct_keys",
     "min_load_time",
+    "n_staged_rows",  # physical COUNT(*): probe rows + guard-only artifacts
 )
 
 # A result CELL is one entry of a grouping set's matrix (e.g. one event-month x
@@ -354,11 +359,25 @@ def build_staging_select(
     if via:
         # the marker distinguishes probe-table rows after the FULL OUTER
         # join below: lookup-only rows carry NULL here and contribute to NO
-        # bucket, only to the lookup-uniqueness guard
-        base = sa.select(
-            *[base.c[column] for column in sorted(base_columns)],
-            sa.literal(1).label("mp_base_marker"),
-        ).subquery("b")
+        # bucket, only to the lookup-uniqueness guard. The as_of WATERMARK
+        # applies to the base side HERE, before the join — filtering the
+        # joined result instead would delete a duplicated lookup key whose
+        # only matches are watermarked-out base rows, silently bypassing
+        # JOIN_NOT_UNIQUE.
+        raw_load = base.c[table.load_time]
+        base = (
+            sa.select(
+                *[base.c[column] for column in sorted(base_columns)],
+                sa.literal(1).label("mp_base_marker"),
+            )
+            .where(
+                sa.or_(
+                    raw_load <= sa.bindparam("as_of", type_=sa.DateTime()),
+                    raw_load.is_(None),
+                )
+            )
+            .subquery("b")
+        )
     load = base.c[table.load_time]
 
     lk = None
@@ -487,7 +506,7 @@ def build_staging_select(
         )
     else:
         compare_mismatch = sa.cast(sa.literal(0), sa.Integer())
-    return (
+    select = (
         sa.select(
             month_key,
             lag_key,
@@ -510,9 +529,14 @@ def build_staging_select(
             load.label("load_time"),
         )
         .select_from(source)
-        # the bare <= would silently delete the NULL-load bucket
-        .where(sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None)))
     )
+    if via is None:
+        # the bare <= would silently delete the NULL-load bucket. (Via probes
+        # carry this predicate INSIDE the base subquery, before the join.)
+        select = select.where(
+            sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None))
+        )
+    return select
 
 
 def staging_sql(
@@ -574,6 +598,9 @@ def _bucket_sums(staging):
         total(staging.c.is_ambiguous_base).label("n_ambiguous_base_rows"),
         total(staging.c.is_compare_mismatch).label("n_compare_mismatch"),
         sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
+        # PHYSICAL staged rows (incl. lookup-only artifacts): the budget row
+        # allowances must scale with what the engine actually processed
+        sa.func.count().label("n_staged_rows"),
     ]
 
 
@@ -928,10 +955,14 @@ def verify_spool_budget(
 
 
 def _staged_row_count(rows: list[tuple], keys, global_id: int) -> int:
-    """Total staged rows, read from the () grouping-set row already fetched."""
+    """PHYSICAL staged rows (probe rows + guard-only artifacts), read from
+    the () grouping-set row already fetched — the budget row allowances must
+    scale with what the engine actually processed, not the admitted subset."""
     key_list = list(keys)
     gid_index = key_list.index("grouping_id")
-    count_index = key_list.index("row_count")
+    count_index = key_list.index(
+        "n_staged_rows" if "n_staged_rows" in key_list else "row_count"
+    )
     for row in rows:
         if row[gid_index] == global_id:
             return int(row[count_index])

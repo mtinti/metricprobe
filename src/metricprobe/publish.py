@@ -235,6 +235,18 @@ def _remote_has_ref(clone: Path, url: str, ref: str) -> bool:
     return bool(out.stdout.strip())
 
 
+class PartialDelivery(RuntimeError):
+    """Some remotes were updated before a later push failed. `pushed` names
+    them; the run must NOT be recorded as PUBLISHED."""
+
+    def __init__(self, pushed: list[str], failed: str, error: Exception):
+        self.pushed = pushed
+        super().__init__(
+            f"push to remote {failed!r} failed after {', '.join(pushed)} already "
+            f"updated: {error}"
+        )
+
+
 def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> list[str]:
     """Push the rendered dashboard to EVERY configured remote, in TWO phases:
     first PREPARE every remote (sync its clone, enforce the
@@ -283,11 +295,19 @@ def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> li
             _git(clone, "commit", "-m", f"metricprobe dashboard {run_id}")
         prepared.append((remote, url, clone))
 
-    # ---- phase 2: push (each push is idempotent, so a retry after a partial
-    # network failure re-pushes no-change commits harmlessly)
+    # ---- phase 2: push. Cross-remote pushes cannot be transactional: when a
+    # later push fails after earlier ones landed, PartialDelivery reports
+    # exactly which remotes now hold the run so the caller can record the
+    # partial state honestly. Each push is idempotent — the retry re-pushes
+    # no-change commits and converges to a full publication.
     pushed = []
     for remote, url, clone in prepared:
-        _git(clone, "push", url, f"HEAD:refs/heads/{remote.ref}")
+        try:
+            _git(clone, "push", url, f"HEAD:refs/heads/{remote.ref}")
+        except Exception as error:
+            if pushed:
+                raise PartialDelivery(pushed, remote.name, error) from error
+            raise
         pushed.append(remote.name)
     return pushed
 
@@ -348,6 +368,10 @@ def emit_dashboard(
     README path."""
     out = Path(out_dir)
     (out / "img").mkdir(parents=True, exist_ok=True)
+    for stale in (out / "img").glob("*.svg"):
+        # a renamed/removed probe must not leave its old figure behind — a
+        # stale tracked SVG would pass the CI diff while lying about content
+        stale.unlink()
     manifest = next(m for m in store.list_runs() if m["run_id"] == run_id)
     frames = load_run_frames(store, run_id)
     all_figures = build_all_figures(store, run_id, configs)

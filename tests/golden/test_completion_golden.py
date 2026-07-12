@@ -294,6 +294,32 @@ def test_via_lookup_duplicates_abort_even_when_unreferenced():
     assert "0 base rows are ambiguous" in excinfo.value.detail
 
 
+def test_via_lookup_duplicates_survive_the_watermark():
+    """Duplicate lookup keys whose ONLY base matches are loaded AFTER as_of
+    must still abort: the watermark applies to the base side BEFORE the join,
+    so filtered-out matches leave the lookup rows as guard-only artifacts
+    instead of deleting them."""
+    _, base, lookup = _via_frames()
+    future = base.head(1).copy()
+    future["referral_id"] = 987_654
+    future["site_code"] = 0
+    future["load_time"] = pd.Timestamp("2099-01-01")  # beyond the as_of watermark
+    duplicated = pd.DataFrame(
+        {
+            "id": [987_654, 987_654],
+            "site": [0, 0],
+            "referral_date": [pd.Timestamp("2024-01-01")] * 2,
+        }
+    )
+    with pytest.raises(ProbeAborted) as excinfo:
+        _probe_via(
+            pd.concat([base, future], ignore_index=True),
+            pd.concat([lookup, duplicated], ignore_index=True),
+            _via_config([{"base_col": "referral_id", "lookup_col": "id"}]),
+        )
+    assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+
+
 def test_via_lookup_duplicates_abort_with_zero_matched_base_rows():
     """The degenerate corner: EVERY admitted base row is unmatched (the
     duplicated lookup keys join to nothing at all) — the FULL OUTER guard

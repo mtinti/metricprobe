@@ -152,7 +152,7 @@ def test_component_versions_are_pinned():
     assert COMPONENT_VERSIONS == {
         "config": 3,  # v3: compare resolution, dialect whitelist, finite params
         "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
-        "canonical": 4,  # v4: FULL OUTER lookup guard (is_probe_row artifacts)
-        "dual": 4,  # v4: same FULL OUTER lookup guard as the main pass
+        "canonical": 5,  # v5: pre-join watermark + physical n_staged_rows
+        "dual": 5,  # v5: same pre-join watermark + n_staged_rows
         "snapshot": 3,  # v3: frozen physical types, version marker, catalog
     }

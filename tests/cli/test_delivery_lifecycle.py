@@ -272,3 +272,92 @@ def test_multi_config_campaign_renders_every_probe(campaign, tmp_path):
     assert "orders_variant" in files["README.md"]  # the second file's probe
     # its presentation settings applied too: proxy labelling in its figures
     assert any("orders_variant" in name for name in files if name.startswith("img/"))
+
+
+def test_standalone_render_requires_the_matching_config(campaign, tmp_path):
+    """report/publish render UNDER the supplied config: rendering a run with
+    a config it was not created with (e.g. suppression toggled off) refuses."""
+    config, store_root, bare = campaign
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--run-id", "r-guard"]) == 0
+    text = yaml.safe_load(config.read_text())
+    text["tables"][0]["suppress_small_counts"] = False  # a DIFFERENT config
+    text["tables"][0]["proxy"] = True
+    other = tmp_path / "other.yaml"
+    other.write_text(yaml.safe_dump(text))
+    out = tmp_path / "out"
+    assert main(["report", "--config", str(other), "--out", str(out)]) == 1
+    assert main(["publish", "--config", str(other), "--out", str(out)]) == 1
+    assert main(["report", "--config", str(config), "--out", str(out)]) == 0
+
+
+def test_render_record_failure_rolls_the_swap_back(campaign, tmp_path, monkeypatch):
+    """The render stage is only real once RECORDED: when recording fails, the
+    previously rendered artifacts are restored, and a publish-only resume is
+    refused until a successful render records itself."""
+    from metricprobe.store import ParquetStore as PS
+
+    config, store_root, bare = campaign
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--run-id", "r-roll"]) == 0
+    artifacts = tmp_path / "worktree" / "artifacts" / "r-roll"
+    before = (artifacts / "README.md").read_bytes()
+
+    real_record = PS.record_stage
+
+    def failing_record(self, run_id, stage, info):
+        if stage == "render":
+            raise RuntimeError("injected record failure")
+        return real_record(self, run_id, stage, info)
+
+    monkeypatch.setattr(PS, "record_stage", failing_record)
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--resume-from", "render", "--run-id", "r-roll"]) == 1
+    # the previous complete artifacts are back in place
+    assert (artifacts / "README.md").read_bytes() == before
+    monkeypatch.undo()
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--resume-from", "render", "--run-id", "r-roll"]) == 0
+
+
+def test_partial_multi_remote_push_is_recorded_honestly(campaign, tmp_path, monkeypatch):
+    """When a later push fails after an earlier one landed, the manifest
+    records publish_partial (never PUBLISHED), and the retry converges."""
+    import metricprobe.publish as publish_module
+
+    config, store_root, bare = campaign
+    second = tmp_path / "mirror.git"
+    second.mkdir()
+    _git(second, "init", "--bare", "--initial-branch", "main")
+    text = yaml.safe_load(config.read_text())
+    text["delivery"]["remotes"].append(
+        {"name": "mirror", "url": f"file://{second}", "ref": "main"}
+    )
+    two = tmp_path / "two.yaml"
+    two.write_text(yaml.safe_dump(text))
+
+    real_git = publish_module._git
+    state = {"fail_mirror_push": True}
+
+    def flaky_git(clone, *args):
+        if (
+            state["fail_mirror_push"]
+            and args[0] == "push"
+            and "mirror.git" in str(args[1])
+        ):
+            raise RuntimeError("injected network failure")
+        return real_git(clone, *args)
+
+    monkeypatch.setattr(publish_module, "_git", flaky_git)
+    assert main(["run", "--config", str(two), "--as-of", AS_OF,
+                 "--run-id", "r-partial"]) == 1
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert "publish" not in manifest["stages"]  # PUBLISHED never claimed
+    assert manifest["stages"]["publish_partial"]["remotes"] == ["origin"]
+    assert "README.md" in _pushed_files(bare)  # the first remote DID land
+    # the retry converges to a full publication
+    state["fail_mirror_push"] = False
+    assert main(["run", "--config", str(two), "--as-of", AS_OF,
+                 "--resume-from", "publish", "--run-id", "r-partial"]) == 0
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert manifest["stages"]["publish"]["remotes"] == ["origin", "mirror"]

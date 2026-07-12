@@ -299,7 +299,7 @@ def _validate_cron(value: str) -> None:
 class CampaignConfig(_Model):
     schedule: str | None = None  # 5-field cron, None = manual-only
     timezone: str = "UTC"
-    grace_period_hours: float = Field(default=6.0, ge=0)
+    grace_period_hours: float = Field(default=6.0, ge=0, allow_inf_nan=False)
     manual_run_behavior: Literal["allow", "forbid"] = "allow"
 
     @field_validator("schedule")
@@ -502,8 +502,12 @@ def load_config(path: str | Path) -> ProbeConfig:
 
 # ---------------------------------------------------------------------- digest
 
-# any URL userinfo (user, user:password, or bare token) — masked entirely
-_URL_USERINFO = re.compile(r"://[^@/\s]+@")
+# URL userinfo: the PASSWORD is masked, the principal is KEPT — a reader and
+# a writer login to the same server must hash differently (they may see
+# different rows, and the digest guards resume identity). A single-component
+# userinfo (bare token) is masked entirely: it is a credential.
+_URL_USERINFO_WITH_PASSWORD = re.compile(r"://([^:@/\s]+):[^@/\s]*@")
+_URL_USERINFO_BARE = re.compile(r"://[^:@/\s]+@")
 
 _SECRET_NAMES = (
     "password", "passwd", "pwd", "token", "access_token", "secret",
@@ -539,7 +543,8 @@ def _redact(value):
     if isinstance(value, list):
         return [_redact(item) for item in value]
     if isinstance(value, str):
-        value = _URL_USERINFO.sub("://***@", value)
+        value = _URL_USERINFO_WITH_PASSWORD.sub(r"://\1:***@", value)
+        value = _URL_USERINFO_BARE.sub("://***@", value)
         return _SECRET_PARAM.sub(lambda m: f"{m.group(1)}{m.group(2)}***", value)
     return value
 
@@ -581,4 +586,11 @@ def compose_campaign(configs: list[ProbeConfig]) -> None:
             "all config files in one campaign must declare the SAME campaign "
             "settings (schedule/timezone/grace) — 'Next update expected by' is "
             f"a campaign property; found {len(campaigns)} distinct ones"
+        )
+    deliveries = {config.delivery for config in configs}
+    if len(deliveries) > 1:
+        raise ConfigError(
+            "all config files in one campaign must declare the SAME delivery "
+            "settings (remotes/refs/worktree) or none — delivery is owned by "
+            f"the one campaign command; found {len(deliveries)} distinct ones"
         )

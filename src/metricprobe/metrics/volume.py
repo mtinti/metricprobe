@@ -200,6 +200,23 @@ def assess_volume(
                 run.append(month)
             else:
                 run = []
+        # "ending at the most recent mature month" is a LIVE claim: when a
+        # month between the run's end and the latest possible mature month is
+        # entirely ABSENT (an interior gap — already RED as VOLUME_GAP), the
+        # run does not extend to the present and must not read as a collapse.
+        # Data that simply ENDS at the run is different: nothing observed
+        # contradicts the claim (staleness is freshness's verdict).
+        horizon_edge = as_of - pd.Timedelta(days=completion.horizon)
+        latest_possible = pd.Period(horizon_edge, freq="M")
+        if month_end(latest_possible) > horizon_edge:
+            latest_possible -= 1
+        if run:
+            cutoff = min(latest_possible, months[-1])
+            if run[-1] < cutoff and any(
+                month not in volumes
+                for month in pd.period_range(run[-1] + 1, cutoff, freq="M")
+            ):
+                run = []
         if len(run) >= COLLAPSE_MIN_RUN:  # ends at the most recent mature month
             collapse_run = run
             statuses.append(

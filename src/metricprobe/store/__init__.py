@@ -219,11 +219,16 @@ class ParquetStore:
     def table_names(self, run_id: str) -> list[str]:
         return sorted(p.stem for p in self._committed(run_id).glob("*.parquet"))
 
-    def prune(self, keep: int) -> list[str]:
-        """Drop the oldest committed runs beyond `keep`; returns dropped ids."""
+    def prune(self, keep: int, protect: str | None = None) -> list[str]:
+        """Drop the oldest committed runs beyond `keep`; returns dropped ids.
+        `protect` shields the run the CALLER is still completing — a resumed
+        old run keeps its original run_at and would otherwise be pruned as
+        the oldest run before its later stages can render it."""
         runs = self.list_runs()
         dropped = []
         for manifest in runs[: max(0, len(runs) - keep)]:
+            if manifest["run_id"] == protect:
+                continue
             shutil.rmtree(self._committed(manifest["run_id"]))
             dropped.append(manifest["run_id"])
         return dropped
@@ -293,13 +298,24 @@ class MssqlStore:
                 committed = conn.execute(
                     sa.text(f"SELECT COUNT(*) FROM {self.schema}.{self.MANIFEST_TABLE}")
                 ).scalar_one()
-                if committed:
+                staging_columns = set(
+                    conn.execute(
+                        sa.text(
+                            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                            "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t"
+                        ),
+                        {"s": self.schema, "t": self.STAGING_TABLE},
+                    ).scalars()
+                )
+                if committed or "claim_token" not in staging_columns:
+                    # committed runs OR old-shape infrastructure (a staging
+                    # table without claim_token): stamping it current would
+                    # only defer the failure to the first begin_run
                     raise RuntimeError(
-                        f"store schema {self.schema!r} holds committed runs but no "
-                        "physical-schema version marker (it predates "
-                        f"snapshot schema v{SNAPSHOT_SCHEMA_VERSION}); its column "
-                        "types cannot be trusted — migrate the data or point "
-                        "the store at a fresh schema"
+                        f"store schema {self.schema!r} predates snapshot schema "
+                        f"v{SNAPSHOT_SCHEMA_VERSION} (committed runs without a "
+                        "version marker, or old infrastructure tables); migrate "
+                        "the data or point the store at a fresh schema"
                     )
                 conn.execute(
                     sa.text(
@@ -392,11 +408,9 @@ class MssqlStore:
         if run_id not in self._staged:
             raise FileNotFoundError(f"run {run_id!r} has no open staging area")
         _require_stamped(frame)
-        frame.to_sql(
-            f"mp_{name}", self.engine, schema=self.schema, if_exists="append", index=False
-        )
-        # record ownership: sweeping deletes only ever touch CATALOGED tables,
-        # never a foreign table that merely shares the mp_ prefix
+        # record the write INTENT (ownership catalog + in-memory name list)
+        # BEFORE any row lands: a failure mid-append must leave a state the
+        # abort sweep fully covers, never rows in an unrecorded table
         with self.engine.begin() as conn:
             conn.execute(
                 sa.text(
@@ -407,6 +421,9 @@ class MssqlStore:
                 {"name": f"mp_{name}"},
             )
         self._staged[run_id]["names"].append(name)
+        frame.to_sql(
+            f"mp_{name}", self.engine, schema=self.schema, if_exists="append", index=False
+        )
 
     def commit_run(self, run_id: str, manifest: dict) -> None:
         if run_id not in self._staged:
@@ -571,12 +588,14 @@ class MssqlStore:
         }
         return sorted((cataloged & existing) - infrastructure)
 
-    def prune(self, keep: int) -> list[str]:
-        """Same retention contract as the parquet store."""
+    def prune(self, keep: int, protect: str | None = None) -> list[str]:
+        """Same retention contract as the parquet store (incl. `protect`)."""
         runs = self.list_runs()
         dropped = []
         for manifest in runs[: max(0, len(runs) - keep)]:
             run_id = manifest["run_id"]
+            if run_id == protect:
+                continue
             with self.engine.begin() as conn:
                 for name in self._data_tables():
                     conn.execute(

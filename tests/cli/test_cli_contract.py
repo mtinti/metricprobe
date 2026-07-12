@@ -541,3 +541,23 @@ def test_window_and_as_of_usage_errors_are_exit_1(tmp_path, demo_db):
                    "--window", "12m", "--year", "2024") == 1
     # a malformed --as-of is a usage error, not a traceback
     assert run_cli("--config", config, "--as-of", "not-a-date") == 1
+
+
+def test_timezone_qualified_as_of_is_normalized(tmp_path, demo_db):
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    # a +02:00-qualified cutoff analyses (its UTC instant), never exits 1
+    assert run_cli("--config", config, "--as-of", "2025-07-02T02:00:00+02:00",
+                   "--run-id", "r-tz") == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    assert manifest["as_of"] == "2025-07-02T00:00:00"  # the naive UTC instant
+
+
+def test_manual_runs_can_be_forbidden(tmp_path, demo_db, monkeypatch):
+    config = write_config(
+        tmp_path, demo_db, [table_entry("events", "orders_main")],
+        campaign={"manual_run_behavior": "forbid"},
+    )
+    monkeypatch.delenv("METRICPROBE_SCHEDULED", raising=False)
+    assert run_cli("--config", config, "--as-of", AS_OF) == 1  # manual: refused
+    monkeypatch.setenv("METRICPROBE_SCHEDULED", "1")
+    assert run_cli("--config", config, "--as-of", AS_OF) == 0  # scheduled: runs

@@ -700,24 +700,44 @@ def _stage_render(configs: list[ProbeConfig], store, run_id: str):
     if final.exists():
         final.rename(previous)
     tmp.rename(final)
+    try:
+        store.record_stage(
+            run_id, "render",
+            {"completed_at": _wall().isoformat(), "artifacts": str(final)},
+        )
+    except BaseException:
+        # the stage is only real once RECORDED: roll the swap back so a
+        # failed render leaves the previous complete artifacts in place
+        shutil.rmtree(final)
+        if previous.exists():
+            previous.rename(final)
+        raise
     if previous.exists():
         shutil.rmtree(previous)
-    store.record_stage(
-        run_id, "render", {"completed_at": _wall().isoformat(), "artifacts": str(final)}
-    )
     return final
 
 
 def _stage_publish(configs: list[ProbeConfig], store, run_id: str, run_at: str) -> list[str]:
     """PUBLISHED: push the rendered dashboard to every configured remote.
     deliver() verifies the artifact marker BELONGS to run_id and prepares
-    every remote before pushing any; the stage is recorded only after EVERY
-    push succeeded."""
-    from metricprobe.publish import deliver
+    every remote before pushing any; PUBLISHED is recorded only after EVERY
+    push succeeded. Cross-remote pushes cannot be transactional — a partial
+    push (some remotes updated, then a failure) is recorded HONESTLY as
+    publish_partial so the manifest never pretends nothing happened; the
+    retry converges (no-change commits, monotonic guard passes equal runs)."""
+    from metricprobe.publish import PartialDelivery, deliver
 
-    pushed = deliver(
-        _artifacts_dir(configs[0], run_id), configs[0].delivery, run_id, run_at
-    )
+    try:
+        pushed = deliver(
+            _artifacts_dir(configs[0], run_id), configs[0].delivery, run_id, run_at
+        )
+    except PartialDelivery as partial:
+        store.record_stage(
+            run_id,
+            "publish_partial",
+            {"completed_at": _wall().isoformat(), "remotes": partial.pushed},
+        )
+        raise
     store.record_stage(
         run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": pushed}
     )
@@ -737,17 +757,26 @@ def _run_finishing_stages(
             print(f"metricprobe: render stage failed: {error}", file=sys.stderr)
             return 1
     else:
-        # resuming publish alone: the rendered artifacts must exist AND belong
-        # to this run — anything else needs --resume-from render
+        # resuming publish alone: the RENDER STAGE RECORD must exist (the
+        # marker alone can be a swap whose record failed and rolled back) and
+        # the artifacts must belong to this run — else resume from render
         import json as _json
 
         from metricprobe.publish import PUBLISHED_MARKER
 
+        manifest = next(
+            (m for m in store.list_runs() if m["run_id"] == run_id), None
+        )
         marker = _artifacts_dir(configs[0], run_id) / PUBLISHED_MARKER
-        if not marker.exists() or _json.loads(marker.read_text())["run_id"] != run_id:
+        if (
+            manifest is None
+            or "render" not in manifest.get("stages", {})
+            or not marker.exists()
+            or _json.loads(marker.read_text())["run_id"] != run_id
+        ):
             print(
-                f"metricprobe: no rendered artifacts for run {run_id!r}; "
-                "resume from the render stage instead",
+                f"metricprobe: run {run_id!r} has no recorded render stage "
+                "with matching artifacts; resume from the render stage instead",
                 file=sys.stderr,
             )
             return 1
@@ -766,6 +795,19 @@ def cmd_run(args) -> int:
         compose_campaign(configs)
         if args.run_id:
             validate_run_id(args.run_id)
+        if (
+            configs[0].campaign.manual_run_behavior == "forbid"
+            and not os.environ.get("METRICPROBE_SCHEDULED")
+        ):
+            # scheduled invocations declare themselves via METRICPROBE_SCHEDULED
+            # (set by the workflow); everything else is a manual run
+            print(
+                "metricprobe: this campaign forbids manual runs "
+                "(campaign.manual_run_behavior: forbid); scheduled invocations "
+                "set METRICPROBE_SCHEDULED=1",
+                file=sys.stderr,
+            )
+            return 1
         if configs[0].delivery is not None:
             # fail BEFORE a long analysis, with the actionable install hint
             from metricprobe.report import ensure_static_export_available
@@ -779,8 +821,11 @@ def cmd_run(args) -> int:
         # pd raises DateParseError (a ValueError) on malformed --as-of: a
         # usage error must exit 1, never escape as a traceback. as_of stays
         # NAIVE (it compares against naive event months throughout the
-        # metrics); run_at is the aware wall clock.
-        as_of = pd.Timestamp(args.as_of) if args.as_of else run_at.tz_localize(None)
+        # metrics); a timezone-qualified value is normalized to its UTC
+        # instant first. run_at is the aware wall clock.
+        as_of = pd.Timestamp(args.as_of) if args.as_of else run_at
+        if as_of.tzinfo is not None:
+            as_of = as_of.tz_convert("UTC").tz_localize(None)
         window_start, window_end = _parse_window(args, as_of)
     except (ConfigError, ValueError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
@@ -944,7 +989,9 @@ def cmd_run(args) -> int:
         return 1
     if configs[0].store.retention_runs:
         try:
-            store.prune(configs[0].store.retention_runs)
+            # protect THIS run: a resumed old run keeps its original run_at
+            # and would otherwise be pruned before its later stages render it
+            store.prune(configs[0].store.retention_runs, protect=run_id)
         except Exception as error:  # retention is best-effort AFTER the commit
             print(f"metricprobe: warning: retention pruning failed: {error}", file=sys.stderr)
     reds = [s for s in statuses if s.severity is Severity.RED]
@@ -1008,6 +1055,22 @@ def _latest_run_id(store, run_id: str | None) -> str:
     return runs[-1]["run_id"]
 
 
+def _require_matching_digest(store, run_id: str, configs: list[ProbeConfig]) -> None:
+    """Standalone report/publish render UNDER THE SUPPLIED CONFIG (probe
+    flags like suppress_small_counts come from it) — an unmatched config
+    could re-render a suppressed run with suppression off, so the digest
+    must match the committed run's."""
+    manifest = next((m for m in store.list_runs() if m["run_id"] == run_id), None)
+    if manifest is None:
+        raise ConfigError(f"run {run_id!r} is not committed")
+    if manifest["config_digest"] != _combined_digest(configs):
+        raise ConfigError(
+            f"config digest mismatch — the supplied config is not the one run "
+            f"{run_id!r} was created with; rendering under a different config "
+            "(different suppression/presentation flags) is refused"
+        )
+
+
 def cmd_report(args) -> int:
     """Standalone re-render of a committed run's interactive report."""
     from metricprobe.report import ensure_static_export_available, generate_report
@@ -1018,6 +1081,7 @@ def cmd_report(args) -> int:
         ensure_static_export_available()
         store = open_store(configs[0].store)
         run_id = _latest_run_id(store, args.run_id)
+        _require_matching_digest(store, run_id, configs)
         path = generate_report(store, run_id, configs, args.out)
     except (ConfigError, ValueError, RuntimeError, FileNotFoundError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
@@ -1066,6 +1130,7 @@ def cmd_publish(args) -> int:
         if not args.out:
             print("metricprobe: pass --out DIR (or --deliver)", file=sys.stderr)
             return 1
+        _require_matching_digest(store, run_id, configs)
         readme = emit_dashboard(store, run_id, configs, args.out)
         print(f"run {run_id}: dashboard written to {readme.parent}")
     except (ConfigError, ValueError, RuntimeError, FileNotFoundError) as error:

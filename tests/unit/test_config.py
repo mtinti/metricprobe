@@ -535,3 +535,41 @@ def test_non_finite_analysis_params_rejected():
                 ProbeConfig.model_validate(
                     minimal_config(tables=[minimal_table(analysis={field: bad})])
                 )
+
+
+def test_digest_masks_the_password_but_keeps_the_principal():
+    # rotation of the PASSWORD leaves the digest unchanged...
+    reader_one = _cfg("mssql+pymssql://reader:demo_pw_one@localhost/demo")
+    reader_two = _cfg("mssql+pymssql://reader:demo_pw_two@localhost/demo")
+    assert config_digest(reader_one) == config_digest(reader_two)
+    # ...but a DIFFERENT PRINCIPAL is a different config (it may see
+    # different rows; resume must not cross principals)
+    writer = _cfg("mssql+pymssql://writer:demo_pw_one@localhost/demo")
+    assert config_digest(reader_one) != config_digest(writer)
+
+
+def test_campaign_composition_requires_identical_delivery():
+    delivery = {"remotes": [{"name": "origin", "url": "https://forge.example/d.git"}]}
+    with_delivery = ProbeConfig.model_validate(minimal_config(delivery=delivery))
+    without = ProbeConfig.model_validate(
+        minimal_config(tables=[minimal_table(probe_name="other_probe")])
+    )
+    with pytest.raises(ConfigError, match="SAME delivery"):
+        compose_campaign([with_delivery, without])
+    other_remote = ProbeConfig.model_validate(
+        minimal_config(
+            tables=[minimal_table(probe_name="other_probe")],
+            delivery={"remotes": [{"name": "mirror",
+                                   "url": "https://forge.example/m.git"}]},
+        )
+    )
+    with pytest.raises(ConfigError, match="SAME delivery"):
+        compose_campaign([with_delivery, other_remote])
+
+
+def test_infinite_grace_period_rejected():
+    for bad in [float("inf"), float("nan")]:
+        with pytest.raises(ValidationError):
+            ProbeConfig.model_validate(
+                minimal_config(campaign={"grace_period_hours": bad})
+            )

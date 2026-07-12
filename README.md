@@ -21,7 +21,9 @@ default, or a SQL Server schema behind a config flag.
 
 ```
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .
+# the supported install path is the release tag (PyPI is phase 2):
+.venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.0"
+# (or, from a checkout: pip install -e ".[export]")
 .venv/bin/metricprobe discover --url "$DB_URL" --database MyDb --out probe.yaml
 # review the draft: confirm the event/load column guesses, then
 .venv/bin/metricprobe run --config probe.yaml
@@ -43,6 +45,10 @@ the repo front page the dashboard.
 [`reports/README.md`](reports/README.md) — four fixed-seed synthetic
 databases (retail orders, IoT telemetry, card settlements, health episode
 records) with healthy and unhealthy twins, so every verdict is visible.
+A synthetic-data sample (an orders feed's completion curves):
+
+![synthetic example: completion curves](reports/img/orders_completion_curves.svg)
+
 Regenerate it with `python examples/demo.py --out reports` (synthetic data
 only; CI diff-checks it). `examples/demo_config.yaml` is an annotated config
 template and `examples/workflow.yml` a scheduled-campaign workflow template.
@@ -53,7 +59,7 @@ Rendering figures to PNG/SVG uses Plotly's **kaleido**, which requires an
 installed **Chrome or Chromium**:
 
 ```
-pip install "metricprobe[export]"
+pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.0"
 ```
 
 - Linux/macOS/Windows with Chrome already installed: nothing else to do.

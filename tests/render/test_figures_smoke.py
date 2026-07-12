@@ -136,3 +136,19 @@ def test_suppression_blanks_small_counts_in_figure_payloads(dashboard_run):
     assert display_count(None, suppressed=True) == "<5"
     assert display_count(7, suppressed=True) == "7"
     assert display_count(None, suppressed=False) == "—"
+
+
+def test_suppression_is_by_magnitude_and_covers_runs():
+    import pandas as pd
+
+    from metricprobe.viz.presentation import suppress_small_counts
+
+    parity = pd.DataFrame({"probe": ["p"] * 3, "diff": [-100, -3, 4]})
+    masked = suppress_small_counts("parity_months", parity)
+    # the legitimate -100 SURVIVES; ±small blanks
+    assert masked["diff"].tolist()[0] == -100
+    assert pd.isna(masked["diff"]).tolist() == [False, True, True]
+    batches = pd.DataFrame({"probe": ["p"], "runs": [3], "null_batch_rows": [2]})
+    masked = suppress_small_counts("batch_months", batches)
+    assert pd.isna(masked["runs"]).all()  # runs is a count: suppressible
+    assert pd.isna(masked["null_batch_rows"]).all()
