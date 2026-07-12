@@ -6,40 +6,40 @@
 
 **Next update expected by:** 2025-07-28 12:00 UTC
 
-Legend: ✅ green · ⚠️ amber · 🔴 red · ❓ indeterminate · ⏳ insufficient history · ➖ skipped
+Legend: ✅ green · ⚠️ amber · 🔴 red · ❓ indeterminate · ⏳ insufficient history · ➖ skipped. p95 = mean ± std days for a month to reach 95% of its final rows (across mature months; "> cap" when censored past lag_cap_days).
 
 ## demo_finance
 
-| Table | Probe | Healthy? | Updating? | Complete back to |
-| --- | --- | :---: | :---: | --- |
-| main.settlements | settlements | ✅ | ✅ | 2025-06-12 |
-| main.card_disputes | card_disputes | 🔴 | ✅ | 2025-06-12 |
+| Table | Probe | Healthy? | Updating? | Complete back to | p95 (days) | p95 (months) |
+| --- | --- | :---: | :---: | --- | --- | --- |
+| main.settlements | settlements | ✅ | ✅ | 2025-06-12 | 40 ± 1 d | 1.3 mo |
+| main.card_disputes | card_disputes | 🔴 | ✅ | 2025-06-12 | 39 ± 1 d | 1.3 mo |
 
 ## demo_health
 
-| Table | Probe | Healthy? | Updating? | Complete back to |
-| --- | --- | :---: | :---: | --- |
-| main.episodes | episodes | ✅ | ✅ | 2025-06-08 |
-| main.registry | registry | ✅ | ✅ | 2025-06-11 |
+| Table | Probe | Healthy? | Updating? | Complete back to | p95 (days) | p95 (months) |
+| --- | --- | :---: | :---: | --- | --- | --- |
+| main.episodes | episodes | ✅ | ✅ | 2025-06-08 | 41 ± 2 d | 1.4 mo |
+| main.registry | registry | ✅ | ✅ | 2025-06-11 | 38 ± 2 d | 1.3 mo |
 
 ## demo_retail
 
-| Table | Probe | Healthy? | Updating? | Complete back to |
-| --- | --- | :---: | :---: | --- |
-| main.orders | orders | ✅ | ✅ | 2025-07-03 |
-| main.returns | returns | 🔴 | ✅ | 2025-07-02 |
-| main.shipments | shipments | ❓ | ✅ | 2025-07-09 |
-| main.shipments_replica | shipments_replica | ✅ | ✅ | 2025-07-09 |
-| main.decommissioned_feed | decommissioned_feed | ➖ | ➖ | — |
+| Table | Probe | Healthy? | Updating? | Complete back to | p95 (days) | p95 (months) |
+| --- | --- | :---: | :---: | --- | --- | --- |
+| main.orders | orders | ✅ | ✅ | 2025-07-03 | 19 ± 1 d | 0.6 mo |
+| main.returns | returns | 🔴 | ✅ | 2025-07-02 | 19 ± 1 d | 0.6 mo |
+| main.shipments | shipments | ❓ | ✅ | 2025-07-09 | 13 ± 1 d | 0.4 mo |
+| main.shipments_replica | shipments_replica | ✅ | ✅ | 2025-07-09 | 13 ± 1 d | 0.4 mo |
+| main.decommissioned_feed | decommissioned_feed | ➖ | ➖ | — | — | — |
 
 ## demo_sensors
 
-| Table | Probe | Healthy? | Updating? | Complete back to |
-| --- | --- | :---: | :---: | --- |
-| main.telemetry | telemetry | ✅ | ✅ | 2025-07-20 |
-| main.device_pings | device_pings | 🔴 | 🔴 | 2025-07-20 |
-| main.gateway_logs | gateway_logs | ⚠️ | ✅ | 2025-07-20 |
-| main.new_feed | new_feed | ⏳ | ✅ | — |
+| Table | Probe | Healthy? | Updating? | Complete back to | p95 (days) | p95 (months) |
+| --- | --- | :---: | :---: | --- | --- | --- |
+| main.telemetry | telemetry | ✅ | ✅ | 2025-07-20 | 3 ± 0 d | 0.1 mo |
+| main.device_pings | device_pings | 🔴 | 🔴 | 2025-07-20 | 3 ± 0 d | 0.1 mo |
+| main.gateway_logs | gateway_logs | ⚠️ | ✅ | 2025-07-20 | 3 ± 0 d | 0.1 mo |
+| main.new_feed | new_feed | ⏳ | ✅ | — | — | — |
 
 Full interactive report: [report.html](report.html) (download to open).
 

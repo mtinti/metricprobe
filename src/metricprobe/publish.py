@@ -327,6 +327,52 @@ def _badge(severity: Severity | None) -> str:
     return SEVERITY_BADGES.get(severity, "➖")
 
 
+_DAYS_PER_MONTH = 30.4375  # mean Gregorian month; presentation only
+
+
+def _mature_p95_censored(frames: dict[str, pd.DataFrame], probe: str) -> bool:
+    """True when a MATURE month's p95 is censored past the lag cap — the
+    reason the mature summary is refused. Checked over the REPORTED window
+    (percentile rows are window-bounded), so an old censored month outside
+    the window degrades to the plain em-dash, never a wrong number."""
+    volumes = frames.get("month_volumes", pd.DataFrame())
+    percentiles = frames.get("completion_percentiles", pd.DataFrame())
+    if volumes.empty or percentiles.empty:
+        return False
+    mature = set(
+        volumes[(volumes["probe"] == probe) & (volumes["state"] == "mature")]["month"]
+    )
+    mine = percentiles[
+        (percentiles["probe"] == probe)
+        & (percentiles["pct"] == 95)
+        & percentiles["month"].isin(mature)
+    ]
+    return bool(mine["over_cap"].fillna(False).astype(bool).any())
+
+
+def _p95_cells(
+    frames: dict[str, pd.DataFrame], probe: str, table
+) -> tuple[str, str]:
+    """('12 ± 3 d', '0.4 mo') from the mature p95 summary; '> cap' when a
+    mature month is censored past lag_cap_days; '—' when there is nothing
+    classifiable (insufficient history, skipped, aborted)."""
+    summaries = frames.get("completion_summary", pd.DataFrame())
+    mine = summaries[summaries["probe"] == probe] if not summaries.empty else summaries
+    if not mine.empty:
+        mean = mine.iloc[0].get("p95_mean")
+        std = mine.iloc[0].get("p95_std")
+        if mean is not None and not pd.isna(mean):
+            spread = "" if std is None or pd.isna(std) else f" ± {float(std):.0f}"
+            return (
+                f"{float(mean):.0f}{spread} d",
+                f"{float(mean) / _DAYS_PER_MONTH:.1f} mo",
+            )
+    if _mature_p95_censored(frames, probe):
+        cap = table.analysis.lag_cap_days
+        return f"> {cap} d", f"> {cap / _DAYS_PER_MONTH:.1f} mo"
+    return "—", "—"
+
+
 def _status_rows(frames: dict[str, pd.DataFrame], configs: list[ProbeConfig]) -> list[dict]:
     statuses = frames.get("statuses", pd.DataFrame())
     summaries = frames.get("completion_summary", pd.DataFrame())
@@ -344,6 +390,7 @@ def _status_rows(frames: dict[str, pd.DataFrame], configs: list[ProbeConfig]) ->
                 value = summary.iloc[0].get("complete_back_to")
                 if value is not None and not pd.isna(value):
                     back_to = str(value)
+        p95_days, p95_months = _p95_cells(frames, probe, table)
         rows.append(
             {
                 "database": table.database,
@@ -352,6 +399,8 @@ def _status_rows(frames: dict[str, pd.DataFrame], configs: list[ProbeConfig]) ->
                 "healthy": _badge(healthy),
                 "updating": _badge(updating),
                 "back_to": back_to,
+                "p95_days": p95_days,
+                "p95_months": p95_months,
             }
         )
     return rows
@@ -416,21 +465,27 @@ def emit_dashboard(
     lines.append("")
     lines.append(
         "Legend: ✅ green · ⚠️ amber · 🔴 red · ❓ indeterminate · "
-        "⏳ insufficient history · ➖ skipped"
+        "⏳ insufficient history · ➖ skipped. "
+        "p95 = mean ± std days for a month to reach 95% of its final rows "
+        "(across mature months; \"> cap\" when censored past lag_cap_days)."
     )
     lines.append("")
     rows = _status_rows(frames, configs)
     for database in sorted({row["database"] for row in rows}):
         lines.append(f"## {database}")
         lines.append("")
-        lines.append("| Table | Probe | Healthy? | Updating? | Complete back to |")
-        lines.append("| --- | --- | :---: | :---: | --- |")
+        lines.append(
+            "| Table | Probe | Healthy? | Updating? | Complete back to | "
+            "p95 (days) | p95 (months) |"
+        )
+        lines.append("| --- | --- | :---: | :---: | --- | --- | --- |")
         for row in rows:
             if row["database"] != database:
                 continue
             lines.append(
                 f"| {row['table']} | {row['probe']} | "
-                f"{row['healthy']} | {row['updating']} | {row['back_to']} |"
+                f"{row['healthy']} | {row['updating']} | {row['back_to']} | "
+                f"{row['p95_days']} | {row['p95_months']} |"
             )
         lines.append("")
     lines.append("Full interactive report: [report.html](report.html) (download to open).")

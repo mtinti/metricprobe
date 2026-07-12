@@ -42,18 +42,27 @@ def test_readme_status_block_and_table(dashboard_dir, dashboard_run):
     # every probe appears as a table row answering the three questions
     for table in config.tables:
         assert table.probe_name in text
-    header = "| Table | Probe | Healthy? | Updating? | Complete back to |"
+    header = (
+        "| Table | Probe | Healthy? | Updating? | Complete back to | "
+        "p95 (days) | p95 (months) |"
+    )
     assert header in text
     # the pathology mix exercises the FULL vocabulary
     for badge in ("✅", "⚠️", "🔴", "⏳"):
         assert badge in text, f"badge {badge} never rendered"
     assert "❓" in text  # parity_b holds duplicate-free keys; parity a vs b mismatch is RED,
     # while read_uncommitted/prereq INDETERMINATE appears via the legend at minimum
-    # a healthy probe promises a concrete completeness date
+    # a healthy probe promises a concrete completeness date AND its p95
+    # latency in both units (mean ± std days, fractional months)
     healthy_row = next(
         line for line in text.splitlines() if "volume_spike_ok_probe" in line
     )
     assert re.search(r"\d{4}-\d{2}-\d{2}", healthy_row), healthy_row
+    assert re.search(r"\| \d+ ± \d+ d \| \d+\.\d mo \|", healthy_row), healthy_row
+    # a probe with nothing classifiable renders em-dashes, never a number
+    tiny_row = next(line for line in text.splitlines() if "| tiny_probe |" in line)
+    assert tiny_row.rstrip().endswith("|")
+    assert "p95 = mean ± std days" in text  # the legend explains the columns
 
 
 def test_image_links_are_relative_and_exist(dashboard_dir):
@@ -165,3 +174,41 @@ def test_cron_handles_leap_days_and_dst():
     )
     assert fire == pd.Timestamp("2026-03-29 06:00", tz="Europe/London")
     assert str(fire.tz) == "Europe/London" and fire.hour == 6
+
+
+def test_p95_cells_render_every_edge(dashboard_run):
+    """The p95 columns are honest at the edges: censored mature months say
+    '> cap', unclassifiable probes say '—', healthy ones carry mean ± std."""
+    import pandas as pd
+
+    from metricprobe.publish import _p95_cells
+
+    _, _, config = dashboard_run
+    table = config.tables[0]
+    healthy = {
+        "completion_summary": pd.DataFrame(
+            {"probe": ["p"], "p95_mean": [12.4], "p95_std": [2.6]}
+        )
+    }
+    assert _p95_cells(healthy, "p", table) == ("12 ± 3 d", "0.4 mo")
+    censored = {
+        "completion_summary": pd.DataFrame(
+            {"probe": ["p"], "p95_mean": [None], "p95_std": [None]}
+        ),
+        "month_volumes": pd.DataFrame(
+            {"probe": ["p"], "month": ["2024-01"], "state": ["mature"]}
+        ),
+        "completion_percentiles": pd.DataFrame(
+            {"probe": ["p"], "month": ["2024-01"], "pct": [95], "over_cap": [True]}
+        ),
+    }
+    days, months = _p95_cells(censored, "p", table)
+    assert days == f"> {table.analysis.lag_cap_days} d"
+    assert months.startswith("> ") and months.endswith(" mo")
+    # censoring on an IMMATURE month is not a mature-summary censoring
+    immature = dict(censored)
+    immature["month_volumes"] = pd.DataFrame(
+        {"probe": ["p"], "month": ["2024-01"], "state": ["immature"]}
+    )
+    assert _p95_cells(immature, "p", table) == ("—", "—")
+    assert _p95_cells({}, "p", table) == ("—", "—")
