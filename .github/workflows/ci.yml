@@ -24,6 +24,16 @@ jobs:
           METRICPROBE_LEAK_MARKERS: ${{ secrets.METRICPROBE_LEAK_MARKERS }}
       - run: .venv/bin/python -m ruff check .
       - run: .venv/bin/python -m pytest -m "not equivalence"
+      # the committed demo dashboard must match a fresh fixed-seed build
+      # (byte-stable: frozen clock/run id/git, canonicalized SVGs, pinned
+      # plotly/kaleido and kaleido's pinned Chrome build)
+      - run: .venv/bin/python scripts/check_demo_current.py
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: regenerated-demo-dashboard
+          path: reports/
+          if-no-files-found: ignore
 
   # SQL Server container images exist for Linux x86-64 only (the sole platform
   # Microsoft supports). On GitHub the ubuntu-24.04 label resolves to x86-64; on

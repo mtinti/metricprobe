@@ -39,6 +39,14 @@ forge-renderable markdown dashboard (README + SVG figures + self-contained
 HTML report) from the latest committed run, so a scheduled workflow can make
 the repo front page the dashboard.
 
+**What the output looks like:** see the committed demo dashboard at
+[`reports/README.md`](reports/README.md) — four fixed-seed synthetic
+databases (retail orders, IoT telemetry, card settlements, health episode
+records) with healthy and unhealthy twins, so every verdict is visible.
+Regenerate it with `python examples/demo.py --out reports` (synthetic data
+only; CI diff-checks it). `examples/demo_config.yaml` is an annotated config
+template and `examples/workflow.yml` a scheduled-campaign workflow template.
+
 ## Static image export (report/publish)
 
 Rendering figures to PNG/SVG uses Plotly's **kaleido**, which requires an

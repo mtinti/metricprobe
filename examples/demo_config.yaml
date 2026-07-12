@@ -1,0 +1,59 @@
+# Example metricprobe campaign config (placeholder values ONLY — everything
+# environment-shaped enters via YOUR config, never this repository).
+#
+# Connection URLs are env-var expandable: ${PROD_DB_URL} is read at load time.
+# Trusted connections and SQL logins are both supported, e.g.
+#   mssql+pyodbc://@SERVER/DB?driver=ODBC+Driver+18+for+SQL+Server&Trusted_Connection=yes&TrustServerCertificate=yes
+
+schema_version: 3
+connection_url: ${METRICPROBE_DB_URL}
+
+campaign:
+  schedule: "0 6 * * 1"      # Mondays 06:00 (5-field cron)
+  timezone: UTC
+  grace_period_hours: 6      # "Next update expected by" = next fire + grace
+
+store:
+  path: ./metricprobe_store  # parquet/duckdb snapshot store (default backend)
+  retention_runs: 50
+
+# Uncomment to let `metricprobe run` own render + delivery (the dashboard
+# repo's front page becomes the status page). Tokens are env var NAMES.
+# delivery:
+#   worktree: ./dashboard_worktree
+#   remotes:
+#     - name: origin
+#       url: https://forge.example.com/team/dashboard.git
+#       ref: main
+#       token_env: DASHBOARD_PUSH_TOKEN
+
+tables:
+  - probe_name: orders_main
+    database: demo_db          # database.schema.table — always from config
+    schema: dbo
+    table: orders
+    event_time: order_date     # when the fact happened
+    load_time: loaded_at       # when the row landed in the warehouse
+    source_insert_time: src_inserted_at   # optional: dual-lag split
+    load_batch_col: batch_id   # optional: batch metrics + batch freshness
+    key_cols: [order_id]       # optional: uniqueness check
+    resolution:                # REQUIRED for every configured time column
+      order_date: date
+      loaded_at: datetime
+      src_inserted_at: datetime
+
+  - probe_name: episodes_via_lookup
+    database: demo_db
+    schema: dbo
+    table: episodes
+    load_time: loaded_at
+    event_time_via:            # borrow the event time from a related table
+      join_table: demo_db.dbo.referrals
+      on:
+        - base_col: referral_id
+          lookup_col: id
+      column: referral_date
+    resolution:
+      referral_date: date
+      loaded_at: datetime
+    optional: true             # absent table -> skipped with a warning

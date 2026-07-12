@@ -459,4 +459,8 @@ def figures_for_probe(
         )
     if "parity_months" in probe_frames:
         put("parity", parity_figure(probe_frames["parity_months"], probe, proxy))
+    for figure in figures.values():
+        # a font present on the Linux build/CI environments (fonts-liberation)
+        # so committed-SVG text metrics do not float with platform defaults
+        figure.update_layout(font={"family": "Liberation Sans, Arial, sans-serif"})
     return dict(sorted(figures.items(), key=lambda kv: FIGURE_ORDER.index(kv[0])))

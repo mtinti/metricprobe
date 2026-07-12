@@ -114,3 +114,13 @@ def test_placeholder_stems_may_contain_percent_escapes():
     # digest tests use demo%2Fone-style secrets: still placeholder-stemmed
     field = "pass" + "word: demo%2Fone"
     assert scan.content_violations("t.py", field, []) == []
+
+
+def test_generated_plotly_bundle_is_exempt_but_path_checked():
+    # the committed report.html embeds the vendored plotly.js bundle, whose
+    # minified source false-positives the structural checks; only its CONTENT
+    # is exempt — a private-shaped FILE NAME would still be flagged, and the
+    # dashboard's README/SVGs remain fully scanned
+    assert scan.CONTENT_SCAN_EXEMPT == ("reports/report.html",)
+    assert scan.path_violation("reports/report.html") is None
+    assert scan.path_violation("reports/report.private.html") is not None

@@ -1,0 +1,31 @@
+# Generic scheduled-campaign workflow (GitHub Actions; Gitea-compatible
+# subset: checkout + plain `run:` steps). The campaign command owns the WHOLE
+# lifecycle in one process — analyse -> commit -> render -> deliver — so the
+# workflow is ONE invocation, never a chain of publish steps (a nonzero exit
+# mid-chain would make later steps be skipped and hide RED).
+#
+# The exit code IS the alert: 0 = everything green and published;
+# 2 = completed AND published, but at least one table is data-health RED
+# (the job fails -> your normal CI notifications fire; the dashboard shows
+# which table and why); 1 = a stage failed (whatever committed before the
+# failure remains committed and honestly reported; retry with
+# `--resume-from <stage> --run-id <id>`).
+
+name: metricprobe campaign
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # keep in sync with campaign.schedule in the config
+  workflow_dispatch: {}
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m venv .venv
+      - run: .venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.0"
+      - name: campaign (analyse -> render -> publish, one process, exit = alert)
+        env:
+          METRICPROBE_DB_URL: ${{ secrets.METRICPROBE_DB_URL }}
+          DASHBOARD_PUSH_TOKEN: ${{ secrets.DASHBOARD_PUSH_TOKEN }}
+        run: .venv/bin/metricprobe run --config probe.yaml

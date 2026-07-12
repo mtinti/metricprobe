@@ -136,7 +136,7 @@ def generate_report(
         if not figures:
             parts.append("<p>no figures (probe skipped or aborted)</p>")
 
-        def _fragment(figure) -> str:
+        def _fragment(figure, key: str, index: int = index) -> str:
             nonlocal include_js
             fragment = pio.to_html(
                 figure,
@@ -144,6 +144,9 @@ def generate_report(
                 include_plotlyjs=include_js,
                 default_width="100%",
                 default_height="450px",
+                # deterministic div ids: to_html would mint a random uuid per
+                # render, breaking the committed demo's byte-stability
+                div_id=f"mp-fig-{index}-{key}",
             )
             include_js = False
             return fragment
@@ -164,14 +167,14 @@ def generate_report(
                     f"onclick=\"mpShow({index},'heatmap',this)\">Heatmap</button>"
                     f"</div>"
                     f'<div id="mp-{index}-curves" class="mp-pane">'
-                    f"{_fragment(figure)}</div>"
+                    f"{_fragment(figure, key)}</div>"
                     f'<div id="mp-{index}-heatmap" class="mp-pane" '
-                    f'style="display:none">{_fragment(heatmap)}</div>'
+                    f'style="display:none">{_fragment(heatmap, "completion_heatmap")}</div>'
                 )
             elif key == "completion_heatmap" and len(tabbed) == 2:
                 continue  # rendered inside the tab container above
             else:
-                parts.append(_fragment(figure))
+                parts.append(_fragment(figure, key))
     if exports:
         # ONE batched kaleido session (a per-figure Chrome roundtrip is ~7x slower)
         pio.write_images(
