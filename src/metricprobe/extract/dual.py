@@ -9,7 +9,8 @@ FROZEN DUAL SCHEMA (v5 — v1 lacked the lookup-uniqueness guard columns and
 used the pages-only scratch budget; v2's guard saw only joined lookup rows;
 v3 staged a windowed global max; v4 uses the main pass's FULL OUTER shape:
 every lookup row is staged, guard-only artifact rows carry is_probe_row = 0;
-v5 watermarks the base BEFORE the join and adds the physical n_staged_rows).
+v5 watermarks the base BEFORE the join and adds the physical n_staged_rows;
+v6 drops guard-artifact-only cells from the grouped branch).
 Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
@@ -57,7 +58,7 @@ from metricprobe.extract.canonical import (
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 5
+DUAL_SCHEMA_VERSION = 6
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -288,6 +289,16 @@ def build_dual_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))
+        # guard-artifact-only cells are not data (v6), same as the main pass
+        # — but the () GLOBAL row is exempt: it must exist even when the base
+        # is empty (it carries max_lookup_dup, the uniqueness guard's answer
+        # for exactly that degenerate case)
+        .having(
+            sa.or_(
+                sa.func.coalesce(sa.func.sum(staging.c.is_probe_row), 0) > 0,
+                grouping_id == DUAL_GROUPING_SET_IDS["global"],
+            )
+        )
         .limit(table.analysis.result_cell_cap * len(sets) + 1)
     )
 

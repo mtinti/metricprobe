@@ -81,8 +81,11 @@ from metricprobe.status import ReasonCode
 # v5: the as_of watermark moved INSIDE the base subquery for via probes (a
 # post-join filter deleted duplicate lookup keys whose only matches were
 # watermarked out), and n_staged_rows (physical COUNT(*)) joined the result
-# so the scratch/spool row allowances scale with what was actually staged
-CANONICAL_SCHEMA_VERSION = 5
+# so the scratch/spool row allowances scale with what was actually staged.
+# v6: the grouped branch drops cells fed only by guard artifacts
+# (HAVING SUM(is_probe_row) > 0) — they created bogus NULL-alt cells and
+# counted against result_cell_cap
+CANONICAL_SCHEMA_VERSION = 6
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -651,6 +654,10 @@ def build_aggregation_query(table: TableConfig, dialect: str):
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))
+        # cells fed ONLY by lookup-only guard artifacts (is_probe_row = 0)
+        # are not data: without this they surface as bogus NULL-alt cells
+        # and count against result_cell_cap (v6)
+        .having(sa.func.coalesce(sa.func.sum(staging.c.is_probe_row), 0) > 0)
     )
     if table.key_cols:
         distinct_keys = sa.func.count(sa.distinct(staging.c.key_hash))

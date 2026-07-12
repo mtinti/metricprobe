@@ -25,11 +25,12 @@ SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 def test_schema_version_is_pinned():
     # v2: the scan-budget accounting formulas changed (ALGORITHMS section 15);
     # v3: windowed global lookup max; v4: FULL OUTER lookup guard; v5:
-    # pre-join watermark for via probes + physical n_staged_rows;
+    # pre-join watermark for via probes + physical n_staged_rows; v6:
+    # guard-artifact-only cells dropped from the grouped branch;
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 5
+    assert CANONICAL_SCHEMA_VERSION == 6
 
 
 def test_grouping_ids_are_frozen():

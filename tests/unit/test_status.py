@@ -152,7 +152,7 @@ def test_component_versions_are_pinned():
     assert COMPONENT_VERSIONS == {
         "config": 3,  # v3: compare resolution, dialect whitelist, finite params
         "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
-        "canonical": 5,  # v5: pre-join watermark + physical n_staged_rows
-        "dual": 5,  # v5: same pre-join watermark + n_staged_rows
+        "canonical": 6,  # v6: guard-artifact-only cells dropped (HAVING)
+        "dual": 6,  # v6: same, with the () global row exempt
         "snapshot": 4,  # v4: mature summary refused below min_mature_months
     }

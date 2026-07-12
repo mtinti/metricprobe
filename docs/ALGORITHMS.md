@@ -347,7 +347,13 @@ the base subquery for via probes (a post-join filter deleted duplicate
 lookup keys whose only matches were watermarked out) and added the physical
 n_staged_rows count, which the scratch/spool row allowances scale by (the
 admitted probe-row count undercounts when guard-only artifact rows are
-staged).
+staged). v6 drops guard-artifact-only cells from the grouped branch
+(`HAVING SUM(is_probe_row) > 0`): a lookup row no base row references
+carries all-NULL derived keys, and without the filter it materialized a
+bogus NULL-alt (and NULL-month/epoch) cell — row_count 0, but a real cell
+against `result_cell_cap`. The dual pass exempts its () global row from the
+HAVING, because that row must exist even over an empty base — it carries
+max_lookup_dup, the uniqueness guard's answer for exactly that case.
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,

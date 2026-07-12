@@ -402,3 +402,30 @@ def test_failed_rollback_is_recorded_as_partial(campaign, tmp_path, monkeypatch)
     assert "publish" not in manifest["stages"]
     assert manifest["stages"]["publish_partial"]["remotes"] == ["origin"]
     assert "README.md" in _pushed_files(bare)  # origin genuinely still holds it
+
+
+def test_publish_record_failure_rolls_the_remote_back(campaign, monkeypatch):
+    """PUBLISHED is a RECORDED fact, not a pushed one: if recording the
+    publish stage fails after the push landed, the remote is rolled back to
+    its prior (here: empty) state, no publish stage exists, and the retry
+    publishes cleanly."""
+    from metricprobe.store import ParquetStore as PS
+
+    config, store_root, bare = campaign
+
+    real_record = PS.record_stage
+
+    def failing_record(self, run_id, stage, info):
+        if stage == "publish":
+            raise RuntimeError("injected publish-record failure")
+        return real_record(self, run_id, stage, info)
+
+    monkeypatch.setattr(PS, "record_stage", failing_record)
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--run-id", "r-rec"]) == 1
+    # the push was compensated: the remote holds no dashboard
+    assert _pushed_files(bare) == {}
+    monkeypatch.undo()
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--resume-from", "publish", "--run-id", "r-rec"]) == 0
+    assert "README.md" in _pushed_files(bare)

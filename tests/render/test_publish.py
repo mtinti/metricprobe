@@ -216,6 +216,19 @@ def test_p95_cells_render_every_edge(dashboard_run):
     days, months = _p95_cells(censored, "p", table)
     assert days == f"> {table.analysis.lag_cap_days} d"
     assert months.startswith("> ") and months.endswith(" mo")
+    # a censored DUAL (source-side) curve must not claim the MAIN p95 is
+    # "> cap": same reason code, different check
+    dual_censored = {
+        "completion_summary": pd.DataFrame(
+            {"probe": ["p"], "p95_mean": [None], "p95_std": [None]}
+        ),
+        "statuses": pd.DataFrame(
+            {"probe": ["p", "p"], "check": ["completion", "dual_lag"],
+             "severity": ["insufficient_history", "insufficient_history"],
+             "reason": ["insufficient_mature_months", "percentile_over_cap"]}
+        ),
+    }
+    assert _p95_cells(dual_censored, "p", table) == ("—", "—")
     # insufficient WITHOUT censoring stays an em-dash
     insufficient = {
         "completion_summary": pd.DataFrame(

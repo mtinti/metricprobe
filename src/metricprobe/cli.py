@@ -727,20 +727,32 @@ def _stage_publish(configs: list[ProbeConfig], store, run_id: str, run_at: str) 
     retry converges (no-change commits, monotonic guard passes equal runs)."""
     from metricprobe.publish import PartialDelivery, deliver
 
+    def record_published(names: list[str]) -> None:
+        store.record_stage(
+            run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": names}
+        )
+
     try:
+        # the stage record runs INSIDE the delivery envelope: a record
+        # failure rolls the pushed remotes back, so the pushed-but-unrecorded
+        # state cannot exist (single-remote atomicity)
         pushed = deliver(
-            _artifacts_dir(configs[0], run_id), configs[0].delivery, run_id, run_at
+            _artifacts_dir(configs[0], run_id),
+            configs[0].delivery,
+            run_id,
+            run_at,
+            on_delivered=record_published,
         )
     except PartialDelivery as partial:
-        store.record_stage(
-            run_id,
-            "publish_partial",
-            {"completed_at": _wall().isoformat(), "remotes": partial.pushed},
-        )
+        try:
+            store.record_stage(
+                run_id,
+                "publish_partial",
+                {"completed_at": _wall().isoformat(), "remotes": partial.pushed},
+            )
+        except Exception:  # noqa: BLE001 — the raise below carries the names
+            pass
         raise
-    store.record_stage(
-        run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": pushed}
-    )
     return pushed
 
 

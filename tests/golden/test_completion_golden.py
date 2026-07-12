@@ -191,7 +191,7 @@ def _via_frames(spec=TRICKLE):
     return df, base, lookup
 
 
-def _via_config(join_on):
+def _via_config(join_on, **overrides):
     return table_config(
         event_time=None,
         event_time_via={
@@ -199,6 +199,7 @@ def _via_config(join_on):
             "on": join_on,
             "column": "referral_date",
         },
+        **overrides,
     )
 
 
@@ -380,3 +381,38 @@ def test_insufficient_history_refuses_the_mature_summary():
         probe(g.generate(grown), config, "2026-07-01"), config, pd.Timestamp("2026-07-01")
     )
     assert sufficient.mature_percentile_summary[95] is not None
+
+
+def test_lookup_only_guard_rows_create_no_alt_cells():
+    """Unreferenced lookup rows exist ONLY for the uniqueness guard: they
+    must not surface as a bogus NULL-alt cell nor count against
+    result_cell_cap. A minimal world where EVERY real grouping set has
+    exactly two cells, probed under cap 2: one unreferenced lookup row must
+    change nothing."""
+    base = pd.DataFrame(
+        {
+            "referral_id": [1, 2, 3, 4],
+            "region": ["north", "south", "north", "south"],
+            "load_time": pd.to_datetime(
+                ["2024-01-05", "2024-01-05", "2024-01-06", "2024-01-06"]
+            ),
+        }
+    )
+    lookup = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4, 77_777_777],  # the last row matches NO base row
+            "referral_date": pd.to_datetime(["2024-01-04"] * 4 + ["2024-01-01"]),
+        }
+    )
+    config = _via_config(
+        [{"base_col": "referral_id", "lookup_col": "id"}],
+        group_by_alt="region",
+        analysis={"result_cell_cap": 2},  # exactly the per-set real cell count
+    )
+    result = _probe_via(base, lookup, config)  # no false cap abort
+    alt_cells = result.rows_for("alt")
+    assert sorted(alt_cells["alt_value"]) == ["north", "south"]  # no NULL ghost
+    assert (alt_cells["row_count"] > 0).all()
+    # the raw frame carries no guard-artifact alt cell either
+    raw_alt = result.frame[result.frame["grouping_id"] == 30]
+    assert not raw_alt["alt_value"].isna().any()

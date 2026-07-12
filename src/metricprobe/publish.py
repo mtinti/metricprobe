@@ -249,7 +249,13 @@ class PartialDelivery(RuntimeError):
         )
 
 
-def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> list[str]:
+def deliver(
+    artifacts_dir: str | Path,
+    delivery,
+    run_id: str,
+    run_at: str,
+    on_delivered=None,
+) -> list[str]:
     """Push the rendered dashboard to EVERY configured remote, in TWO phases:
     first PREPARE every remote (sync its clone, enforce the
     monotonic-publication guard against what it already publishes, stage this
@@ -300,43 +306,48 @@ def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> li
         prepared.append((remote, url, clone, prior_head))
 
     # ---- phase 2: push. Cross-remote pushes cannot be transactional; when a
-    # later push fails after earlier ones landed, a COMPENSATING ROLLBACK
-    # restores every already-pushed remote to its prior head (or deletes a
-    # ref this delivery created), so the failed stage leaves nothing partial.
-    # Only when the rollback ITSELF fails is PartialDelivery raised, naming
-    # the remotes that still hold the run so the caller records the state
-    # honestly; the retry converges (pushes are idempotent).
+    # later push fails after earlier ones landed — or the caller's
+    # post-delivery stage RECORD fails — a COMPENSATING ROLLBACK restores
+    # every already-pushed remote to its prior head (or resets a ref this
+    # delivery created to an empty commit), so the failed stage leaves
+    # nothing partial. Only when the rollback ITSELF fails is
+    # PartialDelivery raised, naming the remotes that still hold the run;
+    # the retry converges (pushes are idempotent).
     pushed: list[tuple[object, str, Path, str | None]] = []
+
+    def _roll_back_pushed() -> list[str]:
+        failed_rollbacks = []
+        for done_remote, done_url, done_clone, done_prior in pushed:
+            try:
+                # the lease pins the rollback to the exact commit WE pushed:
+                # a concurrent writer's newer state is never clobbered
+                ours = _git(done_clone, "rev-parse", "HEAD").strip()
+                lease = f"--force-with-lease=refs/heads/{done_remote.ref}:{ours}"
+                if done_prior is None:
+                    # this delivery CREATED the ref; deleting the default
+                    # branch of a bare remote is commonly prohibited, so
+                    # restore "unpublished" as an EMPTY commit: no marker,
+                    # no dashboard, monotonic guard sees a clean slate
+                    tree = _git(done_clone, "mktree", input_text="").strip()
+                    rollback = _git(
+                        done_clone, "commit-tree", tree,
+                        "-m", "metricprobe delivery rollback",
+                    ).strip()
+                    target = f"{rollback}:refs/heads/{done_remote.ref}"
+                else:
+                    target = f"{done_prior}:refs/heads/{done_remote.ref}"
+                _git(done_clone, "push", "--force", lease, done_url, target)
+            except Exception:  # noqa: BLE001 — collected, reported by caller
+                failed_rollbacks.append(done_remote.name)
+        return failed_rollbacks
+
     for remote, url, clone, prior_head in prepared:
         try:
             _git(clone, "push", url, f"HEAD:refs/heads/{remote.ref}")
         except Exception as error:
             if not pushed:
                 raise
-            failed_rollbacks = []
-            for done_remote, done_url, done_clone, done_prior in pushed:
-                try:
-                    # the lease pins the rollback to the exact commit WE
-                    # pushed: a concurrent writer's newer state is never
-                    # clobbered by our compensation
-                    ours = _git(done_clone, "rev-parse", "HEAD").strip()
-                    lease = f"--force-with-lease=refs/heads/{done_remote.ref}:{ours}"
-                    if done_prior is None:
-                        # this delivery CREATED the ref; deleting the default
-                        # branch of a bare remote is commonly prohibited, so
-                        # restore "unpublished" as an EMPTY commit: no marker,
-                        # no dashboard, monotonic guard sees a clean slate
-                        tree = _git(done_clone, "mktree", input_text="").strip()
-                        rollback = _git(
-                            done_clone, "commit-tree", tree,
-                            "-m", "metricprobe delivery rollback",
-                        ).strip()
-                        target = f"{rollback}:refs/heads/{done_remote.ref}"
-                    else:
-                        target = f"{done_prior}:refs/heads/{done_remote.ref}"
-                    _git(done_clone, "push", "--force", lease, done_url, target)
-                except Exception:  # noqa: BLE001 — collected, reported below
-                    failed_rollbacks.append(done_remote.name)
+            failed_rollbacks = _roll_back_pushed()
             if failed_rollbacks:
                 raise PartialDelivery(
                     failed_rollbacks, remote.name, error
@@ -347,7 +358,26 @@ def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> li
                 f"to their prior state: {error}"
             ) from error
         pushed.append((remote, url, clone, prior_head))
-    return [remote.name for remote, _, _, _ in pushed]
+
+    names = [remote.name for remote, _, _, _ in pushed]
+    if on_delivered is not None:
+        # the caller's stage record runs INSIDE the delivery envelope: the
+        # push is only allowed to stand once it is recorded — a record
+        # failure rolls every remote back (single-remote atomicity holds;
+        # PUBLISHED is claimed only after delivery AND its record succeed)
+        try:
+            on_delivered(names)
+        except Exception as error:
+            failed_rollbacks = _roll_back_pushed()
+            if failed_rollbacks:
+                raise PartialDelivery(
+                    failed_rollbacks, "publish-record", error
+                ) from error
+            raise RuntimeError(
+                f"recording the publish stage failed; all {len(names)} "
+                f"remote(s) were rolled back to their prior state: {error}"
+            ) from error
+    return names
 
 
 # ---------------------------------------------------------------- the README
@@ -379,7 +409,15 @@ def _p95_censored(frames: dict[str, pd.DataFrame], probe: str) -> bool:
     if statuses.empty:
         return False
     mine = statuses[statuses["probe"] == probe]
-    return bool((mine["reason"] == "percentile_over_cap").any())
+    # the dashboard columns are the MAIN (load-side) p95: dual lag emits the
+    # same reason code for a censored SOURCE curve, which must not make the
+    # main summary claim "> cap"
+    return bool(
+        (
+            (mine["check"] == "completion")
+            & (mine["reason"] == "percentile_over_cap")
+        ).any()
+    )
 
 
 def _p95_cells(
