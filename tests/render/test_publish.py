@@ -25,7 +25,7 @@ from metricprobe.publish import (
 def dashboard_dir(dashboard_run, tmp_path_factory):
     store, run_id, config = dashboard_run
     out = tmp_path_factory.mktemp("dashboard")
-    emit_dashboard(store, run_id, config, out)
+    emit_dashboard(store, run_id, [config], out)
     return out
 
 
@@ -78,7 +78,7 @@ def test_svgs_are_canonical_and_deterministic(dashboard_dir, dashboard_run, tmp_
     # a second emission is BYTE-IDENTICAL (fixed-seed CI diff check relies on it)
     store, run_id, config = dashboard_run
     again = tmp_path / "again"
-    emit_dashboard(store, run_id, config, again)
+    emit_dashboard(store, run_id, [config], again)
     assert (again / "README.md").read_bytes() == (
         dashboard_dir / "README.md"
     ).read_bytes()
@@ -144,3 +144,24 @@ def test_next_cron_fire_and_expected_by():
     assert next_expected_by(london, "2026-07-09T12:00:00") == (
         "2026-07-13 06:00 Europe/London"
     )
+
+
+def test_cron_handles_leap_days_and_dst():
+    # a Feb-29 schedule resolves years ahead, never "manual runs only"
+    fire = next_cron_fire("0 6 29 2 *", pd.Timestamp("2026-07-09 12:00"))
+    assert fire == pd.Timestamp("2028-02-29 06:00")
+    # DST spring-forward: 01:30 does not exist on 2026-03-29 in London
+    # (clocks jump 01:00 -> 02:00) — the fire lands on the NEXT valid day,
+    # at the requested wall time
+    fire = next_cron_fire(
+        "30 1 * * *",
+        pd.Timestamp("2026-03-28 12:00", tz="Europe/London"),
+    )
+    assert fire == pd.Timestamp("2026-03-30 01:30", tz="Europe/London")
+    # daily schedules keep local wall time ACROSS the DST boundary
+    fire = next_cron_fire(
+        "0 6 * * *",
+        pd.Timestamp("2026-03-28 12:00", tz="Europe/London"),
+    )
+    assert fire == pd.Timestamp("2026-03-29 06:00", tz="Europe/London")
+    assert str(fire.tz) == "Europe/London" and fire.hour == 6

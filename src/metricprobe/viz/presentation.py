@@ -96,13 +96,15 @@ def display_count(value, suppressed: bool) -> str:
 
 
 def load_run_frames(store, run_id: str) -> dict[str, pd.DataFrame]:
-    """Every snapshot table of a committed run (absent tables skipped)."""
+    """Every snapshot table of a committed run. The store SAYS which tables
+    the run holds (table_names); an absent table is skipped, but a READ
+    FAILURE on a present one propagates — a corrupt file or a database outage
+    must fail the render, never publish an incomplete dashboard."""
+    present = set(store.table_names(run_id))
     frames: dict[str, pd.DataFrame] = {}
     for name in RUN_TABLES:
-        try:
+        if name in present:
             frames[name] = store.read_table(run_id, name)
-        except Exception:  # noqa: BLE001 — absent table, whatever the backend raises
-            continue
     return frames
 
 

@@ -52,12 +52,15 @@ def ensure_static_export_available() -> None:
 
 
 def build_all_figures(
-    store, run_id: str, config: ProbeConfig
+    store, run_id: str, configs: list[ProbeConfig]
 ) -> dict[str, dict[str, go.Figure]]:
-    """probe -> {figure key -> Figure} for every probe of a committed run,
-    through the shared presentation transform (suppression happens there)."""
+    """probe -> {figure key -> Figure} for every probe of a committed run —
+    across EVERY campaign config file — through the shared presentation
+    transform (suppression happens there)."""
     frames = load_run_frames(store, run_id)
-    tables = {table.probe_name: table for table in config.tables}
+    tables = {
+        table.probe_name: table for config in configs for table in config.tables
+    }
     all_figures: dict[str, dict[str, go.Figure]] = {}
     for probe in probes_in(frames):
         table = tables.get(probe)
@@ -68,6 +71,7 @@ def build_all_figures(
             probe,
             proxy=bool(table and table.proxy),
             expect_batchy=bool(table and table.expect_batchy),
+            analysis=table.analysis if table else None,
         )
     return all_figures
 
@@ -79,10 +83,28 @@ def _manifest_for(store, run_id: str) -> dict:
     raise FileNotFoundError(f"run {run_id!r} is not committed")
 
 
+# tab chrome: tiny, inline, offline. Revealing a pane fires a resize so the
+# plotly figure inside (rendered while hidden) lays itself out.
+_TABS_STYLE_AND_SCRIPT = (
+    "<style>.mp-tab{padding:4px 14px;border:1px solid #999;background:#eee;"
+    "cursor:pointer}.mp-tab.mp-active{background:#2f6fb2;color:#fff}</style>\n"
+    "<script>function mpShow(index, key, button){\n"
+    "  for (const pane of ['curves','heatmap']) {\n"
+    "    document.getElementById('mp-'+index+'-'+pane).style.display =\n"
+    "      (pane === key) ? '' : 'none';\n"
+    "  }\n"
+    "  for (const sibling of button.parentNode.children)"
+    " sibling.classList.remove('mp-active');\n"
+    "  button.classList.add('mp-active');\n"
+    "  window.dispatchEvent(new Event('resize'));\n"
+    "}</script>"
+)
+
+
 def generate_report(
     store,
     run_id: str,
-    config: ProbeConfig,
+    configs: list[ProbeConfig],
     out_dir: str | Path,
     png: bool = True,
 ) -> Path:
@@ -92,7 +114,7 @@ def generate_report(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     manifest = _manifest_for(store, run_id)
-    all_figures = build_all_figures(store, run_id, config)
+    all_figures = build_all_figures(store, run_id, configs)
 
     parts: list[str] = []
     parts.append(
@@ -104,27 +126,52 @@ def generate_report(
         f"<b>Analysed window:</b> {html.escape(manifest['window_start'])} → "
         f"{html.escape(manifest['window_end'])}</p>"
     )
+    parts.append(_TABS_STYLE_AND_SCRIPT)
     include_js: bool | str = True  # first figure embeds the bundled plotly.js
     exports: list[tuple[object, Path]] = []
     if png:
         (out / "img").mkdir(exist_ok=True)
-    for probe, figures in all_figures.items():
+    for index, (probe, figures) in enumerate(all_figures.items()):
         parts.append(f"<h2>{html.escape(probe)}</h2>")
         if not figures:
             parts.append("<p>no figures (probe skipped or aborted)</p>")
-        for key, figure in figures.items():
-            parts.append(
-                pio.to_html(
-                    figure,
-                    full_html=False,
-                    include_plotlyjs=include_js,
-                    default_width="100%",
-                    default_height="450px",
-                )
+
+        def _fragment(figure) -> str:
+            nonlocal include_js
+            fragment = pio.to_html(
+                figure,
+                full_html=False,
+                include_plotlyjs=include_js,
+                default_width="100%",
+                default_height="450px",
             )
             include_js = False
-            if png:
+            return fragment
+
+        tabbed = {"completion_curves", "completion_heatmap"} & set(figures)
+        for key, figure in figures.items():
+            if png:  # every figure exports, tabbed or not
                 exports.append((figure, out / "img" / f"{probe}_{key}.png"))
+            if key == "completion_curves" and len(tabbed) == 2:
+                # the completion views are TABS: curves by default, the
+                # event-month x lag-week heatmap behind a toggle
+                heatmap = figures["completion_heatmap"]
+                parts.append(
+                    f'<div class="mp-tabs">'
+                    f'<button class="mp-tab mp-active" '
+                    f"onclick=\"mpShow({index},'curves',this)\">Curves</button>"
+                    f'<button class="mp-tab" '
+                    f"onclick=\"mpShow({index},'heatmap',this)\">Heatmap</button>"
+                    f"</div>"
+                    f'<div id="mp-{index}-curves" class="mp-pane">'
+                    f"{_fragment(figure)}</div>"
+                    f'<div id="mp-{index}-heatmap" class="mp-pane" '
+                    f'style="display:none">{_fragment(heatmap)}</div>'
+                )
+            elif key == "completion_heatmap" and len(tabbed) == 2:
+                continue  # rendered inside the tab container above
+            else:
+                parts.append(_fragment(figure))
     if exports:
         # ONE batched kaleido session (a per-figure Chrome roundtrip is ~7x slower)
         pio.write_images(

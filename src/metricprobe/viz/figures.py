@@ -36,9 +36,16 @@ def _title(text: str, probe: str, proxy: bool) -> str:
     return f"{text} — {probe}{suffix}"
 
 
-def volume_figure(month_volumes: pd.DataFrame, probe: str, proxy: bool) -> go.Figure:
-    """Rows per event month, colored by maturity state; deficit months are
-    flagged; interior gaps show as missing bars (explicitly RED in statuses)."""
+def volume_figure(
+    month_volumes: pd.DataFrame,
+    volume_summary: pd.DataFrame | None,
+    analysis,
+    probe: str,
+    proxy: bool,
+) -> go.Figure:
+    """Rows per event month, colored by maturity state; MATURE months beyond
+    the amber/red robust deviations are marked as outliers; deficit months
+    are flagged; interior gaps show as missing bars (RED in statuses)."""
     df = month_volumes.sort_values("month")
     fig = go.Figure()
     for state, color in _STATE_COLORS.items():
@@ -51,6 +58,33 @@ def volume_figure(month_volumes: pd.DataFrame, probe: str, proxy: bool) -> go.Fi
             name=state,
             marker_color=color,
         )
+    if volume_summary is not None and not volume_summary.empty and analysis is not None:
+        summary = volume_summary.iloc[0]
+        median, sigma = summary.get("baseline_median"), summary.get("baseline_sigma")
+        if not (median is None or pd.isna(median) or sigma is None or pd.isna(sigma)):
+            mature = df[(df["state"] == "mature") & df["volume"].notna()].copy()
+            deviation = (mature["volume"].astype(float) - float(median)).abs()
+            for name, low, high, color in (
+                ("volume outlier (red)", float(analysis.volume_red_mads), None, "#c0392b"),
+                (
+                    "volume outlier (amber)",
+                    float(analysis.volume_amber_mads),
+                    float(analysis.volume_red_mads),
+                    "#e67e22",
+                ),
+            ):
+                mask = deviation > low * float(sigma)
+                if high is not None:
+                    mask &= deviation <= high * float(sigma)
+                hits = mature[mask]
+                if not hits.empty:
+                    fig.add_scatter(
+                        x=list(hits["month"]),
+                        y=[float(v) for v in hits["volume"]],
+                        mode="markers",
+                        name=name,
+                        marker={"symbol": "x", "size": 11, "color": color},
+                    )
     deficits = df[df["deficit"].fillna(False).astype(bool)]
     if not deficits.empty:
         fig.add_scatter(
@@ -130,15 +164,24 @@ def completion_curves_figure(
         aligned = pd.DataFrame(
             {i: curve.reindex(grid).ffill().fillna(0.0) for i, curve in enumerate(mature_frames)}
         )
-        quantile_lines = ((0.5, "median", "solid"), (0.1, "p10", "dot"), (0.9, "p90", "dot"))
-        for quantile, name, dash in quantile_lines:
-            fig.add_scatter(
-                x=grid,
-                y=[round(float(v) * 100, 3) for v in aligned.quantile(quantile, axis=1)],
-                mode="lines",
-                name=name,
-                line={"width": 3 if name == "median" else 1, "color": "#1a1a2e", "dash": dash},
-            )
+
+        def _pct_line(quantile):
+            return [round(float(v) * 100, 3) for v in aligned.quantile(quantile, axis=1)]
+
+        # p10-p90 as a FILLED band under the median (the contract's band,
+        # not two dotted lines)
+        fig.add_scatter(
+            x=grid, y=_pct_line(0.1), mode="lines", name="p10",
+            line={"width": 0}, showlegend=False, hoverinfo="skip",
+        )
+        fig.add_scatter(
+            x=grid, y=_pct_line(0.9), mode="lines", name="p10–p90 band",
+            line={"width": 0}, fill="tonexty", fillcolor="rgba(26,26,46,0.15)",
+        )
+        fig.add_scatter(
+            x=grid, y=_pct_line(0.5), mode="lines", name="median",
+            line={"width": 3, "color": "#1a1a2e"},
+        )
     fig.update_layout(
         title=_title("Completion curves (cumulative % of final rows)", probe, proxy),
         xaxis_title="lag (days)",
@@ -208,18 +251,23 @@ def percentile_summary_figure(
             mean, std = summary.get(f"p{pct}_mean"), summary.get(f"p{pct}_std")
             if mean is None or pd.isna(mean):
                 continue
+            spread = 0.0 if std is None or pd.isna(std) else float(std)
+            low = round(float(mean) - spread, 2)
+            high = round(float(mean) + spread, 2)
+            # the mature mean +/- std as a VISIBLE filled band per percentile
             fig.add_scatter(
-                x=months,
-                y=[round(float(mean), 2)] * len(months),
-                mode="lines",
-                name=f"p{pct} mature mean",
-                line={"dash": "dash", "width": 1},
-                error_y={
-                    "type": "constant",
-                    "value": round(float(std), 2),
-                    "visible": False,
-                },
-                showlegend=False,
+                x=months, y=[low] * len(months), mode="lines",
+                line={"width": 0}, showlegend=False, hoverinfo="skip",
+            )
+            fig.add_scatter(
+                x=months, y=[high] * len(months), mode="lines",
+                name=f"p{pct} mature mean±std",
+                line={"width": 0}, fill="tonexty",
+                fillcolor="rgba(47,111,178,0.12)",
+            )
+            fig.add_scatter(
+                x=months, y=[round(float(mean), 2)] * len(months), mode="lines",
+                line={"dash": "dash", "width": 1}, showlegend=False,
             )
     fig.update_layout(
         title=_title("Days to percentile by event month", probe, proxy),
@@ -348,6 +396,7 @@ def figures_for_probe(
     probe: str,
     proxy: bool = False,
     expect_batchy: bool = False,
+    analysis=None,
 ) -> dict[str, go.Figure]:
     """Every applicable figure for one probe, under stable keys (FIGURE_ORDER)."""
     figures: dict[str, go.Figure] = {}
@@ -357,7 +406,16 @@ def figures_for_probe(
             figures[key] = figure
 
     if "month_volumes" in probe_frames:
-        put("volume", volume_figure(probe_frames["month_volumes"], probe, proxy))
+        put(
+            "volume",
+            volume_figure(
+                probe_frames["month_volumes"],
+                probe_frames.get("volume_summary"),
+                analysis,
+                probe,
+                proxy,
+            ),
+        )
     if "month_lag_cells" in probe_frames:
         put(
             "completion_curves",

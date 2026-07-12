@@ -172,6 +172,103 @@ def test_standalone_report_and_publish_commands(campaign, tmp_path):
     assert main(["publish", "--config", str(config), "--out", str(out / "dash"),
                  "--run-id", "r-cmd"]) == 0
     assert (out / "dash" / "README.md").exists()
-    # standalone re-DELIVERY of the same run is idempotent
-    assert main(["publish", "--config", str(config), "--out", str(out / "dash"),
-                 "--run-id", "r-cmd", "--deliver"]) == 0
+    # --deliver re-runs the SAME lifecycle stages (render recorded before
+    # publish — never an analysis -> publish manifest) and is idempotent
+    assert main(["publish", "--config", str(config), "--run-id", "r-cmd",
+                 "--deliver"]) == 0
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert set(manifest["stages"]) == {"analysis", "render", "publish"}
+    # --out and --deliver together are ambiguous: refused
+    assert main(["publish", "--config", str(config), "--run-id", "r-cmd",
+                 "--out", str(out / "x"), "--deliver"]) == 1
+
+
+def test_delivery_is_bound_to_the_requested_run(campaign, tmp_path):
+    """Artifacts are per-run and the marker is verified: one run's files can
+    never be published under another run's name (which would defeat the
+    monotonic guarantee)."""
+    from metricprobe.config import load_config
+    from metricprobe.publish import deliver
+
+    config, store_root, bare = campaign
+    assert main(["run", "--config", str(config), "--as-of", AS_OF,
+                 "--run-id", "r-one"]) == 0
+    loaded = load_config(config)
+    artifacts_root = tmp_path / "worktree" / "artifacts"
+    assert (artifacts_root / "r-one" / PUBLISHED_MARKER).exists()  # per-run dir
+    # delivering r-one's artifacts under a different run id is refused
+    import pytest as _pytest
+
+    with _pytest.raises(RuntimeError, match="belong to run"):
+        deliver(artifacts_root / "r-one", loaded.delivery, "r-two",
+                "2099-01-01T00:00:00")
+
+
+def test_multi_remote_prepare_failure_touches_no_remote(campaign, tmp_path):
+    """Two remotes, the second broken: phase-1 preparation fails BEFORE any
+    push, so the healthy first remote is untouched (no partial publication)."""
+    config, store_root, bare = campaign
+    text = yaml.safe_load(config.read_text())
+    text["delivery"]["remotes"].append(
+        {"name": "mirror", "url": f"file://{tmp_path}/missing.git", "ref": "main"}
+    )
+    two_remotes = tmp_path / "two.yaml"
+    two_remotes.write_text(yaml.safe_dump(text))
+    assert main(["run", "--config", str(two_remotes), "--as-of", AS_OF,
+                 "--run-id", "r-two-remotes"]) == 1  # publish stage failed
+    # the FIRST remote received nothing: prepare-all happens before push-any
+    assert _git(bare, "ls-remote", "--heads", str(bare), "main") == ""
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert "render" in manifest["stages"] and "publish" not in manifest["stages"]
+    # with both remotes reachable (same config, same digest: the missing
+    # repo comes into existence at its configured URL), BOTH publish at once
+    second = tmp_path / "missing.git"
+    second.mkdir()
+    _git(second, "init", "--bare", "--initial-branch", "main")
+    assert main(["run", "--config", str(two_remotes), "--as-of", AS_OF,
+                 "--resume-from", "render", "--run-id", "r-two-remotes"]) == 0
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert manifest["stages"]["publish"]["remotes"] == ["origin", "mirror"]
+    for remote in (bare, second):
+        assert "README.md" in _pushed_files(remote)
+
+
+def test_corrupt_snapshot_fails_render_not_publishes_incomplete(campaign, tmp_path):
+    """A present-but-unreadable snapshot table must FAIL the render stage —
+    never quietly publish a dashboard missing that data."""
+    config, store_root, bare = campaign
+    # analysis only (strip delivery so the run commits without rendering)
+    text = yaml.safe_load(config.read_text())
+    delivery = text.pop("delivery")
+    plain = tmp_path / "plain.yaml"
+    plain.write_text(yaml.safe_dump(text))
+    assert main(["run", "--config", str(plain), "--as-of", AS_OF,
+                 "--run-id", "r-corrupt"]) == 0
+    # corrupt a PRESENT table
+    statuses = store_root / "runs" / "r-corrupt" / "statuses.parquet"
+    statuses.write_bytes(b"not parquet at all")
+    text["delivery"] = delivery
+    withd = tmp_path / "withd.yaml"
+    withd.write_text(yaml.safe_dump(text))
+    assert main(["run", "--config", str(withd), "--as-of", AS_OF,
+                 "--resume-from", "render", "--run-id", "r-corrupt"]) == 1
+    assert _git(bare, "ls-remote", "--heads", str(bare), "main") == ""
+
+
+def test_multi_config_campaign_renders_every_probe(campaign, tmp_path):
+    """A repeatable-config campaign renders ALL configs' probes: the second
+    file's probe must appear in the published README with its own settings."""
+    config, store_root, bare = campaign
+    base = yaml.safe_load(config.read_text())
+    second = dict(base)
+    second["tables"] = [dict(base["tables"][0])
+                        | {"probe_name": "orders_variant", "proxy": True}]
+    second_path = tmp_path / "second.yaml"
+    second_path.write_text(yaml.safe_dump(second))
+    assert main(["run", "--config", str(config), "--config", str(second_path),
+                 "--as-of", AS_OF, "--run-id", "r-multi"]) == 0
+    files = _pushed_files(bare)
+    assert "orders_main" in files["README.md"]
+    assert "orders_variant" in files["README.md"]  # the second file's probe
+    # its presentation settings applied too: proxy labelling in its figures
+    assert any("orders_variant" in name for name in files if name.startswith("img/"))

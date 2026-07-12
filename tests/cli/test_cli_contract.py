@@ -369,12 +369,14 @@ def test_frozen_clock_makes_run_metadata_deterministic(tmp_path, demo_db, monkey
     config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
     assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "frozen-run") == 0
     (manifest,) = ParquetStore(tmp_path / "store").list_runs()
-    assert manifest["run_at"] == "2025-07-02T06:00:00"
+    # the frozen clock is normalized to timezone-AWARE UTC (a naive local
+    # run_at would be misread by schedule math and monotonic comparisons)
+    assert manifest["run_at"] == "2025-07-02T06:00:00+00:00"
     assert manifest["git_sha"] == "cafe1234"
     (probe,) = manifest["probes"]
     assert probe["duration_seconds"] == 0.0  # every timestamp is the frozen clock
     assert probe["extraction_started"] == probe["extraction_finished"]
-    assert manifest["stages"]["analysis"]["completed_at"] == "2025-07-02T06:00:00"
+    assert manifest["stages"]["analysis"]["completed_at"] == "2025-07-02T06:00:00+00:00"
 
 
 def test_probe_abort_commits_no_partial_frames(tmp_path, demo_db, monkeypatch):

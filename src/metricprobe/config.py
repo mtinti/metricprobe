@@ -575,3 +575,10 @@ def compose_campaign(configs: list[ProbeConfig]) -> None:
             "all config files in one campaign must declare the SAME store; "
             f"found {len(stores)} distinct store configurations"
         )
+    campaigns = {config.campaign for config in configs}
+    if len(campaigns) > 1:
+        raise ConfigError(
+            "all config files in one campaign must declare the SAME campaign "
+            "settings (schedule/timezone/grace) — 'Next update expected by' is "
+            f"a campaign property; found {len(campaigns)} distinct ones"
+        )

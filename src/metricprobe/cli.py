@@ -115,9 +115,12 @@ BUCKET_COLUMNS = (
 
 def _wall() -> pd.Timestamp:
     """The injectable clock: METRICPROBE_RUN_AT freezes EVERY recorded
-    timestamp (durations become 0), making demo builds byte-stable."""
+    timestamp (durations become 0), making demo builds byte-stable.
+    Always timezone-AWARE UTC — a naive local run_at would be misread as UTC
+    by schedule math and cross-machine monotonic comparisons."""
     frozen = os.environ.get("METRICPROBE_RUN_AT")
-    return pd.Timestamp(frozen) if frozen else pd.Timestamp.now()
+    stamp = pd.Timestamp(frozen) if frozen else pd.Timestamp.now(tz="UTC")
+    return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
 
 
 def _git_sha() -> str:
@@ -670,40 +673,51 @@ def _statuses_from_manifest(manifest: dict) -> list[Status]:
     ]
 
 
-def _artifacts_dir(config: ProbeConfig):
+def _artifacts_dir(config: ProbeConfig, run_id: str):
+    """PER-RUN artifact directory: overlapping runs can never publish each
+    other's artifacts (delivery verifies the marker against run_id too)."""
     from pathlib import Path
 
-    return Path(config.delivery.worktree) / "artifacts"
+    return Path(config.delivery.worktree) / "artifacts" / validate_run_id(run_id)
 
 
-def _stage_render(config: ProbeConfig, store, run_id: str):
-    """ARTIFACTS_RENDERED: emit the dashboard into the delivery worktree,
-    atomically (build in a tmp dir, one rename), then record the stage."""
+def _stage_render(configs: list[ProbeConfig], store, run_id: str):
+    """ARTIFACTS_RENDERED: emit the dashboard into the run's OWN worktree
+    directory. The swap keeps the previous complete artifacts as a backup
+    until the new directory is in place — no window where neither exists."""
     import shutil
 
     from metricprobe.publish import emit_dashboard
 
-    final = _artifacts_dir(config)
-    tmp = final.with_name("artifacts.tmp")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    emit_dashboard(store, run_id, config, tmp)
+    final = _artifacts_dir(configs[0], run_id)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    tmp = final.with_name(f"{final.name}.tmp")
+    previous = final.with_name(f"{final.name}.prev")
+    for leftover in (tmp, previous):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    emit_dashboard(store, run_id, configs, tmp)
     if final.exists():
-        shutil.rmtree(final)
+        final.rename(previous)
     tmp.rename(final)
+    if previous.exists():
+        shutil.rmtree(previous)
     store.record_stage(
         run_id, "render", {"completed_at": _wall().isoformat(), "artifacts": str(final)}
     )
     return final
 
 
-def _stage_publish(config: ProbeConfig, store, run_id: str, run_at: str) -> list[str]:
-    """PUBLISHED: push the rendered dashboard to every configured remote
-    (monotonic-publication guard enforced per remote inside deliver);
-    the stage is recorded only after EVERY push succeeded."""
+def _stage_publish(configs: list[ProbeConfig], store, run_id: str, run_at: str) -> list[str]:
+    """PUBLISHED: push the rendered dashboard to every configured remote.
+    deliver() verifies the artifact marker BELONGS to run_id and prepares
+    every remote before pushing any; the stage is recorded only after EVERY
+    push succeeded."""
     from metricprobe.publish import deliver
 
-    pushed = deliver(_artifacts_dir(config), config.delivery, run_id, run_at)
+    pushed = deliver(
+        _artifacts_dir(configs[0], run_id), configs[0].delivery, run_id, run_at
+    )
     store.record_stage(
         run_id, "publish", {"completed_at": _wall().isoformat(), "remotes": pushed}
     )
@@ -711,13 +725,13 @@ def _stage_publish(config: ProbeConfig, store, run_id: str, run_at: str) -> list
 
 
 def _run_finishing_stages(
-    config: ProbeConfig, store, run_id: str, run_at: str, start_stage: str
+    configs: list[ProbeConfig], store, run_id: str, run_at: str, start_stage: str
 ) -> int | None:
     """Render + publish for a committed run. Returns None on success, 1 on a
     stage failure (everything before it stays committed and recorded)."""
     if start_stage in ("analysis", "render"):
         try:
-            _stage_render(config, store, run_id)
+            _stage_render(configs, store, run_id)
             print(f"run {run_id}: artifacts rendered")
         except Exception as error:
             print(f"metricprobe: render stage failed: {error}", file=sys.stderr)
@@ -729,7 +743,7 @@ def _run_finishing_stages(
 
         from metricprobe.publish import PUBLISHED_MARKER
 
-        marker = _artifacts_dir(config) / PUBLISHED_MARKER
+        marker = _artifacts_dir(configs[0], run_id) / PUBLISHED_MARKER
         if not marker.exists() or _json.loads(marker.read_text())["run_id"] != run_id:
             print(
                 f"metricprobe: no rendered artifacts for run {run_id!r}; "
@@ -738,7 +752,7 @@ def _run_finishing_stages(
             )
             return 1
     try:
-        pushed = _stage_publish(config, store, run_id, run_at)
+        pushed = _stage_publish(configs, store, run_id, run_at)
         print(f"run {run_id}: published to {', '.join(pushed)}")
     except Exception as error:
         print(f"metricprobe: publish stage failed: {error}", file=sys.stderr)
@@ -763,8 +777,10 @@ def cmd_run(args) -> int:
     run_at = _wall()
     try:
         # pd raises DateParseError (a ValueError) on malformed --as-of: a
-        # usage error must exit 1, never escape as a traceback
-        as_of = pd.Timestamp(args.as_of) if args.as_of else run_at
+        # usage error must exit 1, never escape as a traceback. as_of stays
+        # NAIVE (it compares against naive event months throughout the
+        # metrics); run_at is the aware wall clock.
+        as_of = pd.Timestamp(args.as_of) if args.as_of else run_at.tz_localize(None)
         window_start, window_end = _parse_window(args, as_of)
     except (ConfigError, ValueError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
@@ -822,7 +838,7 @@ def cmd_run(args) -> int:
                     )
                     return exit_code_for(statuses)
                 failure = _run_finishing_stages(
-                    configs[0], store, args.run_id, manifest["run_at"], args.resume_from
+                    configs, store, args.run_id, manifest["run_at"], args.resume_from
                 )
                 return failure if failure is not None else exit_code_for(statuses)
             if args.resume_from != "analysis":
@@ -935,7 +951,7 @@ def cmd_run(args) -> int:
     print(f"run {run_id}: analysis committed — {len(statuses)} statuses, {len(reds)} red")
     if len(configured) > 1:
         failure = _run_finishing_stages(
-            configs[0], store, run_id, meta.run_at, "analysis"
+            configs, store, run_id, meta.run_at, "analysis"
         )
         if failure is not None:
             return failure
@@ -1002,7 +1018,7 @@ def cmd_report(args) -> int:
         ensure_static_export_available()
         store = open_store(configs[0].store)
         run_id = _latest_run_id(store, args.run_id)
-        path = generate_report(store, run_id, configs[0], args.out)
+        path = generate_report(store, run_id, configs, args.out)
     except (ConfigError, ValueError, RuntimeError, FileNotFoundError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
         return 1
@@ -1011,9 +1027,11 @@ def cmd_report(args) -> int:
 
 
 def cmd_publish(args) -> int:
-    """Standalone re-render (and optional re-delivery) of a committed run's
-    dashboard — the campaign command calls the same code."""
-    from metricprobe.publish import deliver, emit_dashboard
+    """Standalone dashboard emission (--out DIR), or — with --deliver — the
+    SAME finishing stages the campaign runs (render recorded, then publish):
+    the campaign command stays the sole delivery code path, and the supplied
+    config must still match the committed run's digest."""
+    from metricprobe.publish import emit_dashboard
     from metricprobe.report import ensure_static_export_available
 
     try:
@@ -1022,22 +1040,34 @@ def cmd_publish(args) -> int:
         ensure_static_export_available()
         store = open_store(configs[0].store)
         run_id = _latest_run_id(store, args.run_id)
-        readme = emit_dashboard(store, run_id, configs[0], args.out)
-        print(f"run {run_id}: dashboard written to {readme.parent}")
         if args.deliver:
+            if args.out:
+                print(
+                    "metricprobe: --deliver renders into the delivery worktree; "
+                    "pass either --out or --deliver, not both",
+                    file=sys.stderr,
+                )
+                return 1
             if configs[0].delivery is None:
                 print("metricprobe: --deliver requires a delivery config", file=sys.stderr)
                 return 1
             manifest = next(m for m in store.list_runs() if m["run_id"] == run_id)
-            pushed = deliver(
-                readme.parent, configs[0].delivery, run_id, manifest["run_at"]
+            if manifest["config_digest"] != _combined_digest(configs):
+                print(
+                    "metricprobe: config digest mismatch — the config changed "
+                    f"since run {run_id!r} was created; refusing to deliver",
+                    file=sys.stderr,
+                )
+                return 1
+            failure = _run_finishing_stages(
+                configs, store, run_id, manifest["run_at"], "render"
             )
-            store.record_stage(
-                run_id,
-                "publish",
-                {"completed_at": _wall().isoformat(), "remotes": pushed},
-            )
-            print(f"run {run_id}: published to {', '.join(pushed)}")
+            return 1 if failure is not None else 0
+        if not args.out:
+            print("metricprobe: pass --out DIR (or --deliver)", file=sys.stderr)
+            return 1
+        readme = emit_dashboard(store, run_id, configs, args.out)
+        print(f"run {run_id}: dashboard written to {readme.parent}")
     except (ConfigError, ValueError, RuntimeError, FileNotFoundError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
         return 1
@@ -1127,10 +1157,11 @@ def main(argv=None) -> int:
     )
     publish.add_argument("--config", action="append", required=True, help="YAML config")
     publish.add_argument("--run-id", help="default: the latest committed run")
-    publish.add_argument("--out", required=True, help="output directory")
+    publish.add_argument("--out", help="output directory (standalone emission)")
     publish.add_argument(
         "--deliver", action="store_true",
-        help="push to the configured delivery remotes (monotonic guard enforced)",
+        help="re-run the render+publish lifecycle stages for the run "
+        "(renders into the delivery worktree; monotonic guard enforced)",
     )
     publish.set_defaults(handler=cmd_publish)
 

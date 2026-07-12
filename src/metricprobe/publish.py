@@ -99,13 +99,23 @@ def _cron_field_matches(field_text: str, value: int, low: int, high: int) -> boo
     )
 
 
+# scan horizon: 8 years covers the sparsest valid schedule (Feb 29 recurs
+# within any 8-year window, including the 2100-style century gap-free range)
+_CRON_SCAN_DAYS = 366 * 8
+
+
 def next_cron_fire(schedule: str, after: pd.Timestamp) -> pd.Timestamp | None:
-    """First schedule fire STRICTLY after `after` (same timezone as `after`),
-    scanning at most 366 days. Day-of-month and day-of-week follow standard
-    cron OR semantics when both are restricted; 0 and 7 both mean Sunday."""
+    """First schedule fire STRICTLY after `after` (same timezone as `after`).
+    Day-of-month and day-of-week follow standard cron OR semantics when both
+    are restricted; 0 and 7 both mean Sunday. Timezone-aware inputs handle
+    DST: days are enumerated by local midnight, and a candidate whose local
+    wall time was shifted (nonexistent hour on a spring-forward day) is
+    skipped, matching common cron behavior."""
     minute_f, hour_f, dom_f, month_f, dow_f = schedule.split()
     start = (after + pd.Timedelta(minutes=1)).floor("min")
-    for day_offset in range(367):
+    for day_offset in range(_CRON_SCAN_DAYS):
+        # 24h steps then normalize(): local midnight of every day, duplicates
+        # possible around fall-back (harmless), no day ever skipped
         day = (start + pd.Timedelta(days=day_offset)).normalize()
         if not _cron_field_matches(month_f, day.month, 1, 12):
             continue
@@ -125,7 +135,18 @@ def next_cron_fire(schedule: str, after: pd.Timestamp) -> pd.Timestamp | None:
             for minute in range(60):
                 if not _cron_field_matches(minute_f, minute, 0, 59):
                     continue
-                candidate = day + pd.Timedelta(hours=hour, minutes=minute)
+                if day.tz is None:
+                    candidate = day + pd.Timedelta(hours=hour, minutes=minute)
+                else:
+                    # construct the LOCAL wall time (Timedelta arithmetic
+                    # counts elapsed hours and drifts across DST changes);
+                    # a nonexistent local time (spring forward) is skipped,
+                    # an ambiguous one (fall back) fires on its first pass
+                    naive = pd.Timestamp(day.year, day.month, day.day, hour, minute)
+                    try:
+                        candidate = naive.tz_localize(day.tz, ambiguous=True)
+                    except Exception:  # noqa: BLE001 — nonexistent wall time
+                        continue
                 if candidate >= start:
                     return candidate
     return None
@@ -133,7 +154,9 @@ def next_cron_fire(schedule: str, after: pd.Timestamp) -> pd.Timestamp | None:
 
 def next_expected_by(campaign: CampaignConfig, run_at: str) -> str:
     """The self-diagnosing staleness promise: next scheduled fire after this
-    run, plus the grace period. 'manual runs only' when unscheduled."""
+    run, plus the grace period. 'manual runs only' when unscheduled.
+    run_at is timezone-aware UTC from the runner; a naive value (older
+    snapshots, frozen demo clocks) is DEFINED as UTC."""
     if campaign.schedule is None:
         return "manual runs only"
     stamp = pd.Timestamp(run_at)
@@ -213,17 +236,26 @@ def _remote_has_ref(clone: Path, url: str, ref: str) -> bool:
 
 
 def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> list[str]:
-    """Push the rendered dashboard to EVERY configured remote. Per remote:
-    sync a local clone of the target ref, enforce the monotonic-publication
-    guard against the marker already published there, replace the dashboard
-    files, commit, push. Returns the pushed remote names; raises on the first
-    failure (PUBLISHED is claimed only when every remote succeeded)."""
+    """Push the rendered dashboard to EVERY configured remote, in TWO phases:
+    first PREPARE every remote (sync its clone, enforce the
+    monotonic-publication guard against what it already publishes, stage this
+    run's files, commit locally) — any failure here leaves every remote
+    untouched — then push all. The artifacts must carry THIS run's marker:
+    delivery can never publish one run's files under another run's name."""
     artifacts = Path(artifacts_dir)
     marker = artifacts / PUBLISHED_MARKER
     if not marker.exists():
         raise RuntimeError(f"no rendered dashboard at {artifacts} (marker missing)")
+    marked = json.loads(marker.read_text(encoding="utf-8"))
+    if marked["run_id"] != run_id:
+        raise RuntimeError(
+            f"rendered artifacts at {artifacts} belong to run {marked['run_id']!r}, "
+            f"not {run_id!r}; refusing to deliver them under the wrong name"
+        )
     worktree = Path(delivery.worktree)
-    pushed = []
+
+    # ---- phase 1: prepare every remote (no pushes yet)
+    prepared: list[tuple[object, str, Path]] = []
     for remote in delivery.remotes:
         url = _push_url(remote)
         clone = worktree / "remotes" / remote.name
@@ -247,9 +279,14 @@ def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> li
         if (artifacts / "img").exists():
             shutil.copytree(artifacts / "img", clone / "img")
         _git(clone, "add", "-A")
-        status = _git(clone, "status", "--porcelain")
-        if status.strip():
+        if _git(clone, "status", "--porcelain").strip():
             _git(clone, "commit", "-m", f"metricprobe dashboard {run_id}")
+        prepared.append((remote, url, clone))
+
+    # ---- phase 2: push (each push is idempotent, so a retry after a partial
+    # network failure re-pushes no-change commits harmlessly)
+    pushed = []
+    for remote, url, clone in prepared:
         _git(clone, "push", url, f"HEAD:refs/heads/{remote.ref}")
         pushed.append(remote.name)
     return pushed
@@ -270,11 +307,11 @@ def _badge(severity: Severity | None) -> str:
     return SEVERITY_BADGES.get(severity, "➖")
 
 
-def _status_rows(frames: dict[str, pd.DataFrame], config: ProbeConfig) -> list[dict]:
+def _status_rows(frames: dict[str, pd.DataFrame], configs: list[ProbeConfig]) -> list[dict]:
     statuses = frames.get("statuses", pd.DataFrame())
     summaries = frames.get("completion_summary", pd.DataFrame())
     rows = []
-    for table in config.tables:
+    for table in (table for config in configs for table in config.tables):
         probe = table.probe_name
         mine = statuses[statuses["probe"] == probe] if not statuses.empty else statuses
         healthy = _worst(list(mine["severity"])) if not mine.empty else None
@@ -303,16 +340,17 @@ def _status_rows(frames: dict[str, pd.DataFrame], config: ProbeConfig) -> list[d
 def emit_dashboard(
     store,
     run_id: str,
-    config: ProbeConfig,
+    configs: list[ProbeConfig],
     out_dir: str | Path,
 ) -> Path:
     """Write README.md + img/<probe>_<figure>.svg + report.html + the
-    published marker into out_dir. Returns the README path."""
+    published marker into out_dir, over EVERY campaign config. Returns the
+    README path."""
     out = Path(out_dir)
     (out / "img").mkdir(parents=True, exist_ok=True)
     manifest = next(m for m in store.list_runs() if m["run_id"] == run_id)
     frames = load_run_frames(store, run_id)
-    all_figures = build_all_figures(store, run_id, config)
+    all_figures = build_all_figures(store, run_id, configs)
 
     # ---- SVG figures: ONE batched export, then canonicalized in place
     exports = [
@@ -348,7 +386,8 @@ def emit_dashboard(
     )
     lines.append("")
     lines.append(
-        f"**Next update expected by:** {next_expected_by(config.campaign, manifest['run_at'])}"
+        "**Next update expected by:** "
+        f"{next_expected_by(configs[0].campaign, manifest['run_at'])}"
     )
     lines.append("")
     lines.append(
@@ -356,7 +395,7 @@ def emit_dashboard(
         "⏳ insufficient history · ➖ skipped"
     )
     lines.append("")
-    rows = _status_rows(frames, config)
+    rows = _status_rows(frames, configs)
     for database in sorted({row["database"] for row in rows}):
         lines.append(f"## {database}")
         lines.append("")
@@ -383,7 +422,7 @@ def emit_dashboard(
     readme.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # ---- self-contained HTML alongside (no extra PNGs: SVGs are committed)
-    generate_report(store, run_id, config, out, png=False)
+    generate_report(store, run_id, configs, out, png=False)
 
     # ---- the machine-readable publication marker (monotonic guard input)
     (out / PUBLISHED_MARKER).write_text(

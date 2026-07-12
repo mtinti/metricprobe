@@ -464,6 +464,11 @@ def test_mssql_store_shares_the_run_contract(mssql_engine):
     assert not any(m["run_id"] == run_id for m in store.list_runs())  # staged: invisible
     store.commit_run(run_id, manifest_for(meta))
     assert any(m["run_id"] == run_id for m in store.list_runs())
+    # the run reports which logical tables it holds (presentation reads
+    # exactly these and lets read failures on present ones propagate)
+    assert store.table_names(run_id) == ["month_volumes"]
+    with pytest.raises(FileNotFoundError):
+        store.table_names("never-committed")
     # post-commit lifecycle stages update the committed manifest in place
     store.record_stage(run_id, "render", {"completed_at": "2026-07-01T06:05:00"})
     store.record_stage(run_id, "publish", {"remotes": ["origin"]})

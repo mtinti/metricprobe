@@ -29,7 +29,7 @@ def report_dir(dashboard_run, tmp_path_factory):
     store, run_id, config = dashboard_run
     ensure_static_export_available()
     out = tmp_path_factory.mktemp("report")
-    generate_report(store, run_id, config, out)
+    generate_report(store, run_id, [config], out)
     return out
 
 
@@ -49,11 +49,23 @@ def test_report_is_self_contained_offline_html(report_dir, dashboard_run):
         assert table.probe_name in html_text
 
 
+def test_completion_views_are_tabs(report_dir):
+    """Curves are the DEFAULT view; the heatmap sits behind a tab toggle."""
+    html_text = (report_dir / "report.html").read_text(encoding="utf-8")
+    assert "mpShow(" in html_text and 'class="mp-tab' in html_text
+    # every heatmap pane starts hidden, every curves pane starts visible
+    hidden = re.findall(r'id="mp-\d+-heatmap" class="mp-pane" style="display:none"',
+                        html_text)
+    assert hidden, "no hidden heatmap panes"
+    assert 'id="mp-0-curves" class="mp-pane">' in html_text
+
+
 def test_pngs_exist_per_figure(report_dir):
     pngs = sorted(p.name for p in (report_dir / "img").glob("*.png"))
     assert pngs, "no PNGs were exported"
     assert any(name.endswith("_volume.png") for name in pngs)
     assert any(name.endswith("_completion_curves.png") for name in pngs)
+    assert any(name.endswith("_completion_heatmap.png") for name in pngs)  # tabbed too
     assert any(name.startswith("dual_registry_probe_dual_overlay") for name in pngs)
     for png in (report_dir / "img").glob("*.png"):
         assert png.stat().st_size > 1000  # a real raster, not an error stub

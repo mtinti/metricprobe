@@ -448,6 +448,25 @@ class MssqlStore:
             )
         del self._staged[run_id]
 
+    def table_names(self, run_id: str) -> list[str]:
+        """Logical table names readable for a committed run: the cataloged
+        data tables (store-wide) that hold rows for this run_id."""
+        if not any(m["run_id"] == run_id for m in self.list_runs()):
+            raise FileNotFoundError(f"run {run_id!r} is not committed")
+        names = []
+        with self.engine.connect() as conn:
+            for physical in self._data_tables():
+                present = conn.execute(
+                    sa.text(
+                        f"SELECT COUNT(*) FROM (SELECT TOP 1 run_id FROM "
+                        f"{self.schema}.{physical} WHERE run_id = :run_id) probe"
+                    ),
+                    {"run_id": run_id},
+                ).scalar_one()
+                if present:
+                    names.append(physical.removeprefix("mp_"))
+        return sorted(names)
+
     def record_stage(self, run_id: str, stage: str, info: dict) -> None:
         """Same post-commit stage record as the parquet store: one UPDATE of
         the committed manifest row."""
