@@ -1,4 +1,4 @@
-# Example metricprobe campaign config (placeholder values ONLY — everything
+# Example metricprobe campaign config (placeholder values ONLY; everything
 # environment-shaped enters via YOUR config, never this repository).
 #
 # Connection URLs are env-var expandable: ${PROD_DB_URL} is read at load time.
@@ -29,7 +29,7 @@ store:
 
 tables:
   - probe_name: orders_main
-    database: demo_db          # database.schema.table — always from config
+    database: demo_db          # database.schema.table, always from config
     schema: dbo
     table: orders
     event_time: order_date     # when the fact happened

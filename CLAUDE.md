@@ -2,7 +2,7 @@
 
 Repo description (use verbatim on GitHub):
 "When can you trust that a month of data is complete? Measures arrival latency and
-completeness for SQL tables — completion curves, freshness and volume checks, and a
+completeness for SQL tables: completion curves, freshness and volume checks, and a
 git-friendly status dashboard."
 README tagline: "Data arrival latency & completeness probes for database tables."
 

@@ -3,7 +3,7 @@
 Data arrival latency & completeness probes for database tables.
 
 When can you trust that a month of data is complete? `metricprobe` measures arrival
-latency and completeness for SQL tables — completion curves, freshness and volume
+latency and completeness for SQL tables: completion curves, freshness and volume
 checks, and a git-friendly status dashboard.
 
 Given a table with an *event time* column (when the fact happened) and a *load
@@ -22,7 +22,7 @@ default, or a SQL Server schema behind a config flag.
 ```
 python3 -m venv .venv
 # the supported install path is the release tag (PyPI is phase 2):
-.venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.4"
+.venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/mtinti/metricprobe@v0.1.4"
 # (or, from a checkout: pip install -e ".[export]")
 .venv/bin/metricprobe discover --url "$DB_URL" --database MyDb --out probe.yaml
 # review the draft: confirm the event/load column guesses, then
@@ -32,8 +32,8 @@ python3 -m venv .venv
 
 `metricprobe run` executes every configured probe sequentially under one run id
 and commits an atomic snapshot. With a `delivery:` section configured it owns
-the whole lifecycle in one process — analyse → commit → render the dashboard →
-push it to your git remotes — and exits 0 (all green), 2 (data-health red) or
+the whole lifecycle in one process (analyse, commit, render the dashboard,
+push it to your git remotes) and exits 0 (all green), 2 (data-health red) or
 1 (a stage failed; earlier stages stay committed).
 
 `metricprobe publish --config probe.yaml --out ./dashboard` emits a
@@ -42,7 +42,7 @@ HTML report) from the latest committed run, so a scheduled workflow can make
 the repo front page the dashboard.
 
 **What the output looks like:** see the committed demo dashboard at
-[`reports/README.md`](reports/README.md) — four fixed-seed synthetic
+[`reports/README.md`](reports/README.md): four fixed-seed synthetic
 databases (retail orders, IoT telemetry, card settlements, health episode
 records) with healthy and unhealthy twins, so every verdict is visible.
 A synthetic-data sample (an orders feed's completion curves):
@@ -59,12 +59,12 @@ Rendering figures to PNG/SVG uses Plotly's **kaleido**, which requires an
 installed **Chrome or Chromium**:
 
 ```
-pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.4"
+pip install "metricprobe[export] @ git+https://github.com/mtinti/metricprobe@v0.1.4"
 ```
 
 - Linux/macOS/Windows with Chrome already installed: nothing else to do.
 - **Locked-down Windows machines (no admin rights):** run `kaleido_get_chrome`
-  once — it downloads a private Chromium build into your user profile; no
+  once. It downloads a private Chromium build into your user profile; no
   system install or elevation required.
 - CI runners: GitHub's Ubuntu images ship Chrome preinstalled.
 
