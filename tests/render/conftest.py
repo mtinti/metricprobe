@@ -94,6 +94,17 @@ def dashboard_run(tmp_path_factory):
 
     g.load_into_duckdb(g.generate(TINY), con, "tiny_counts")
     entries.append(_entry("tiny_counts", "tiny_probe", suppress_small_counts=True))
+    # a CENSORED variant probe (variants are first-class): the trickle's real
+    # p95 (~35d) exceeds a 15-day lag cap, so the training cohort censors,
+    # learned_wait refuses, and the dashboard must say "> 15 d" — through the
+    # PRODUCTION path, not a fabricated snapshot
+    entries.append(
+        _entry(
+            "volume_spike_ok",
+            "censored_probe",
+            analysis={"lag_cap_days": 15, "training_cutoff_days": 365},
+        )
+    )
     con.close()
 
     config_path = root / "probe.yaml"

@@ -138,7 +138,14 @@ as Plotly figures via a static HTML/PNG report and a Streamlit app.
   (a nonzero exit mid-chain would make Actions skip them and hide RED).
   **PUBLISHED is claimed only after the actual delivery succeeded**, not after
   rendering. Staged states with per-stage atomicity and idempotent retry:
-  ANALYSIS_COMMITTED → ARTIFACTS_RENDERED → PUBLISHED. Retry (`--resume-from`)
+  ANALYSIS_COMMITTED → ARTIFACTS_RENDERED → PUBLISHED. Per-stage atomicity is
+  absolute for everything under the tool's control (store, artifacts,
+  single-remote delivery). Multi-remote delivery cannot be transactional
+  across independent git servers: a later push failure triggers a
+  COMPENSATING ROLLBACK of already-updated remotes (lease-pinned to the
+  exact commit pushed); only when that compensation itself also fails is the
+  residue recorded HONESTLY as `publish_partial` — never as PUBLISHED — and
+  the idempotent retry converges to a full publication. Retry (`--resume-from`)
   requires an explicit run_id and a matching config digest, and delivery performs a
   monotonic-publication check (an old failed run may never overwrite a newer
   published dashboard). **Exit codes are relative to the CONFIGURED stages**:

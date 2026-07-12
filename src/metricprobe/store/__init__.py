@@ -33,8 +33,11 @@ from metricprobe.config import StoreConfig, expand_env
 # v2: rows persist the canonical v2 / dual v2 cell shapes, probe_runs carries
 # the stable read-accounting columns, percentile frames carry lag_resolution.
 # v3: FROZEN physical column types (TYPED_COLUMNS incl. string casts for
-# identifier columns) and the mssql store's version marker + ownership catalog
-SNAPSHOT_SCHEMA_VERSION = 3
+# identifier columns) and the mssql store's version marker + ownership catalog.
+# v4: the persisted mature percentile summary (completion_summary pXX_mean/
+# _std) is REFUSED below min_mature_months — the same stored columns now
+# carry None where v3 stored a low-evidence mean (ALGORITHMS.md section 3)
+SNAPSHOT_SCHEMA_VERSION = 4
 
 STAMP_COLUMNS = (
     "run_id",

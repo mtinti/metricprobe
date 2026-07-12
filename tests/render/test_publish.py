@@ -65,6 +65,13 @@ def test_readme_status_block_and_table(dashboard_dir, dashboard_run):
     assert tiny_row.rstrip().endswith("| — | — |"), tiny_row
     assert "⏳" in tiny_row
     assert "p95 = mean ± std days" in text  # the legend explains the columns
+    # a probe whose training cohort is CENSORED past its lag cap renders the
+    # "> cap" cells — via the production status path (a censored cohort has
+    # no learned wait, hence no mature months to inspect)
+    censored_row = next(
+        line for line in text.splitlines() if "| censored_probe |" in line
+    )
+    assert "| > 15 d | > 0.5 mo |" in censored_row, censored_row
 
 
 def test_image_links_are_relative_and_exist(dashboard_dir):
@@ -193,24 +200,32 @@ def test_p95_cells_render_every_edge(dashboard_run):
         )
     }
     assert _p95_cells(healthy, "p", table) == ("12 ± 3 d", "0.4 mo")
+    # censoring is read from the persisted PERCENTILE_OVER_CAP status — the
+    # production signal (a censored training cohort produces no mature months
+    # at all, so inspecting mature months could never fire)
     censored = {
         "completion_summary": pd.DataFrame(
             {"probe": ["p"], "p95_mean": [None], "p95_std": [None]}
         ),
-        "month_volumes": pd.DataFrame(
-            {"probe": ["p"], "month": ["2024-01"], "state": ["mature"]}
-        ),
-        "completion_percentiles": pd.DataFrame(
-            {"probe": ["p"], "month": ["2024-01"], "pct": [95], "over_cap": [True]}
+        "statuses": pd.DataFrame(
+            {"probe": ["p"], "check": ["completion"],
+             "severity": ["insufficient_history"],
+             "reason": ["percentile_over_cap"]}
         ),
     }
     days, months = _p95_cells(censored, "p", table)
     assert days == f"> {table.analysis.lag_cap_days} d"
     assert months.startswith("> ") and months.endswith(" mo")
-    # censoring on an IMMATURE month is not a mature-summary censoring
-    immature = dict(censored)
-    immature["month_volumes"] = pd.DataFrame(
-        {"probe": ["p"], "month": ["2024-01"], "state": ["immature"]}
-    )
-    assert _p95_cells(immature, "p", table) == ("—", "—")
+    # insufficient WITHOUT censoring stays an em-dash
+    insufficient = {
+        "completion_summary": pd.DataFrame(
+            {"probe": ["p"], "p95_mean": [None], "p95_std": [None]}
+        ),
+        "statuses": pd.DataFrame(
+            {"probe": ["p"], "check": ["completion"],
+             "severity": ["insufficient_history"],
+             "reason": ["insufficient_mature_months"]}
+        ),
+    }
+    assert _p95_cells(insufficient, "p", table) == ("—", "—")
     assert _p95_cells({}, "p", table) == ("—", "—")

@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m venv .venv
-      - run: .venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.1"
+      - run: .venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/OWNER/metricprobe@v0.1.2"
       - name: campaign (analyse -> render -> publish, one process, exit = alert)
         env:
           METRICPROBE_DB_URL: ${{ secrets.METRICPROBE_DB_URL }}

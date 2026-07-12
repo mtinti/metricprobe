@@ -154,5 +154,5 @@ def test_component_versions_are_pinned():
         "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
         "canonical": 5,  # v5: pre-join watermark + physical n_staged_rows
         "dual": 5,  # v5: same pre-join watermark + n_staged_rows
-        "snapshot": 3,  # v3: frozen physical types, version marker, catalog
+        "snapshot": 4,  # v4: mature summary refused below min_mature_months
     }

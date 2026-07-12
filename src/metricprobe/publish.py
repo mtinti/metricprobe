@@ -368,24 +368,18 @@ def _badge(severity: Severity | None) -> str:
 _DAYS_PER_MONTH = 30.4375  # mean Gregorian month; presentation only
 
 
-def _mature_p95_censored(frames: dict[str, pd.DataFrame], probe: str) -> bool:
-    """True when a MATURE month's p95 is censored past the lag cap — the
-    reason the mature summary is refused. Checked over the REPORTED window
-    (percentile rows are window-bounded), so an old censored month outside
-    the window degrades to the plain em-dash, never a wrong number."""
-    volumes = frames.get("month_volumes", pd.DataFrame())
-    percentiles = frames.get("completion_percentiles", pd.DataFrame())
-    if volumes.empty or percentiles.empty:
+def _p95_censored(frames: dict[str, pd.DataFrame], probe: str) -> bool:
+    """True when censoring past the lag cap is WHY no p95 summary exists —
+    read from the probe's own PERCENTILE_OVER_CAP status. Detecting via
+    mature months would be unreachable in production: a censored training
+    cohort refuses learned_wait, without which NO month is ever classified
+    mature — the status is emitted on every censoring path (training cohort
+    or mature cohort) and is the persisted source of truth."""
+    statuses = frames.get("statuses", pd.DataFrame())
+    if statuses.empty:
         return False
-    mature = set(
-        volumes[(volumes["probe"] == probe) & (volumes["state"] == "mature")]["month"]
-    )
-    mine = percentiles[
-        (percentiles["probe"] == probe)
-        & (percentiles["pct"] == 95)
-        & percentiles["month"].isin(mature)
-    ]
-    return bool(mine["over_cap"].fillna(False).astype(bool).any())
+    mine = statuses[statuses["probe"] == probe]
+    return bool((mine["reason"] == "percentile_over_cap").any())
 
 
 def _p95_cells(
@@ -405,7 +399,7 @@ def _p95_cells(
                 f"{float(mean):.0f}{spread} d",
                 f"{float(mean) / _DAYS_PER_MONTH:.1f} mo",
             )
-    if _mature_p95_censored(frames, probe):
+    if _p95_censored(frames, probe):
         cap = table.analysis.lag_cap_days
         return f"> {cap} d", f"> {cap / _DAYS_PER_MONTH:.1f} mo"
     return "—", "—"

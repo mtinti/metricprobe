@@ -64,7 +64,11 @@ the wait is refused (PERCENTILE_OVER_CAP).
 - The user-facing `recommended_wait` = the same formula over MATURE months.
 - Headline percentile summary: for each of p50/p90/p95/p99, the (mean,
   population std) across mature months — undefined when any mature month's
-  percentile is over-cap.
+  percentile is over-cap, AND refused entirely (all None) when fewer than
+  `min_mature_months` mature months exist: the summary is a PUBLISHED claim
+  and is gated exactly like recommended_wait (a mean over two months must
+  never surface as a confident dashboard number). Introduced with snapshot
+  schema v4.
 - "complete back to" date = `as_of - recommended_wait` (Step 5 wiring).
 
 ## 4. Maturity (single-pass, exposure-based)
