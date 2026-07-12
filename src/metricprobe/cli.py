@@ -1168,12 +1168,15 @@ def cmd_abort(args) -> int:
     return 0
 
 
-def _unimplemented(command: str, step: str):
-    def handler(args) -> int:
-        print(f"metricprobe {command}: lands in {step}", file=sys.stderr)
-        return 1
-
-    return handler
+def _serve_skipped(args) -> int:
+    print(
+        "metricprobe serve: the Streamlit app (plan Step 10) was deliberately "
+        "SKIPPED in this build — `metricprobe report` produces the interactive "
+        "self-contained HTML instead. serve returns when the app step is picked "
+        "back up.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def main(argv=None) -> int:
@@ -1239,9 +1242,10 @@ def main(argv=None) -> int:
     abort.add_argument("--run-id", required=True)
     abort.set_defaults(handler=cmd_abort)
 
-    for command, step in (("serve", "Step 10"),):
-        stub = commands.add_parser(command)
-        stub.set_defaults(handler=_unimplemented(command, step))
+    serve = commands.add_parser(
+        "serve", help="(not built: the Streamlit app step was skipped)"
+    )
+    serve.set_defaults(handler=_serve_skipped)
 
     try:
         args = parser.parse_args(argv)

@@ -105,7 +105,11 @@ as Plotly figures via a static HTML/PNG report and a Streamlit app.
   completion needs the month dimension since a batch can span cohorts;
   (group_by_alt value) when configured; and the EMPTY () grouping set carrying the
   global scalars COUNT(*) vs COUNT(DISTINCT canonical key hash) for uniqueness
-  (without () they would compute per-set, not globally) —
+  (without () they would compute per-set, not globally). The () set is REALIZED
+  as a UNION ALL branch of the same statement: measured on SQL Server, the
+  distinct-count inside the GROUPING SETS plan spools per row (~150x one scan),
+  which would violate the read budget this same rule mandates; a golden test
+  proves the branch is row-for-row identical to the literal () grouping set —
   the hash is HASHBYTES SHA-256 over a **type-tagged, length-prefixed binary
   encoding with a distinct NULL sentinel** (delimiter concatenation is ambiguous:
   'a|b','c' and 'a','b|c' collide before hashing), and the check is documented as
@@ -148,9 +152,13 @@ as Plotly figures via a static HTML/PNG report and a Streamlit app.
   frozen alongside the config schema before any metric work.
 - **Analysis commits are atomic.** begin_run → staging → atomic run-manifest commit
   (or abort). Readers (report/publish/app) only read manifest-committed runs.
-- **Reports must work offline.** Static HTML embeds Plotly.js (no CDN). Streamlit
-  telemetry (`gatherUsageStats`) is disabled in shipped config. A test enforces
-  zero external URLs in report output.
+- **Reports must work offline.** Static HTML embeds Plotly.js (no CDN) and
+  carries a Content-Security-Policy that FORBIDS network fetches (browser-
+  enforced, not just linted). Streamlit telemetry (`gatherUsageStats`) is
+  disabled in shipped config. A test enforces zero external RESOURCE LOADS and
+  the CSP's presence in report output (the vendored Plotly.js source contains
+  inert URL string literals — attribution links and exporter constants that are
+  never fetched, and that the CSP would block if they ever were).
 - **Every output row is stamped** with `run_id`, `run_at`, `as_of`, `git_sha`,
   tool version, config digest, `schema_version`, and the analysed window, from the
   very first release.
@@ -282,7 +290,8 @@ silent on the healthy twin.
    vehicle; the container job is the truth-teller for the T-SQL dialect production
    actually runs.
 5. **viz/report smoke** — every figure builds for every scenario (incl. batchy and
-   missing-month); HTML report contains zero external URLs.
+   missing-month); HTML report loads zero external resources and carries the
+   no-network CSP.
 6. **CLI contract** — red status ⇒ non-zero exit code, tested like any feature.
 
 ### CI (GitHub Actions, also Gitea-compatible syntax)

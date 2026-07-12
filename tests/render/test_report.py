@@ -39,6 +39,14 @@ def test_report_is_self_contained_offline_html(report_dir, dashboard_run):
     assert "<script" in html_text and "plotly" in html_text.lower()
     assert not _EXTERNAL_RESOURCE.search(html_text), "external resource load found"
     assert not _CDN_SCRIPT.search(html_text), "CDN script tag found"
+    # the offline guarantee is browser-ENFORCED, not just linted: the page
+    # carries a CSP under which no network fetch can succeed (verified to
+    # render correctly under headless Chrome; the vendored plotly.js source
+    # contains inert URL string literals that this policy would block if any
+    # code path ever tried to fetch one)
+    assert 'http-equiv="Content-Security-Policy"' in html_text
+    assert "default-src 'none'" in html_text
+    assert "connect-src 'none'" in html_text
     # provenance header
     _, run_id, _ = dashboard_run
     assert run_id in html_text

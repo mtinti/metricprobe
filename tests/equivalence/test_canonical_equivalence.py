@@ -305,15 +305,49 @@ def test_scan_budget_enforced_through_the_production_runner(mssql_engine):
     # enforced too — the guard's reads are counted, fail-closed
     assert result.scratch_logical_reads is not None and result.scratch_logical_reads > 0
     assert result.scratch_logical_reads <= result.scratch_budget_reads
+    # the baseline is measured INDEPENDENTLY: the logical reads of an actual
+    # forced full scan of the base data, straight from STATISTICS IO — the
+    # budget must be 3x ONE SCAN, not 3x whatever the DMV happens to sum
     with mssql_engine.connect() as conn:
-        pages = conn.execute(
-            sa.text(
-                "SELECT SUM(used_page_count) FROM sys.dm_db_partition_stats "
-                "WHERE object_id = OBJECT_ID('dbo.events')"
-            )
-        ).scalar_one()
-    assert result.scan_budget_reads == 3 * pages
+        conn.exec_driver_sql("SET STATISTICS IO ON")
+        messages: list[str] = []
+        from metricprobe.extract.canonical import (
+            _install_message_capture,
+            _target_reads_from,
+        )
+
+        _install_message_capture(conn, messages)
+        conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM dbo.events WITH (INDEX(0))"  # force base scan
+        )
+        conn.exec_driver_sql("SELECT 1")  # flush pymssql's pending messages
+        one_scan = _target_reads_from(messages, {"events"})
+    assert one_scan is not None and one_scan > 0
+    # the enforced budget brackets 3x that measured single scan (page counts
+    # and read counts differ by small constants: IAM/allocation pages)
+    assert result.scan_budget_reads <= 3 * one_scan * 1.2
+    assert result.scan_budget_reads >= 3 * one_scan * 0.8
     assert result.target_logical_reads <= result.scan_budget_reads
+
+    # a fat NONCLUSTERED index must not inflate the baseline: the budget is
+    # the scan path (heap/clustered), not the sum of every index
+    with mssql_engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE NONCLUSTERED INDEX ix_events_fat ON dbo.events (row_id) "
+            "INCLUDE (event_time, load_time, batch_id)"
+        )
+    try:
+        engine = _engine_for(os.environ["METRICPROBE_MSSQL_URL"], True)
+        try:
+            with_index = run_canonical(engine, config, AS_OF)
+        finally:
+            engine.dispose()
+        assert with_index.scan_budget_reads <= result.scan_budget_reads * 1.1, (
+            "a nonclustered index inflated the scan-budget baseline"
+        )
+    finally:
+        with mssql_engine.begin() as conn:
+            conn.exec_driver_sql("DROP INDEX ix_events_fat ON dbo.events")
 
 
 def test_step5_metrics_match_between_dialects(duckdb_engine, mssql_engine):

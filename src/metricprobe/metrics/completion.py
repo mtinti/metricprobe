@@ -323,6 +323,10 @@ def assess_completion(
     if not statuses:
         statuses.append(Status(check=Check.COMPLETION, severity=Severity.GREEN))
 
+    # the mature summary is a PUBLISHED claim: below min_mature_months it is
+    # refused (all-None), exactly like recommended_wait — a mean over 2
+    # months would render as a confident number under INSUFFICIENT_HISTORY
+    summary_months = mature if len(mature) >= analysis.min_mature_months else []
     return CompletionAssessment(
         percentiles=percentiles,
         training_months=training,
@@ -330,7 +334,7 @@ def assess_completion(
         horizon=horizon,
         mature_months=mature,
         recommended_wait=rec_wait,
-        mature_percentile_summary=percentile_summary(percentiles, mature),
+        mature_percentile_summary=percentile_summary(percentiles, summary_months),
         f_mature=f_mature,
         negative_lag_excess_fraction=excess,
         statuses=statuses,

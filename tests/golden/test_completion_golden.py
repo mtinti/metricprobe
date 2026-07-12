@@ -3,6 +3,7 @@ from the generator parameters, honor the as-of watermark and NULL buckets,
 refuse censored percentiles, apply the negative-lag policy, and abort on caps.
 Assertion style: accumulate ALL failing cases into one message."""
 
+import dataclasses
 import functools
 
 import pandas as pd
@@ -352,3 +353,30 @@ def test_via_percentiles_match_generator_expectations():
             if got.over_cap or abs(got.value - want) > TOLERANCE_DAYS[pct]:
                 failures.append(f"{month} p{pct}: expected {want}, got {got}")
     assert not failures, "; ".join(failures)
+
+
+def test_insufficient_history_refuses_the_mature_summary():
+    """Below min_mature_months, the mature percentile summary is refused
+    (all None) exactly like recommended_wait — a mean over 2 months must
+    never surface as a confident published number."""
+    spec = g.TableSpec(
+        name="events", start_month="2024-01", n_months=15, rows_per_month=1000,
+        lag_model=g.LognormalLag(mu=1.6, sigma=0.8), seed=88,
+    )
+    config = table_config(analysis={"lag_cap_days": 300, "training_cutoff_days": 365})
+    # as_of leaves only ~2 mature months (< the default minimum of 6)
+    assessment = assess_completion(
+        probe(g.generate(spec), config, "2025-04-10"), config, pd.Timestamp("2025-04-10")
+    )
+    assert 0 < len(assessment.mature_months) < 6
+    assert assessment.recommended_wait is None
+    assert all(v is None for v in assessment.mature_percentile_summary.values())
+    assert any(
+        s.reason is ReasonCode.INSUFFICIENT_MATURE_MONTHS for s in assessment.statuses
+    )
+    # ...and with enough mature months the summary IS published
+    grown = dataclasses.replace(spec, n_months=30)
+    sufficient = assess_completion(
+        probe(g.generate(grown), config, "2026-07-01"), config, pd.Timestamp("2026-07-01")
+    )
+    assert sufficient.mature_percentile_summary[95] is not None

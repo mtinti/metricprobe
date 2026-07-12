@@ -60,8 +60,10 @@ def test_readme_status_block_and_table(dashboard_dir, dashboard_run):
     assert re.search(r"\d{4}-\d{2}-\d{2}", healthy_row), healthy_row
     assert re.search(r"\| \d+ ± \d+ d \| \d+\.\d mo \|", healthy_row), healthy_row
     # a probe with nothing classifiable renders em-dashes, never a number
+    # (the tiny probe is deliberately too young: INSUFFICIENT_HISTORY)
     tiny_row = next(line for line in text.splitlines() if "| tiny_probe |" in line)
-    assert tiny_row.rstrip().endswith("|")
+    assert tiny_row.rstrip().endswith("| — | — |"), tiny_row
+    assert "⏳" in tiny_row
     assert "p95 = mean ± std days" in text  # the legend explains the columns
 
 

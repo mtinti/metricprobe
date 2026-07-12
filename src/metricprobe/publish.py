@@ -189,7 +189,7 @@ def check_monotonic_publication(candidate_run_at: str, published_run_ats: list[s
         )
 
 
-def _git(clone: Path, *args: str) -> str:
+def _git(clone: Path, *args: str, input_text: str | None = None) -> str:
     """Run git in `clone` with a fixed identity; logic stays in Python (the
     CI workflow is one invocation, never a chain of shell one-liners)."""
     result = subprocess.run(
@@ -198,6 +198,7 @@ def _git(clone: Path, *args: str) -> str:
         cwd=clone,
         capture_output=True,
         text=True,
+        input=input_text,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -236,14 +237,15 @@ def _remote_has_ref(clone: Path, url: str, ref: str) -> bool:
 
 
 class PartialDelivery(RuntimeError):
-    """Some remotes were updated before a later push failed. `pushed` names
-    them; the run must NOT be recorded as PUBLISHED."""
+    """Some remotes still hold this run after a later push failed AND the
+    compensating rollback could not restore them. `pushed` names them; the
+    run must NOT be recorded as PUBLISHED."""
 
     def __init__(self, pushed: list[str], failed: str, error: Exception):
         self.pushed = pushed
         super().__init__(
-            f"push to remote {failed!r} failed after {', '.join(pushed)} already "
-            f"updated: {error}"
+            f"push to remote {failed!r} failed and rollback left "
+            f"{', '.join(pushed)} still updated: {error}"
         )
 
 
@@ -274,8 +276,10 @@ def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> li
         clone.mkdir(parents=True, exist_ok=True)
         if not (clone / ".git").exists():
             _git(clone, "init", "--initial-branch", remote.ref)
+        prior_head: str | None = None  # None = the remote ref did not exist
         if _remote_has_ref(clone, url, remote.ref):
             _git(clone, "fetch", url, f"+refs/heads/{remote.ref}:refs/remotes/delivery/head")
+            prior_head = _git(clone, "rev-parse", "refs/remotes/delivery/head").strip()
             _git(clone, "checkout", "-B", "mp-delivery", "refs/remotes/delivery/head")
             published = clone / PUBLISHED_MARKER
             if published.exists():
@@ -293,23 +297,57 @@ def deliver(artifacts_dir: str | Path, delivery, run_id: str, run_at: str) -> li
         _git(clone, "add", "-A")
         if _git(clone, "status", "--porcelain").strip():
             _git(clone, "commit", "-m", f"metricprobe dashboard {run_id}")
-        prepared.append((remote, url, clone))
+        prepared.append((remote, url, clone, prior_head))
 
-    # ---- phase 2: push. Cross-remote pushes cannot be transactional: when a
-    # later push fails after earlier ones landed, PartialDelivery reports
-    # exactly which remotes now hold the run so the caller can record the
-    # partial state honestly. Each push is idempotent — the retry re-pushes
-    # no-change commits and converges to a full publication.
-    pushed = []
-    for remote, url, clone in prepared:
+    # ---- phase 2: push. Cross-remote pushes cannot be transactional; when a
+    # later push fails after earlier ones landed, a COMPENSATING ROLLBACK
+    # restores every already-pushed remote to its prior head (or deletes a
+    # ref this delivery created), so the failed stage leaves nothing partial.
+    # Only when the rollback ITSELF fails is PartialDelivery raised, naming
+    # the remotes that still hold the run so the caller records the state
+    # honestly; the retry converges (pushes are idempotent).
+    pushed: list[tuple[object, str, Path, str | None]] = []
+    for remote, url, clone, prior_head in prepared:
         try:
             _git(clone, "push", url, f"HEAD:refs/heads/{remote.ref}")
         except Exception as error:
-            if pushed:
-                raise PartialDelivery(pushed, remote.name, error) from error
-            raise
-        pushed.append(remote.name)
-    return pushed
+            if not pushed:
+                raise
+            failed_rollbacks = []
+            for done_remote, done_url, done_clone, done_prior in pushed:
+                try:
+                    # the lease pins the rollback to the exact commit WE
+                    # pushed: a concurrent writer's newer state is never
+                    # clobbered by our compensation
+                    ours = _git(done_clone, "rev-parse", "HEAD").strip()
+                    lease = f"--force-with-lease=refs/heads/{done_remote.ref}:{ours}"
+                    if done_prior is None:
+                        # this delivery CREATED the ref; deleting the default
+                        # branch of a bare remote is commonly prohibited, so
+                        # restore "unpublished" as an EMPTY commit: no marker,
+                        # no dashboard, monotonic guard sees a clean slate
+                        tree = _git(done_clone, "mktree", input_text="").strip()
+                        rollback = _git(
+                            done_clone, "commit-tree", tree,
+                            "-m", "metricprobe delivery rollback",
+                        ).strip()
+                        target = f"{rollback}:refs/heads/{done_remote.ref}"
+                    else:
+                        target = f"{done_prior}:refs/heads/{done_remote.ref}"
+                    _git(done_clone, "push", "--force", lease, done_url, target)
+                except Exception:  # noqa: BLE001 — collected, reported below
+                    failed_rollbacks.append(done_remote.name)
+            if failed_rollbacks:
+                raise PartialDelivery(
+                    failed_rollbacks, remote.name, error
+                ) from error
+            raise RuntimeError(
+                f"push to remote {remote.name!r} failed; the "
+                f"{len(pushed)} already-updated remote(s) were rolled back "
+                f"to their prior state: {error}"
+            ) from error
+        pushed.append((remote, url, clone, prior_head))
+    return [remote.name for remote, _, _, _ in pushed]
 
 
 # ---------------------------------------------------------------- the README

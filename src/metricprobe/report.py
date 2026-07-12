@@ -187,6 +187,15 @@ def generate_report(
     body = "\n".join(parts)
     document = (
         "<!DOCTYPE html>\n<html><head><meta charset='utf-8'>"
+        # the OFFLINE guarantee, browser-ENFORCED: no network fetch of any
+        # kind can succeed when this page opens — inline script/style and
+        # data:/blob: assets only. The vendored plotly.js source contains
+        # inert URL string literals; this policy would block them if any
+        # code path ever tried to fetch one.
+        '<meta http-equiv="Content-Security-Policy" content="'
+        "default-src 'none'; script-src 'unsafe-inline' blob:; "
+        "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; "
+        'connect-src \'none\'">'
         "<title>metricprobe report</title></head>\n"
         f"<body>\n{body}\n</body></html>\n"
     )

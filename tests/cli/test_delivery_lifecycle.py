@@ -320,9 +320,10 @@ def test_render_record_failure_rolls_the_swap_back(campaign, tmp_path, monkeypat
                  "--resume-from", "render", "--run-id", "r-roll"]) == 0
 
 
-def test_partial_multi_remote_push_is_recorded_honestly(campaign, tmp_path, monkeypatch):
-    """When a later push fails after an earlier one landed, the manifest
-    records publish_partial (never PUBLISHED), and the retry converges."""
+def test_partial_push_rolls_earlier_remotes_back(campaign, tmp_path, monkeypatch):
+    """When a later push fails after an earlier one landed, the compensating
+    rollback restores the earlier remote to its prior state — the failed
+    stage leaves nothing partial — and the retry then publishes both."""
     import metricprobe.publish as publish_module
 
     config, store_root, bare = campaign
@@ -339,25 +340,65 @@ def test_partial_multi_remote_push_is_recorded_honestly(campaign, tmp_path, monk
     real_git = publish_module._git
     state = {"fail_mirror_push": True}
 
-    def flaky_git(clone, *args):
+    def flaky_git(clone, *args, **kwargs):
         if (
             state["fail_mirror_push"]
             and args[0] == "push"
-            and "mirror.git" in str(args[1])
+            and "mirror.git" in " ".join(str(a) for a in args)
         ):
             raise RuntimeError("injected network failure")
-        return real_git(clone, *args)
+        return real_git(clone, *args, **kwargs)
 
     monkeypatch.setattr(publish_module, "_git", flaky_git)
     assert main(["run", "--config", str(two), "--as-of", AS_OF,
                  "--run-id", "r-partial"]) == 1
     (manifest,) = ParquetStore(store_root).list_runs()
     assert "publish" not in manifest["stages"]  # PUBLISHED never claimed
-    assert manifest["stages"]["publish_partial"]["remotes"] == ["origin"]
-    assert "README.md" in _pushed_files(bare)  # the first remote DID land
-    # the retry converges to a full publication
+    # the first remote was pushed, then ROLLED BACK to an unpublished state
+    # (an empty commit: deleting a bare remote's default branch is commonly
+    # prohibited) — no dashboard, no marker survives the failed stage
+    assert "publish_partial" not in manifest["stages"]
+    assert _pushed_files(bare) == {}
+    # the retry converges to a full publication of BOTH remotes
     state["fail_mirror_push"] = False
     assert main(["run", "--config", str(two), "--as-of", AS_OF,
                  "--resume-from", "publish", "--run-id", "r-partial"]) == 0
     (manifest,) = ParquetStore(store_root).list_runs()
     assert manifest["stages"]["publish"]["remotes"] == ["origin", "mirror"]
+    for remote in (bare, second):
+        assert "README.md" in _pushed_files(remote)
+
+
+def test_failed_rollback_is_recorded_as_partial(campaign, tmp_path, monkeypatch):
+    """Only when the compensating rollback ITSELF fails does the manifest
+    record publish_partial — the honest fallback, never a silent lie."""
+    import metricprobe.publish as publish_module
+
+    config, store_root, bare = campaign
+    second = tmp_path / "mirror.git"
+    second.mkdir()
+    _git(second, "init", "--bare", "--initial-branch", "main")
+    text = yaml.safe_load(config.read_text())
+    text["delivery"]["remotes"].append(
+        {"name": "mirror", "url": f"file://{second}", "ref": "main"}
+    )
+    two = tmp_path / "two.yaml"
+    two.write_text(yaml.safe_dump(text))
+
+    real_git = publish_module._git
+
+    def hostile_git(clone, *args, **kwargs):
+        args_text = " ".join(str(a) for a in args)
+        if args[0] == "push" and "mirror.git" in args_text:
+            raise RuntimeError("injected network failure")
+        if args[0] == "push" and "force-with-lease" in args_text:
+            raise RuntimeError("rollback also failed")
+        return real_git(clone, *args, **kwargs)
+
+    monkeypatch.setattr(publish_module, "_git", hostile_git)
+    assert main(["run", "--config", str(two), "--as-of", AS_OF,
+                 "--run-id", "r-stuck"]) == 1
+    (manifest,) = ParquetStore(store_root).list_runs()
+    assert "publish" not in manifest["stages"]
+    assert manifest["stages"]["publish_partial"]["remotes"] == ["origin"]
+    assert "README.md" in _pushed_files(bare)  # origin genuinely still holds it

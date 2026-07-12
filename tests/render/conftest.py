@@ -21,8 +21,10 @@ from metricprobe.store import ParquetStore
 AS_OF = "2025-07-24"
 RUN_ID = "render-fixture"
 
+# suppressed AND too young to classify: exercises "<5" masking end to end
+# and the em-dash p95 cells under INSUFFICIENT_HISTORY
 TINY = g.TableSpec(
-    name="tiny", start_month="2024-01", n_months=18, rows_per_month=3,
+    name="tiny", start_month="2025-01", n_months=7, rows_per_month=3,
     lag_model=g.LognormalLag(mu=1.0, sigma=0.5), seed=404,
 )
 

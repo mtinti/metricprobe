@@ -704,8 +704,12 @@ def _bracket(name: str) -> str:
 
 
 def _mssql_target_pages(conn, table: TableConfig) -> int | None:
-    """used_page_count of the probed table (+ lookup for via probes); None when
-    the DMV is not readable (budget then unenforced, by design)."""
+    """Pages of ONE full scan of the probed table (+ lookup for via probes):
+    the heap or clustered index ONLY (index_id 0/1). Summing every index
+    would let nonclustered indexes inflate the baseline and quietly loosen
+    the <=3x budget — and if the optimizer picks a covering nonclustered
+    index instead, its scan is SMALLER than this baseline, so the bound
+    still holds. None when the DMV is not readable (fail-closed upstream)."""
     locators = [(table.database, table.table_schema, table.table)]
     if table.event_time_via is not None:
         via = table.event_time_via
@@ -716,7 +720,8 @@ def _mssql_target_pages(conn, table: TableConfig) -> int | None:
             pages = conn.execute(
                 sa.text(
                     f"SELECT SUM(used_page_count) FROM {_bracket(database)}.sys."
-                    "dm_db_partition_stats WHERE object_id = OBJECT_ID(:full_name)"
+                    "dm_db_partition_stats WHERE object_id = OBJECT_ID(:full_name) "
+                    "AND index_id IN (0, 1)"
                 ),
                 {"full_name": f"{database}.{schema}.{name}"},
             ).scalar()
