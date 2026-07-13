@@ -85,7 +85,13 @@ from metricprobe.status import ReasonCode
 # v6: the grouped branch drops cells fed only by guard artifacts
 # (HAVING SUM(is_probe_row) > 0) — they created bogus NULL-alt cells and
 # counted against result_cell_cap
-CANONICAL_SCHEMA_VERSION = 6
+# v7: the as_of watermark literal is whole-second, T-separated, and CAST to
+# DATETIME2(0) on mssql — locale-independent under any SET DATEFORMAT, and
+# the comparison keeps the cutoff's own precision (a bare string degrades to
+# the column type; SMALLDATETIME would round a latter-half-minute cutoff UP,
+# admitting rows loaded after the recorded as_of). Changes the admitted
+# population versus unfloored/untyped cutoffs.
+CANONICAL_SCHEMA_VERSION = 7
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -160,6 +166,34 @@ RESULT_COLUMNS = (
 # lag-day combination). result_cell_cap bounds cells per set; the aggregation
 # query also carries a server-side row limit of cap x set-count + 1 so the
 # database never returns unbounded rows even before the client counts them.
+
+
+
+class AsOfLiteral(sa.types.TypeDecorator):
+    """The as_of watermark literal, rendered LOCALE-INDEPENDENTLY and typed.
+
+    mssql: CAST('YYYY-MM-DDTHH:MM:SS' AS DATETIME2(0)). The T separator is
+    the only datetime string SQL Server parses identically under every
+    SET DATEFORMAT (space-separated '2026-07-13 07:49:08' raises Msg 242
+    under dmy, and an ambiguous day silently swaps month and day). The
+    DATETIME2 cast keeps the COMPARISON at the cutoff's own precision: a
+    bare string degrades to the column's type, and SMALLDATETIME would
+    round a latter-half-minute cutoff UP, admitting rows loaded after the
+    recorded as_of. duckdb: a standard TIMESTAMP literal.
+    isoformat(timespec="seconds") also re-floors defensively.
+    """
+
+    impl = sa.DateTime
+    cache_ok = True
+
+    def literal_processor(self, dialect):
+        def process(value):
+            iso = pd.Timestamp(value).isoformat(sep="T", timespec="seconds")
+            if dialect.name == "mssql":
+                return f"CAST('{iso}' AS DATETIME2(0))"
+            return f"TIMESTAMP '{iso}'"
+
+        return process
 
 
 class ProbeAborted(Exception):
@@ -375,7 +409,7 @@ def build_staging_select(
             )
             .where(
                 sa.or_(
-                    raw_load <= sa.bindparam("as_of", type_=sa.DateTime()),
+                    raw_load <= sa.bindparam("as_of", type_=AsOfLiteral()),
                     raw_load.is_(None),
                 )
             )
@@ -537,7 +571,7 @@ def build_staging_select(
         # the bare <= would silently delete the NULL-load bucket. (Via probes
         # carry this predicate INSIDE the base subquery, before the join.)
         select = select.where(
-            sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None))
+            sa.or_(load <= sa.bindparam("as_of", type_=AsOfLiteral()), load.is_(None))
         )
     return select
 
@@ -871,6 +905,16 @@ class CanonicalResult:
     scratch_logical_reads: int | None = None  # aggregation reads incl. the guard
     scratch_budget_reads: int | None = None  # (branches + 1) x staging pages
     staging_spool_reads: int | None = None  # staging stmt worktables (via window spool)
+
+    @property
+    def staged_row_count(self) -> int | None:
+        """Physical rows staged into the temp table (probe rows + guard-only
+        artifacts), from the () row — the tempdb sizing observable."""
+        rows = self.frame[self.frame["grouping_id"] == GROUPING_SET_IDS["global"]]
+        if rows.empty or "n_staged_rows" not in rows.columns:
+            return None
+        value = rows.iloc[0]["n_staged_rows"]
+        return None if pd.isna(value) else int(value)
 
     def rows_for(self, set_name: str) -> pd.DataFrame:
         gid = GROUPING_SET_IDS[set_name]

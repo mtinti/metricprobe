@@ -354,6 +354,15 @@ bogus NULL-alt (and NULL-month/epoch) cell — row_count 0, but a real cell
 against `result_cell_cap`. The dual pass exempts its () global row from the
 HAVING, because that row must exist even over an empty base — it carries
 max_lookup_dup, the uniqueness guard's answer for exactly that case.
+v7 (both passes): the as_of watermark literal is whole-second, T-separated
+ISO-8601, and CAST to DATETIME2(0) on mssql. The T separator is the only
+datetime string SQL Server parses identically under every SET DATEFORMAT
+(the space form raises Msg 242 under dmy — or silently swaps month and day
+when both fit); the DATETIME2 cast keeps the comparison at the cutoff's own
+precision, because a bare string degrades to the column's type and
+SMALLDATETIME would round a latter-half-minute cutoff UP, admitting rows
+loaded after the recorded as_of. This changes the admitted population versus
+unfloored or untyped cutoffs, hence the version bump.
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,
@@ -363,16 +372,21 @@ than their own staging projection it is unsatisfiable by ANY architecture
 that materializes derived columns.
 
 Tempdb CAPACITY (distinct from the read ledgers): the staging step
-(`SELECT ... INTO #mp_probe`) materializes one narrow row per probed row —
-around 60–100 bytes across the derived columns, so roughly 30–50 GB of
-tempdb for a 500M-row table, transient per probe (probes run sequentially;
-the temp table drops with the connection). This is the deliberate design
-trade: staging feeds every grouping set AND the () distinct-count branch
-from ONE scan of the production table, where direct GROUPING SETS
-aggregation was measured to spool the distinct count per row (~150x one
-scan) — the read budget forbids that. The physical `n_staged_rows` count is
-in every snapshot; operators sizing a deployment should check tempdb free
-space against the largest probed table before the first full-scale run.
+(`SELECT ... INTO #mp_probe`) materializes one row per STAGED row — every
+probed row, plus one guard artifact per unreferenced lookup row on via
+probes. The fixed derived columns are ~60 bytes; batch_id, alt_value and
+key_hash are staged at their actual string widths on top, so the per-row
+size is configuration-dependent and 60 bytes is a FLOOR, not a bound: a
+500M-row table starts around 30 GB of transient tempdb and grows with the
+configured string columns (probes run sequentially; the temp table drops
+with the connection). This is the deliberate design trade: staging feeds
+every grouping set AND the () distinct-count branch from ONE scan of the
+production table, where direct GROUPING SETS aggregation was measured to
+spool the distinct count per row (~150x one scan) — the read budget forbids
+that. The physical staged-row count is persisted per probe as
+`n_staged_rows` in the probe_runs snapshot table (snapshot schema v5);
+operators sizing a deployment should check tempdb free space against the
+largest probed table before the first full-scale run.
 The as_of watermark is rendered as a whole-second literal (floored at CLI
 entry and again in the builders): a microsecond literal fails conversion
 against legacy DATETIME/SMALLDATETIME load columns (Msg 241), and the

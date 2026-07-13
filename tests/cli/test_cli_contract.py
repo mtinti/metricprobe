@@ -561,3 +561,46 @@ def test_manual_runs_can_be_forbidden(tmp_path, demo_db, monkeypatch):
     assert run_cli("--config", config, "--as-of", AS_OF) == 1  # manual: refused
     monkeypatch.setenv("METRICPROBE_SCHEDULED", "1")
     assert run_cli("--config", config, "--as-of", AS_OF) == 0  # scheduled: runs
+
+
+def test_resume_accepts_the_identical_microsecond_as_of(tmp_path, demo_db, monkeypatch):
+    """The cutoff's NORMAL FORM (whole seconds) applies on EVERY entry path:
+    retrying a failed run with the byte-identical explicit --as-of (carrying
+    microseconds) must resume, and a pre-normal-form registration adopted on
+    resume is re-normalized so the manifest as_of equals the queried one."""
+    import json
+
+    import metricprobe.cli as cli
+
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    fractional = "2025-07-02T07:49:08.085711"
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("injected analysis failure")
+
+    monkeypatch.setattr(cli, "assess_volume", explode)
+    assert run_cli("--config", config, "--as-of", fractional, "--run-id", "r-us") == 1
+    monkeypatch.undo()
+    # the reviewer's repro: the IDENTICAL flag used to be refused because the
+    # unfloored argument was compared against the floored registration
+    assert (
+        run_cli("--config", config, "--as-of", fractional,
+                "--resume-from", "analysis", "--run-id", "r-us") == 0
+    )
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    assert manifest["as_of"] == "2025-07-02T07:49:08"  # stamped == queried
+
+    # a v0.1.4-era registration (microseconds recorded) is adopted NORMALIZED
+    store = ParquetStore(tmp_path / "store")
+    registration_path = store._registration("r-old")
+    monkeypatch.setattr(cli, "assess_volume", explode)
+    assert run_cli("--config", config, "--as-of", "2025-07-02", "--run-id", "r-old") == 1
+    monkeypatch.undo()
+    recorded = json.loads(registration_path.read_text(encoding="utf-8"))
+    recorded["as_of"] = fractional  # forge the pre-normal-form registration
+    registration_path.write_text(json.dumps(recorded), encoding="utf-8")
+    assert run_cli("--config", config, "--resume-from", "analysis", "--run-id", "r-old") == 0
+    manifest = next(
+        m for m in ParquetStore(tmp_path / "store").list_runs() if m["run_id"] == "r-old"
+    )
+    assert manifest["as_of"] == "2025-07-02T07:49:08"  # floored on adoption

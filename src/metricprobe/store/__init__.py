@@ -36,8 +36,10 @@ from metricprobe.config import StoreConfig, expand_env
 # identifier columns) and the mssql store's version marker + ownership catalog.
 # v4: the persisted mature percentile summary (completion_summary pXX_mean/
 # _std) is REFUSED below min_mature_months — the same stored columns now
-# carry None where v3 stored a low-evidence mean (ALGORITHMS.md section 3)
-SNAPSHOT_SCHEMA_VERSION = 4
+# carry None where v3 stored a low-evidence mean (ALGORITHMS.md section 3).
+# v5: probe_runs carries n_staged_rows (the main pass's physical staging
+# size — the tempdb sizing observable, ALGORITHMS.md section 15)
+SNAPSHOT_SCHEMA_VERSION = 5
 
 STAMP_COLUMNS = (
     "run_id",

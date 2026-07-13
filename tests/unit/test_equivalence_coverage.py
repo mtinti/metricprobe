@@ -129,6 +129,10 @@ COVERAGE: dict[str, str] = {
         "test_mssql_store_sweeps_are_isolated_and_types_are_frozen",
     "dialect_branch:store.MssqlStore.commit_run":
         "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:extract.canonical.AsOfLiteral.literal_processor":
+        "test_legacy_datetime_columns_accept_a_microsecond_as_of",
+    "dialect_branch:extract.canonical.CanonicalResult.staged_row_count":
+        "test_legacy_datetime_columns_accept_a_microsecond_as_of",
     "dialect_branch:store.MssqlStore.record_stage":
         "test_mssql_store_shares_the_run_contract",
     "dialect_branch:store.MssqlStore.prepare_stage":

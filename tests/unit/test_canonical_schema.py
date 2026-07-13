@@ -26,11 +26,12 @@ def test_schema_version_is_pinned():
     # v2: the scan-budget accounting formulas changed (ALGORITHMS section 15);
     # v3: windowed global lookup max; v4: FULL OUTER lookup guard; v5:
     # pre-join watermark for via probes + physical n_staged_rows; v6:
-    # guard-artifact-only cells dropped from the grouped branch;
+    # guard-artifact-only cells dropped from the grouped branch; v7:
+    # whole-second locale-independent typed as_of literal;
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 6
+    assert CANONICAL_SCHEMA_VERSION == 7
 
 
 def test_grouping_ids_are_frozen():
@@ -422,6 +423,14 @@ def test_as_of_literal_is_whole_second_in_every_staging_statement():
         dual_staging_sql(dual_table, "mssql", as_of=as_of),
         dual_staging_sql(dual_table, "duckdb", as_of=as_of),
     ]
+    mssql_statements, duckdb_statements = statements[::2], statements[1::2]
+    for sql in mssql_statements:
+        # locale-independent AND precision-typed: T separator (dmy-safe) and
+        # DATETIME2(0) cast (a bare string degrades to the column type;
+        # SMALLDATETIME would round a latter-half-minute cutoff upward)
+        assert "CAST('2026-07-13T07:49:08' AS DATETIME2(0))" in sql
+    for sql in duckdb_statements:
+        assert "TIMESTAMP '2026-07-13T07:49:08'" in sql
     for sql in statements:
-        assert "2026-07-13 07:49:08" in sql  # the floored watermark IS there
+        assert "2026-07-13 07:49:08" not in sql  # the space form is the dmy trap
         assert ".085" not in sql and "085711" not in sql, sql[-200:]

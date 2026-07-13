@@ -666,12 +666,15 @@ def test_mssql_store_sweeps_are_isolated_and_types_are_frozen(mssql_engine):
 
 
 def test_legacy_datetime_columns_accept_a_microsecond_as_of(duckdb_engine, mssql_engine):
-    """Type-precision regression (found in production, B3): a microsecond
-    as_of used to be inlined as a six-fractional-digit literal, which legacy
-    DATETIME (3 digits max) and SMALLDATETIME reject with Msg 241 — while
-    datetime2 parses it, so a datetime2-only harness never sees the bug. The
-    literal is now floored to whole seconds; this case pins BOTH legacy
-    types AND that the numbers still match DuckDB exactly."""
+    """Type-precision AND locale regression (found in production, B3): a
+    microsecond as_of used to be inlined as a six-fractional-digit literal,
+    which legacy DATETIME (3 digits max) and SMALLDATETIME reject with Msg
+    241 — while datetime2 parses it, so a datetime2-only harness never sees
+    the bug. The session ALSO runs under SET DATEFORMAT dmy with a day > 12
+    in the cutoff: a space-separated literal raises Msg 242 there (or
+    silently swaps month and day); only the T-separated ISO form is
+    locale-independent. Numbers must still match DuckDB exactly."""
+    import sqlalchemy as sa_events
     from sqlalchemy.dialects import mssql as mssql_types
 
     df = _dataset()
@@ -690,9 +693,62 @@ def test_legacy_datetime_columns_accept_a_microsecond_as_of(duckdb_engine, mssql
         },
     )
 
-    microsecond_as_of = pd.Timestamp("2026-07-01 07:49:08.085711")
+    # the hostile locale applies to the PROBE's connections (a real login's
+    # DATEFORMAT is set at query time). It is flipped only after the load:
+    # pymssql itself sends datetime parameters as locale-sensitive strings,
+    # so a dmy session would break the seeding INSERTs, not the probe.
+    @sa_events.event.listens_for(mssql_engine, "connect")
+    def _hostile_locale(dbapi_connection, record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SET DATEFORMAT dmy")
+        cursor.close()
+
+    mssql_engine.dispose()  # drop pooled connections: probes reconnect as dmy
+
+    microsecond_as_of = pd.Timestamp("2026-07-13 07:49:08.085711")  # day > 12
     duck = run_canonical(duckdb_engine, _config("memory", "main"), microsecond_as_of)
     mssql = run_canonical(mssql_engine, _config("tempdb", "dbo"), microsecond_as_of)
     pd.testing.assert_frame_equal(
         _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
     )
+    # the tempdb sizing observable agrees across engines and counts all rows
+    assert duck.staged_row_count == mssql.staged_row_count == len(df)
+
+
+def test_smalldatetime_cannot_admit_rows_after_the_cutoff(duckdb_engine, mssql_engine):
+    """Precision-degradation boundary: comparing a SMALLDATETIME column
+    against a bare string converts the CUTOFF to smalldatetime, which ROUNDS
+    a latter-half-minute cutoff up — '07:49:45' becomes 07:50:00 and admits
+    a row loaded 15 seconds AFTER the recorded as_of. The DATETIME2(0) cast
+    keeps the comparison at the cutoff's own precision: exactly one of the
+    three rows is admitted, identically on both engines."""
+    from sqlalchemy.dialects import mssql as mssql_types
+
+    df = pd.DataFrame(
+        {
+            "row_id": [1, 2, 3],
+            "event_time": pd.to_datetime(["2026-06-01 12:00:00"] * 3),
+            "load_time": pd.to_datetime(
+                # before the cutoff / 15s after (the rounding trap) / far after
+                ["2026-06-02 07:49:00", "2026-06-02 07:50:00", "2026-06-02 08:10:00"]
+            ),
+            "batch_id": ["b1", "b1", "b1"],
+        }
+    )
+    g.load_via_sqlalchemy(df, duckdb_engine, "events")
+    g.load_via_sqlalchemy(
+        df, mssql_engine, "events", dtype={"load_time": mssql_types.SMALLDATETIME()}
+    )
+
+    latter_half_minute = pd.Timestamp("2026-06-02 07:49:45.5")
+    duck = run_canonical(
+        duckdb_engine, _config("memory", "main", key_cols=["row_id"]), latter_half_minute
+    )
+    mssql = run_canonical(
+        mssql_engine, _config("tempdb", "dbo", key_cols=["row_id"]), latter_half_minute
+    )
+    pd.testing.assert_frame_equal(
+        _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
+    )
+    global_row = mssql.rows_for("global").iloc[0]
+    assert int(global_row["row_count"]) == 1  # ONLY the pre-cutoff row

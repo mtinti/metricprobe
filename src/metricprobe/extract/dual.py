@@ -10,7 +10,9 @@ used the pages-only scratch budget; v2's guard saw only joined lookup rows;
 v3 staged a windowed global max; v4 uses the main pass's FULL OUTER shape:
 every lookup row is staged, guard-only artifact rows carry is_probe_row = 0;
 v5 watermarks the base BEFORE the join and adds the physical n_staged_rows;
-v6 drops guard-artifact-only cells from the grouped branch).
+v6 drops guard-artifact-only cells from the grouped branch;
+v7 renders the as_of literal whole-second, T-separated, CAST to DATETIME2(0)
+on mssql — locale-independent and precision-safe, same as the main pass).
 Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
@@ -39,6 +41,7 @@ import sqlalchemy as sa
 from metricprobe.config import TableConfig
 from metricprobe.extract.canonical import (
     NEGATIVE_LAG_SENTINEL,
+    AsOfLiteral,
     DateDiffDay,
     GroupingSetsClause,
     MonthFloor,
@@ -58,7 +61,7 @@ from metricprobe.extract.canonical import (
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 6
+DUAL_SCHEMA_VERSION = 7
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -144,7 +147,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
             )
             .where(
                 sa.or_(
-                    raw_load <= sa.bindparam("as_of", type_=sa.DateTime()),
+                    raw_load <= sa.bindparam("as_of", type_=AsOfLiteral()),
                     raw_load.is_(None),
                 )
             )
@@ -229,7 +232,7 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
         # the bare <= would silently delete the NULL-load bucket. (Via probes
         # carry this predicate INSIDE the base subquery, before the join.)
         select = select.where(
-            sa.or_(load <= sa.bindparam("as_of", type_=sa.DateTime()), load.is_(None))
+            sa.or_(load <= sa.bindparam("as_of", type_=AsOfLiteral()), load.is_(None))
         )
     return select
 

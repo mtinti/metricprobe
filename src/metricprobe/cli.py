@@ -113,6 +113,18 @@ BUCKET_COLUMNS = (
 )
 
 
+def _normalize_as_of(value) -> pd.Timestamp:
+    """The frozen cutoff's NORMAL FORM: naive UTC, floored to whole seconds.
+    Applied wherever an as_of enters (fresh parse, resume flag, adopted
+    registration) so the stamped as_of always equals the queried one —
+    sub-second precision is meaningless for an analysis watermark and does
+    not survive legacy DATETIME columns."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts.floor("s")
+
+
 def _wall() -> pd.Timestamp:
     """The injectable clock: METRICPROBE_RUN_AT freezes EVERY recorded
     timestamp (durations become 0), making demo builds byte-stable.
@@ -381,6 +393,7 @@ def _probe_one(
         "target_logical_reads": canonical.target_logical_reads,
         "scan_budget_reads": canonical.scan_budget_reads,
         "scratch_logical_reads": canonical.scratch_logical_reads,
+        "n_staged_rows": canonical.staged_row_count,
     }
     return statuses, side, frames, extraction_started, extraction_finished, reads
 
@@ -392,7 +405,12 @@ def _int_or_none(value):
 # probe_runs read-accounting columns: ALWAYS present (None when the probe was
 # skipped or aborted) so the physical table schema a first to_sql() fixes is
 # identical no matter which probe outcome writes first
-READ_COLUMNS = ("target_logical_reads", "scan_budget_reads", "scratch_logical_reads")
+READ_COLUMNS = (
+    "target_logical_reads",
+    "scan_budget_reads",
+    "scratch_logical_reads",
+    "n_staged_rows",  # physical staging size of the MAIN pass (tempdb sizing)
+)
 
 # the FROZEN snapshot column types (nullable pandas dtypes). Applied to every
 # frame before it is written: to_sql() infers physical column types from the
@@ -840,15 +858,7 @@ def cmd_run(args) -> int:
         # NAIVE (it compares against naive event months throughout the
         # metrics); a timezone-qualified value is normalized to its UTC
         # instant first. run_at is the aware wall clock.
-        as_of = pd.Timestamp(args.as_of) if args.as_of else run_at
-        if as_of.tzinfo is not None:
-            as_of = as_of.tz_convert("UTC").tz_localize(None)
-        # the frozen cutoff is WHOLE-SECOND: sub-second precision is
-        # meaningless for an analysis watermark, and a microsecond literal
-        # does not parse against legacy DATETIME(3) columns (extraction
-        # floors again defensively, but the STAMPED as_of must equal the
-        # queried one)
-        as_of = as_of.floor("s")
+        as_of = _normalize_as_of(args.as_of if args.as_of else run_at)
         window_start, window_end = _parse_window(args, as_of)
     except (ConfigError, ValueError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)
@@ -956,7 +966,10 @@ def cmd_run(args) -> int:
             # explicitly passed flags must agree or the resume is refused.
             # git_sha/tool_version are refreshed: they describe the execution.
             conflicts = []
-            if args.as_of and pd.Timestamp(args.as_of) != pd.Timestamp(
+            # both sides normalized: retrying with the identical explicit
+            # flag must succeed even when the registration predates the
+            # whole-second normal form (or the flag carries microseconds)
+            if args.as_of and _normalize_as_of(args.as_of) != _normalize_as_of(
                 registration["as_of"]
             ):
                 conflicts.append(f"--as-of {args.as_of} != {registration['as_of']}")
@@ -980,6 +993,9 @@ def cmd_run(args) -> int:
             meta = RunMeta(
                 **{
                     **registration,
+                    # a pre-normal-form registration may carry microseconds;
+                    # extraction floors regardless, so the manifest must too
+                    "as_of": _normalize_as_of(registration["as_of"]).isoformat(),
                     "git_sha": _git_sha(),
                     "tool_version": metricprobe.__version__,
                 }
