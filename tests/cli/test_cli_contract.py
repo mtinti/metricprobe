@@ -686,3 +686,28 @@ def test_staged_row_count_round_trips_through_the_store(tmp_path, demo_db):
         tmp_path / "store" / "runs" / "r-staged" / "probe_runs.parquet"
     )
     assert int(frame.iloc[0]["n_staged_rows"]) == expected
+
+
+def test_console_narrates_probe_progress_and_failure_reasons(
+    tmp_path, demo_db, capsys
+):
+    """A long sequential campaign must SAY what it is doing and WHY anything
+    went red, on the console as it happens — a failing probe whose reason
+    lives only in a parquet file is a production incident generator."""
+    config = write_config(
+        tmp_path, demo_db,
+        [table_entry("events", "orders_main",
+                     analysis={"result_cell_cap": 1})],  # guaranteed abort
+    )
+    assert run_cli("--config", config, "--as-of", AS_OF) == 2
+    out, err = capsys.readouterr()
+    assert "probing orders_main (demo.main.events)" in out  # start line
+    assert "orders_main: RED" in out  # outcome line with the worst severity
+    assert "result_cell_cap_exceeded" in err  # the REASON, on stderr
+    assert "red reasons were printed above" in err
+
+    healthy = write_config(tmp_path, demo_db, [table_entry("events", "orders_ok")])
+    assert run_cli("--config", healthy, "--as-of", AS_OF) == 0
+    out, err = capsys.readouterr()
+    assert "orders_ok: GREEN in" in out
+    assert "red reasons" not in err

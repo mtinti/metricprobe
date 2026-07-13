@@ -71,6 +71,7 @@ from metricprobe.metrics.freshness import assess_freshness
 from metricprobe.metrics.parity import ParitySide, assess_parity
 from metricprobe.metrics.volume import assess_volume
 from metricprobe.status import (
+    SEVERITY_PRECEDENCE,
     STATUS_SCHEMA_VERSION,
     Check,
     ReasonCode,
@@ -123,6 +124,34 @@ def _normalize_as_of(value) -> pd.Timestamp:
     from metricprobe.extract.canonical import normalize_watermark
 
     return normalize_watermark(value)
+
+
+def _print_probe_outcome(
+    run_id: str, label: str, statuses: list[Status], duration: float | None
+) -> None:
+    """One console line per probe as it finishes, and every non-green reason
+    printed the moment it exists — a failing probe must SAY why on the
+    console, never only in a parquet file."""
+    worst = next(
+        (
+            severity
+            for severity in SEVERITY_PRECEDENCE
+            if any(status.severity is severity for status in statuses)
+        ),
+        Severity.GREEN,
+    )
+    timing = "" if duration is None else f" in {duration}s"
+    print(f"run {run_id}: {label}: {worst.value.upper()}{timing}", flush=True)
+    for status in statuses:
+        if status.severity in (Severity.GREEN, Severity.SKIPPED):
+            continue
+        detail = f": {status.detail}" if status.detail else ""
+        print(
+            f"  {status.severity.value}: {status.check.value} — "
+            f"{status.reason.value}{detail}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _wall() -> pd.Timestamp:
@@ -558,6 +587,11 @@ def _stage_analysis(
                             config.connection_url, table.read_uncommitted
                         )
                     engine = engines[table.read_uncommitted]
+                    print(
+                        f"run {meta.run_id}: probing {table.probe_name} "
+                        f"({table.database}.{table.table_schema}.{table.table}) ...",
+                        flush=True,  # visible DURING a long scan, not after
+                    )
                     started = _wall()
                     statuses: list[Status] = []
                     extraction = (None, None)
@@ -621,6 +655,12 @@ def _stage_analysis(
                     )
                     _collect_statuses(frames, table.probe_name, statuses)
                     all_statuses += statuses
+                    _print_probe_outcome(
+                        meta.run_id,
+                        table.probe_name,
+                        statuses,
+                        round((finished - started).total_seconds(), 1),
+                    )
             finally:
                 for engine in engines.values():
                     engine.dispose()
@@ -659,6 +699,9 @@ def _stage_analysis(
                         )
                 _collect_statuses(frames, table.probe_name, statuses)
                 all_statuses += statuses
+                _print_probe_outcome(
+                    meta.run_id, f"{table.probe_name} parity", statuses, None
+                )
         for name, frame in frames.frames().items():
             store.write_table(meta.run_id, name, stamp(_typed(name, frame), meta))
         store.write_table(
@@ -1052,6 +1095,12 @@ def cmd_run(args) -> int:
             print(f"metricprobe: warning: retention pruning failed: {error}", file=sys.stderr)
     reds = [s for s in statuses if s.severity is Severity.RED]
     print(f"run {run_id}: analysis committed — {len(statuses)} statuses, {len(reds)} red")
+    if reds:
+        print(
+            f"run {run_id}: red reasons were printed above per probe and are "
+            "recorded in the run's statuses table (report/dashboard render them)",
+            file=sys.stderr,
+        )
     if len(configured) > 1:
         failure = _run_finishing_stages(
             configs, store, run_id, meta.run_at, "analysis"
