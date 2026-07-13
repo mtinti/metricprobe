@@ -698,7 +698,11 @@ def test_console_narrates_probe_progress_and_failure_reasons(
     out, err = capsys.readouterr()
     assert "probing orders_main (demo.main.events)" in out  # start line
     assert "orders_main: RED" in out  # outcome line with the worst severity
-    assert "result_cell_cap_exceeded" in err  # the REASON, on stderr
+    # the reason on stderr, FULLY ATTRIBUTED: stderr is often collected
+    # separately, so the line itself must carry the probe and run id
+    reason_line = next(line for line in err.splitlines()
+                       if "result_cell_cap_exceeded" in line)
+    assert "orders_main" in reason_line and "run " in reason_line
     assert "red reasons were printed above" in err
 
     healthy = write_config(tmp_path, demo_db, [table_entry("events", "orders_ok")])
@@ -706,3 +710,16 @@ def test_console_narrates_probe_progress_and_failure_reasons(
     out, err = capsys.readouterr()
     assert "orders_ok: GREEN in" in out
     assert "red reasons" not in err
+
+    # SKIPPED is not silence: an optional absent table narrates its reason
+    ghost = write_config(
+        tmp_path, demo_db,
+        [table_entry("events", "orders_base"),
+         table_entry("not_a_table", "ghost_probe", optional=True)],
+    )
+    assert run_cli("--config", ghost, "--as-of", AS_OF) == 0
+    out, err = capsys.readouterr()
+    assert "ghost_probe: SKIPPED" in out
+    skipped_line = next(line for line in err.splitlines()
+                        if "optional_table_absent" in line)
+    assert "ghost_probe" in skipped_line

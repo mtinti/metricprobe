@@ -978,12 +978,14 @@ def verify_scan_budget(
             f"probe {probe_name!r}: cannot read the target table's page count "
             "(sys.dm_db_partition_stats — the login may need VIEW DATABASE STATE); "
             "the scan budget cannot be verified, refusing to run unbudgeted",
+            staged_rows=staged_rows,
         )
     if target_reads is None:
         raise ProbeAborted(
             ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
             f"probe {probe_name!r}: no STATISTICS IO output captured from the "
             "driver; the scan budget cannot be verified, refusing to run unbudgeted",
+            staged_rows=staged_rows,
         )
     budget = 3 * pages
     check_scan_budget(target_reads, budget, probe_name, staged_rows=staged_rows)
@@ -1013,6 +1015,7 @@ def verify_scratch_budget(
             ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
             f"probe {probe_name!r}: the scratch-read ledger (staging pages or "
             "STATISTICS IO) is unmeasurable; refusing to run unbudgeted",
+            staged_rows=staged_rows,
         )
     budget = (branches + 1) * max(staging_pages, 1) + SCRATCH_ROW_ALLOWANCE * max(staged_rows, 0)
     if scratch_reads > budget:
@@ -1037,6 +1040,7 @@ def verify_spool_budget(
             ReasonCode.SCAN_BUDGET_UNVERIFIABLE,
             f"probe {probe_name!r}: the staging-spool ledger is unmeasurable; "
             "refusing to run unbudgeted",
+            staged_rows=staged_rows,
         )
     budget = max(staging_pages, 1) + SPOOL_ROW_ALLOWANCE * max(staged_rows, 0)
     if spool_reads > budget:

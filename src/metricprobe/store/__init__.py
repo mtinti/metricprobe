@@ -345,6 +345,28 @@ class MssqlStore:
                     {"version": str(SNAPSHOT_SCHEMA_VERSION)},
                 )
             elif int(marker) != SNAPSHOT_SCHEMA_VERSION:
+                # SERIALIZE concurrent constructors: two campaigns starting
+                # together must not both run the ALTER (error 2705). The app
+                # lock is transaction-scoped (released at commit); the marker
+                # is RE-READ under the lock — the loser sees the winner's
+                # bump and applies nothing.
+                granted = conn.exec_driver_sql(
+                    "DECLARE @r int; "
+                    "EXEC @r = sp_getapplock @Resource = 'metricprobe_store_migration', "
+                    "@LockMode = 'Exclusive', @LockOwner = 'Transaction', "
+                    "@LockTimeout = 60000; SELECT @r"
+                ).scalar()
+                if granted is None or int(granted) < 0:
+                    raise RuntimeError(
+                        f"store schema {self.schema!r}: could not acquire the "
+                        "migration lock (another writer may be migrating); retry"
+                    )
+                marker = conn.execute(
+                    sa.text(
+                        f"SELECT meta_value FROM {self.schema}.{self.META_TABLE} "
+                        "WHERE meta_key = 'snapshot_schema_version'"
+                    )
+                ).scalar_one()
                 version = int(marker)
                 # KNOWN upgrades are applied in place; anything else still
                 # refuses loudly (fail-closed for unknown pasts and futures)

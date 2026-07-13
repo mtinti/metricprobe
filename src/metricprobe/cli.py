@@ -143,12 +143,16 @@ def _print_probe_outcome(
     timing = "" if duration is None else f" in {duration}s"
     print(f"run {run_id}: {label}: {worst.value.upper()}{timing}", flush=True)
     for status in statuses:
-        if status.severity in (Severity.GREEN, Severity.SKIPPED):
+        if status.severity is Severity.GREEN:
             continue
+        # EVERY non-green reason, fully attributed: stderr is often collected
+        # separately from stdout, so each line must carry the run id and the
+        # probe name itself (SKIPPED included — an optional absent table has
+        # a reason too)
         detail = f": {status.detail}" if status.detail else ""
         print(
-            f"  {status.severity.value}: {status.check.value} — "
-            f"{status.reason.value}{detail}",
+            f"run {run_id}: {label}: {status.severity.value}: "
+            f"{status.check.value} — {status.reason.value}{detail}",
             file=sys.stderr,
             flush=True,
         )

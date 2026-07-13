@@ -825,6 +825,25 @@ def test_mssql_store_migrates_a_v4_marker_in_place(mssql_engine):
         assert int(marker) == SNAPSHOT_SCHEMA_VERSION
         assert "n_staged_rows" in columns
         assert any(m["run_id"] == "r-mig" for m in migrated.list_runs())
+        # concurrent-startup aftermath: marker old but the column ALREADY
+        # exists (another writer migrated first, or a lock-loser re-enters).
+        # Construction must converge cleanly, never error 2705.
+        with mssql_engine.begin() as conn:
+            conn.execute(
+                sa_mod.text(
+                    f"UPDATE {schema}.{meta_table} SET meta_value = '4' "
+                    "WHERE meta_key = 'snapshot_schema_version'"
+                )
+            )
+        MssqlStore(mssql_engine.url.render_as_string(hide_password=False), schema)
+        with mssql_engine.begin() as conn:
+            remarked = conn.execute(
+                sa_mod.text(
+                    f"SELECT meta_value FROM {schema}.{meta_table} "
+                    "WHERE meta_key = 'snapshot_schema_version'"
+                )
+            ).scalar_one()
+        assert int(remarked) == SNAPSHOT_SCHEMA_VERSION
     finally:
         with mssql_engine.begin() as conn:
             infra = (

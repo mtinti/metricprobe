@@ -1,6 +1,6 @@
 # metricprobe dashboard
 
-**Generated at:** 2025-07-24T06:00:00+00:00 · **Run:** `demo-0001` · **Git:** `demo0000demo` · **Tool:** 0.1.9
+**Generated at:** 2025-07-24T06:00:00+00:00 · **Run:** `demo-0001` · **Git:** `demo0000demo` · **Tool:** 0.1.10
 
 **Analysed window:** 2023-07-24 → 2025-07-24 · **as-of:** 2025-07-24
 

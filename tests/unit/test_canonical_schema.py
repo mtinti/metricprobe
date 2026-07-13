@@ -485,3 +485,17 @@ def test_budget_aborts_carry_the_staged_row_count():
     with pt.raises(ProbeAborted) as excinfo:
         verify_spool_budget(10_000, 10, 42, "p")
     assert excinfo.value.staged_rows == 42
+    # the UNVERIFIABLE branches know the count too (the ledgers are what is
+    # missing, not the fetched rows)
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_scan_budget(100, None, "p", staged_rows=42)
+    assert excinfo.value.staged_rows == 42
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_scan_budget(None, 3, "p", staged_rows=42)
+    assert excinfo.value.staged_rows == 42
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_scratch_budget(None, 10, 4, 42, "p")
+    assert excinfo.value.staged_rows == 42
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_spool_budget(None, 10, 42, "p")
+    assert excinfo.value.staged_rows == 42

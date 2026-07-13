@@ -36,12 +36,16 @@ def _git(cwd, *args) -> str:
 
 
 @pytest.fixture(autouse=True)
-def stub_static_export(monkeypatch):
+def stub_static_export():
     """Lifecycle tests exercise the orchestration state machine (stages,
     atomicity, rollback) — not the renderer, which the render smoke tests
     own with a REAL Chrome. Stubbing image export here removes ~40 browser
     launches from this module: files are still written (existence and
-    delivery are asserted), only the bytes are fake."""
+    delivery are asserted), only the bytes are fake.
+
+    Uses a PRIVATE MonkeyPatch instance: several tests call their own
+    monkeypatch.undo(), which would strip a shared fixture's patches too
+    and relaunch real Chrome mid-test from an ungrouped worker."""
     import plotly.io as pio
 
     fake_svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
@@ -52,8 +56,11 @@ def stub_static_export(monkeypatch):
         for path in file:
             Path(path).write_bytes(payload)
 
-    monkeypatch.setattr(pio, "write_images", fake_write_images)
-    monkeypatch.setattr(pio, "to_image", lambda *args, **kwargs: fake_png)
+    own_patch = pytest.MonkeyPatch()
+    own_patch.setattr(pio, "write_images", fake_write_images)
+    own_patch.setattr(pio, "to_image", lambda *args, **kwargs: fake_png)
+    yield
+    own_patch.undo()
 
 
 @pytest.fixture()
@@ -532,3 +539,14 @@ def test_finalize_and_rollback_both_failing_is_honest_partial(
     assert main(["run", "--config", str(config), "--as-of", AS_OF,
                  "--resume-from", "publish", "--run-id", "r-res"]) == 0
     assert "README.md" in _pushed_files(bare)
+
+
+def test_export_stub_survives_test_level_undo(monkeypatch):
+    """Several tests in this module call monkeypatch.undo(); the autouse
+    export stub must live on its OWN MonkeyPatch so an undo cannot strip it
+    and relaunch real Chrome from an ungrouped worker mid-test."""
+    import plotly.io as pio
+
+    monkeypatch.setattr("os.environ", dict(**__import__("os").environ))
+    monkeypatch.undo()
+    assert pio.to_image(None).startswith(b"\x89PNG")  # still the stub
