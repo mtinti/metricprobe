@@ -345,12 +345,61 @@ class MssqlStore:
                     {"version": str(SNAPSHOT_SCHEMA_VERSION)},
                 )
             elif int(marker) != SNAPSHOT_SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"store schema {self.schema!r} was written under snapshot "
-                    f"schema v{marker}; this build writes "
-                    f"v{SNAPSHOT_SCHEMA_VERSION} — migrate the data or point "
-                    "the store at a fresh schema"
-                )
+                version = int(marker)
+                # KNOWN upgrades are applied in place; anything else still
+                # refuses loudly (fail-closed for unknown pasts and futures)
+                while version in self._MIGRATIONS:
+                    self._MIGRATIONS[version](self, conn)
+                    version += 1
+                    conn.execute(
+                        sa.text(
+                            f"UPDATE {self.schema}.{self.META_TABLE} "
+                            "SET meta_value = :version "
+                            "WHERE meta_key = 'snapshot_schema_version'"
+                        ),
+                        {"version": str(version)},
+                    )
+                    print(
+                        f"store schema {self.schema!r}: migrated snapshot "
+                        f"schema v{version - 1} -> v{version}"
+                    )
+                if version != SNAPSHOT_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"store schema {self.schema!r} was written under snapshot "
+                        f"schema v{marker}; this build writes "
+                        f"v{SNAPSHOT_SCHEMA_VERSION} and has no migration from "
+                        f"v{version} — migrate the data or point the store at "
+                        "a fresh schema"
+                    )
+
+    def _migrate_v4_to_v5(self, conn) -> None:
+        """v5 added ONE nullable column: probe_runs.n_staged_rows (the tempdb
+        sizing observable). Old rows stay NULL — honest: the count was never
+        measured for them."""
+        physical = "mp_probe_runs"
+        exists = conn.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t"
+            ),
+            {"s": self.schema, "t": physical},
+        ).scalar_one()
+        if not exists:
+            return  # marker present but the table was never written: nothing to alter
+        has_column = conn.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t "
+                "AND COLUMN_NAME = 'n_staged_rows'"
+            ),
+            {"s": self.schema, "t": physical},
+        ).scalar_one()
+        if not has_column:
+            conn.exec_driver_sql(
+                f"ALTER TABLE {self.schema}.{physical} ADD n_staged_rows BIGINT NULL"
+            )
+
+    _MIGRATIONS = {4: _migrate_v4_to_v5}
 
     def register_run(self, meta: RunMeta) -> None:
         """Same durable pre-stage record as the parquet store (upserted: a

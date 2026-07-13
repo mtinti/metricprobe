@@ -396,11 +396,13 @@ production table, where direct GROUPING SETS aggregation was measured to
 spool the distinct count per row (~150x one scan) — the read budget forbids
 that. The physical staged-row count is persisted per probe as
 `n_staged_rows` in the probe_runs snapshot table (snapshot schema v5) —
-including on the join-uniqueness abort, where the measured fanout is
-exactly the number worth having; aborts that fire before staging is
-measured (budget, cell cap) persist it as NULL. Operators sizing a
-deployment should check tempdb free space against the largest probed table
-before the first full-scale run.
+on success AND on the aborts that fire after the aggregation was fetched:
+the join-uniqueness abort of EITHER pass (where the measured fanout is
+exactly the number worth having) and all three budget aborts (scan,
+scratch, spool — their ledgers are computed from the fetched rows). Only
+result_cell_cap (fires mid-fetch) and pre-staging failures persist NULL.
+Operators sizing a deployment should check tempdb free space against the
+largest probed table before the first full-scale run.
 The as_of watermark is rendered as a whole-second literal (floored at CLI
 entry and again in the builders): a microsecond literal fails conversion
 against legacy DATETIME/SMALLDATETIME load columns (Msg 241), and the

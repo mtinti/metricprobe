@@ -135,6 +135,8 @@ COVERAGE: dict[str, str] = {
         "test_legacy_datetime_columns_accept_a_microsecond_as_of",
     "dialect_branch:store.MssqlStore.record_stage":
         "test_mssql_store_shares_the_run_contract",
+    "dialect_branch:store.MssqlStore._migrate_v4_to_v5":
+        "test_mssql_store_migrates_a_v4_marker_in_place",
     "dialect_branch:store.MssqlStore.prepare_stage":
         "test_mssql_store_shares_the_run_contract",
     "dialect_branch:store.MssqlStore.table_names":

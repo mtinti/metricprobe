@@ -324,6 +324,16 @@ class DualLagResult:
     scratch_budget_reads: int | None = None
     staging_spool_reads: int | None = None
 
+    @property
+    def staged_row_count(self) -> int | None:
+        """Physical rows staged by THIS pass (probe rows + guard artifacts),
+        from the () row — same tempdb observable as the main pass."""
+        rows = self.frame[self.frame["grouping_id"] == DUAL_GROUPING_SET_IDS["global"]]
+        if rows.empty or "n_staged_rows" not in rows.columns:
+            return None
+        value = rows.iloc[0]["n_staged_rows"]
+        return None if pd.isna(value) else int(value)
+
     def rows_for(self, set_name: str) -> pd.DataFrame:
         gid = DUAL_GROUPING_SET_IDS[set_name]
         rows = self.frame[self.frame["grouping_id"] == gid]
@@ -390,14 +400,17 @@ def run_dual_lag(
                 target_tables.add(table.event_time_via.table)
             own_reads = _target_reads_from(messages, target_tables)
             cumulative = None if own_reads is None else own_reads + (prior_target_reads or 0)
-            target_reads, budget = verify_scan_budget(cumulative, pages, table.probe_name)
+            staged = _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"])
+            target_reads, budget = verify_scan_budget(
+                cumulative, pages, table.probe_name, staged_rows=staged
+            )
             scratch_reads, scratch_budget = verify_scratch_budget(
                 _scratch_reads_from(
                     messages[staging_message_count:], dual_staging_table_name(dialect)
                 ),
                 staging_pages,
                 3,  # grouping sets: month_src_lag, delta, ()
-                _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"]),
+                staged,
                 table.probe_name,
             )
             # the via uniqueness window function spools during staging:
@@ -407,7 +420,7 @@ def run_dual_lag(
                     messages[:staging_message_count], dual_staging_table_name(dialect)
                 ),
                 staging_pages,
-                _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"]),
+                staged,
                 table.probe_name,
             )
     frame = pd.DataFrame(rows, columns=list(keys))
@@ -428,5 +441,6 @@ def run_dual_lag(
                 f"probe {table.probe_name!r}: dual pass — lookup side of "
                 f"event_time_via is not unique on the join key (worst key "
                 f"matches {int(max_dup)} rows)",
+                staged_rows=result.staged_row_count,
             )
     return result

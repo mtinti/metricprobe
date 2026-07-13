@@ -752,3 +752,92 @@ def test_smalldatetime_cannot_admit_rows_after_the_cutoff(duckdb_engine, mssql_e
     )
     global_row = mssql.rows_for("global").iloc[0]
     assert int(global_row["row_count"]) == 1  # ONLY the pre-cutoff row
+
+
+def test_mssql_store_migrates_a_v4_marker_in_place(mssql_engine):
+    """The fail-closed version marker must not make old stores UNREACHABLE:
+    a v4-marker store (pre n_staged_rows) is migrated in place — the one
+    nullable column added, the marker bumped — so the resume upgrade path
+    is reachable on mssql, not only on parquet."""
+    import uuid as uuid_module
+
+    import sqlalchemy as sa_mod
+
+    from metricprobe.store import SNAPSHOT_SCHEMA_VERSION, MssqlStore, RunMeta
+
+    # "test" stem + plain concatenation: the leak scanner checks assignments
+    # to environment-shaped names and accepts placeholder-shaped values only
+    schema = "test_mig_" + uuid_module.uuid4().hex[:8]
+    with mssql_engine.begin() as conn:
+        conn.exec_driver_sql(f"CREATE SCHEMA {schema}")
+    try:
+        store = MssqlStore(mssql_engine.url.render_as_string(hide_password=False), schema)
+        meta = RunMeta(
+            run_id="r-mig", run_at="2026-07-01T06:00:00", as_of="2026-07-01T00:00:00",
+            git_sha="x", tool_version="0", config_digest="d",
+            schema_version=SNAPSHOT_SCHEMA_VERSION,
+            window_start="2024-07-01T00:00:00", window_end="2026-07-01T00:00:00",
+        )
+        store.begin_run(meta)
+        frame = pd.DataFrame({"probe": ["a"], "n_staged_rows": [7]})
+        from metricprobe.store import stamp
+
+        store.write_table("r-mig", "probe_runs", stamp(frame, meta))
+        store.commit_run("r-mig", {
+            "run_id": "r-mig", "run_at": meta.run_at, "as_of": meta.as_of,
+            "git_sha": "x", "tool_version": "0", "config_digest": "d",
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "window_start": meta.window_start, "window_end": meta.window_end,
+            "stages": {"analysis": {}},
+        })
+        # forge the v4 past: drop the v5 column, wind the marker back
+        meta_table = MssqlStore.META_TABLE
+        with mssql_engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"ALTER TABLE {schema}.mp_probe_runs DROP COLUMN n_staged_rows"
+            )
+            conn.execute(
+                sa_mod.text(
+                    f"UPDATE {schema}.{meta_table} SET meta_value = '4' "
+                    "WHERE meta_key = 'snapshot_schema_version'"
+                )
+            )
+        # constructing the store MIGRATES instead of refusing
+        migrated = MssqlStore(
+            mssql_engine.url.render_as_string(hide_password=False), schema
+        )
+        with mssql_engine.begin() as conn:
+            marker = conn.execute(
+                sa_mod.text(
+                    f"SELECT meta_value FROM {schema}.{meta_table} "
+                    "WHERE meta_key = 'snapshot_schema_version'"
+                )
+            ).scalar_one()
+            columns = set(
+                conn.execute(
+                    sa_mod.text(
+                        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = 'mp_probe_runs'"
+                    ),
+                    {"s": schema},
+                ).scalars()
+            )
+        assert int(marker) == SNAPSHOT_SCHEMA_VERSION
+        assert "n_staged_rows" in columns
+        assert any(m["run_id"] == "r-mig" for m in migrated.list_runs())
+    finally:
+        with mssql_engine.begin() as conn:
+            infra = (
+                "mp_probe_runs",
+                MssqlStore.MANIFEST_TABLE,
+                MssqlStore.STAGING_TABLE,
+                MssqlStore.REGISTRATION_TABLE,
+                MssqlStore.CATALOG_TABLE,
+                MssqlStore.META_TABLE,
+            )
+            for table in infra:
+                conn.exec_driver_sql(
+                    f"IF OBJECT_ID('{schema}.{table}') IS NOT NULL "
+                    f"DROP TABLE {schema}.{table}"
+                )
+            conn.exec_driver_sql(f"DROP SCHEMA {schema}")

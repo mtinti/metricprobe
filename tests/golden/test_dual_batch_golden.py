@@ -178,6 +178,9 @@ def test_dual_via_asserts_lookup_uniqueness_itself():
     finally:
         engine.dispose()
     assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+    # the dual abort MEASURES its fanout exactly like the main pass
+    assert excinfo.value.staged_rows is not None
+    assert excinfo.value.staged_rows > len(base)
     # and the degenerate corner: duplicated lookup keys that match NO base
     # row still abort (the FULL OUTER guard stages every lookup row)
     disjoint = pd.DataFrame(
@@ -192,6 +195,7 @@ def test_dual_via_asserts_lookup_uniqueness_itself():
     finally:
         engine.dispose()
     assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
+    assert excinfo.value.staged_rows is not None  # measured even when disjoint
 
 
 def test_dual_delta_histogram_is_the_exact_offset():

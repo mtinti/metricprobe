@@ -759,14 +759,19 @@ def drop_staging_sql(dialect: str) -> str:
 _STATS_IO_LINE = re.compile(r"Table '([^']+)'\. Scan count \d+, logical reads (\d+)")
 
 
-def check_scan_budget(target_reads: int, budget_reads: int, probe_name: str) -> None:
+def check_scan_budget(
+    target_reads: int, budget_reads: int, probe_name: str, staged_rows: int | None = None
+) -> None:
     """The frozen numeric budget: logical reads on the TARGET table(s) <= 3x
-    one full scan per probe. Exceeding it ABORTS with SCAN_BUDGET_EXCEEDED."""
+    one full scan per probe. Exceeding it ABORTS with SCAN_BUDGET_EXCEEDED.
+    Budget checks run AFTER the aggregation rows were fetched, so the abort
+    carries the measured staged-row count (tempdb observability)."""
     if target_reads > budget_reads:
         raise ProbeAborted(
             ReasonCode.SCAN_BUDGET_EXCEEDED,
             f"probe {probe_name!r}: {target_reads} logical reads on the target "
             f"table(s) exceed the budget of {budget_reads} (3x one full scan)",
+            staged_rows=staged_rows,
         )
 
 
@@ -958,7 +963,10 @@ class CanonicalResult:
 
 
 def verify_scan_budget(
-    target_reads: int | None, pages: int | None, probe_name: str
+    target_reads: int | None,
+    pages: int | None,
+    probe_name: str,
+    staged_rows: int | None = None,
 ) -> tuple[int, int]:
     """Fail-CLOSED budget verification for mssql: if either the measured reads
     (STATISTICS IO capture) or the table size (dm_db_partition_stats) is
@@ -978,7 +986,7 @@ def verify_scan_budget(
             "driver; the scan budget cannot be verified, refusing to run unbudgeted",
         )
     budget = 3 * pages
-    check_scan_budget(target_reads, budget, probe_name)
+    check_scan_budget(target_reads, budget, probe_name, staged_rows=staged_rows)
     return target_reads, budget
 
 
@@ -1013,6 +1021,7 @@ def verify_scratch_budget(
             f"probe {probe_name!r}: {scratch_reads} scratch logical reads exceed "
             f"the bound of {budget} ({branches} branches + 1 spare, x "
             f"{staging_pages} pages, + {SCRATCH_ROW_ALLOWANCE}/row x {staged_rows} rows)",
+            staged_rows=staged_rows,
         )
     return scratch_reads, budget
 
@@ -1036,6 +1045,7 @@ def verify_spool_budget(
             f"probe {probe_name!r}: {spool_reads} staging-spool logical reads exceed "
             f"the bound of {budget} ({staging_pages} pages + "
             f"{SPOOL_ROW_ALLOWANCE}/row x {staged_rows} rows)",
+            staged_rows=staged_rows,
         )
     return spool_reads, budget
 
@@ -1106,8 +1116,12 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
             target_tables = {table.table}
             if table.event_time_via is not None:
                 target_tables.add(table.event_time_via.table)
+            staged = _staged_row_count(rows, keys, GROUPING_SET_IDS["global"])
             target_reads, budget = verify_scan_budget(
-                _target_reads_from(messages, target_tables), pages, table.probe_name
+                _target_reads_from(messages, target_tables),
+                pages,
+                table.probe_name,
+                staged_rows=staged,
             )
             scratch_reads, scratch_budget = verify_scratch_budget(
                 _scratch_reads_from(
@@ -1115,7 +1129,7 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                 ),
                 staging_pages,
                 aggregation_branch_count(table),
-                _staged_row_count(rows, keys, GROUPING_SET_IDS["global"]),
+                staged,
                 table.probe_name,
             )
             # the staging statement's own worktable spool (the via uniqueness
@@ -1125,7 +1139,7 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                     messages[:staging_message_count], staging_table_name(dialect)
                 ),
                 staging_pages,
-                _staged_row_count(rows, keys, GROUPING_SET_IDS["global"]),
+                staged,
                 table.probe_name,
             )
     frame = pd.DataFrame(rows, columns=list(keys))

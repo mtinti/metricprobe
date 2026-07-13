@@ -457,3 +457,31 @@ def test_watermark_normal_form_rejects_nat_and_normalizes_timezones():
         normalize_watermark(pd.NaT)
     with pt.raises(ValueError):
         staging_sql(table, "mssql", as_of="NaT")
+
+
+def test_budget_aborts_carry_the_staged_row_count():
+    """Budget checks run AFTER the aggregation rows were fetched, so their
+    aborts must carry the measured staged count (the tempdb observable) —
+    the docs used to claim the opposite and the handler persisted NULL."""
+    import pytest as pt
+
+    from metricprobe.extract.canonical import (
+        ProbeAborted,
+        check_scan_budget,
+        verify_scan_budget,
+        verify_scratch_budget,
+        verify_spool_budget,
+    )
+
+    with pt.raises(ProbeAborted) as excinfo:
+        check_scan_budget(100, 10, "p", staged_rows=42)
+    assert excinfo.value.staged_rows == 42
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_scan_budget(100, 3, "p", staged_rows=42)  # budget = 9 < 100
+    assert excinfo.value.staged_rows == 42
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_scratch_budget(10_000, 10, 4, 42, "p")
+    assert excinfo.value.staged_rows == 42
+    with pt.raises(ProbeAborted) as excinfo:
+        verify_spool_budget(10_000, 10, 42, "p")
+    assert excinfo.value.staged_rows == 42
