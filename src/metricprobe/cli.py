@@ -114,15 +114,15 @@ BUCKET_COLUMNS = (
 
 
 def _normalize_as_of(value) -> pd.Timestamp:
-    """The frozen cutoff's NORMAL FORM: naive UTC, floored to whole seconds.
-    Applied wherever an as_of enters (fresh parse, resume flag, adopted
-    registration) so the stamped as_of always equals the queried one —
-    sub-second precision is meaningless for an analysis watermark and does
-    not survive legacy DATETIME columns."""
-    ts = pd.Timestamp(value)
-    if ts.tzinfo is not None:
-        ts = ts.tz_convert("UTC").tz_localize(None)
-    return ts.floor("s")
+    """The frozen cutoff's NORMAL FORM — delegated to the extraction layer's
+    normalize_watermark (valid, naive-UTC, whole-second) so the CLI and any
+    direct builder caller agree byte-for-byte. Applied wherever an as_of
+    enters: fresh parse, resume flag, adopted registration. Raises
+    ValueError on NaT/invalid input (a usage error, exit 1 — a NaT would
+    otherwise reach SQL as the literal string 'NaT')."""
+    from metricprobe.extract.canonical import normalize_watermark
+
+    return normalize_watermark(value)
 
 
 def _wall() -> pd.Timestamp:
@@ -592,6 +592,11 @@ def _stage_analysis(
                             sides[table.probe_name] = side
                             extraction = (ext_start, ext_end)
                         except ProbeAborted as abort:
+                            # the join-uniqueness abort fires AFTER staging
+                            # was measured: persist the fanout size (base x
+                            # duplicate matches) — the most dangerous tempdb
+                            # case is exactly the one that must be observable
+                            reads["n_staged_rows"] = abort.staged_rows
                             statuses = [
                                 Status(
                                     check=Check.PROBE,
@@ -974,11 +979,11 @@ def cmd_run(args) -> int:
             ):
                 conflicts.append(f"--as-of {args.as_of} != {registration['as_of']}")
             if args.year or args.window:
-                registered_as_of = pd.Timestamp(registration["as_of"])
+                registered_as_of = _normalize_as_of(registration["as_of"])
                 want_start, want_end = _parse_window(args, registered_as_of)
-                if want_start != pd.Timestamp(
+                if want_start != _normalize_as_of(
                     registration["window_start"]
-                ) or want_end != pd.Timestamp(registration["window_end"]):
+                ) or want_end != _normalize_as_of(registration["window_end"]):
                     conflicts.append(
                         f"window {want_start.date()}..{want_end.date()} != "
                         f"{registration['window_start']}..{registration['window_end']}"
@@ -993,11 +998,23 @@ def cmd_run(args) -> int:
             meta = RunMeta(
                 **{
                     **registration,
-                    # a pre-normal-form registration may carry microseconds;
+                    # a pre-normal-form registration may carry microseconds
+                    # (as_of AND the window bounds derived from it);
                     # extraction floors regardless, so the manifest must too
                     "as_of": _normalize_as_of(registration["as_of"]).isoformat(),
+                    "window_start": _normalize_as_of(
+                        registration["window_start"]
+                    ).isoformat(),
+                    "window_end": _normalize_as_of(
+                        registration["window_end"]
+                    ).isoformat(),
+                    # git_sha/tool_version/schema_version describe the
+                    # EXECUTION: this writer emits current-schema rows, so an
+                    # old registration must not stamp its stale version on
+                    # the manifest while every row carries the current one
                     "git_sha": _git_sha(),
                     "tool_version": metricprobe.__version__,
+                    "schema_version": SNAPSHOT_SCHEMA_VERSION,
                 }
             )
             as_of = pd.Timestamp(meta.as_of)

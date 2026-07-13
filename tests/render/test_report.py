@@ -24,6 +24,12 @@ _EXTERNAL_RESOURCE = re.compile(
 _CDN_SCRIPT = re.compile(r"""<script[^>]*(?:cdn\.plot\.ly|unpkg\.com|cdnjs)""", re.IGNORECASE)
 
 
+# kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
+# as a 300s timeout): every module that renders figures shares one xdist
+# group, so --dist loadgroup serializes them onto a single worker
+pytestmark = pytest.mark.xdist_group("kaleido-chrome")
+
+
 @pytest.fixture(scope="module")
 def report_dir(dashboard_run, tmp_path_factory):
     store, run_id, config = dashboard_run

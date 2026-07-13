@@ -152,7 +152,7 @@ def test_component_versions_are_pinned():
     assert COMPONENT_VERSIONS == {
         "config": 3,  # v3: compare resolution, dialect whitelist, finite params
         "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
-        "canonical": 7,  # v7: locale-independent whole-second as_of literal
-        "dual": 7,  # v7: same typed watermark literal as the main pass
+        "canonical": 8,  # v8: watermark normal form (UTC instant, NaT rejected)
+        "dual": 8,  # v8: same watermark normal form as the main pass
         "snapshot": 5,  # v4: mature summary refused below min_mature_months
     }

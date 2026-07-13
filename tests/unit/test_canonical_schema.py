@@ -27,11 +27,12 @@ def test_schema_version_is_pinned():
     # v3: windowed global lookup max; v4: FULL OUTER lookup guard; v5:
     # pre-join watermark for via probes + physical n_staged_rows; v6:
     # guard-artifact-only cells dropped from the grouped branch; v7:
-    # whole-second locale-independent typed as_of literal;
+    # whole-second locale-independent typed as_of literal; v8: watermark
+    # normal form (tz-aware -> UTC instant, NaT rejected);
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 7
+    assert CANONICAL_SCHEMA_VERSION == 8
 
 
 def test_grouping_ids_are_frozen():
@@ -434,3 +435,25 @@ def test_as_of_literal_is_whole_second_in_every_staging_statement():
     for sql in statements:
         assert "2026-07-13 07:49:08" not in sql  # the space form is the dmy trap
         assert ".085" not in sql and "085711" not in sql, sql[-200:]
+
+
+def test_watermark_normal_form_rejects_nat_and_normalizes_timezones():
+    """A timezone-aware cutoff must render its UTC INSTANT (the naive
+    isoformat of an aware timestamp is its local clock face — SQL Server
+    silently discards the offset); NaT must be rejected loudly instead of
+    reaching SQL as the literal string 'NaT'."""
+    import pandas as pd
+    import pytest as pt
+
+    from metricprobe.extract.canonical import normalize_watermark, staging_sql
+
+    table = _config_basic()
+    aware = pd.Timestamp("2026-07-13 08:49:08.5+01:00")  # 07:49:08 UTC
+    for dialect in ("mssql", "duckdb"):
+        sql = staging_sql(table, dialect, as_of=aware)
+        assert "2026-07-13T07:49:08" in sql  # the UTC instant
+        assert "08:49:08" not in sql and "+01" not in sql
+    with pt.raises(ValueError, match="not a valid timestamp"):
+        normalize_watermark(pd.NaT)
+    with pt.raises(ValueError):
+        staging_sql(table, "mssql", as_of="NaT")

@@ -12,7 +12,8 @@ every lookup row is staged, guard-only artifact rows carry is_probe_row = 0;
 v5 watermarks the base BEFORE the join and adds the physical n_staged_rows;
 v6 drops guard-artifact-only cells from the grouped branch;
 v7 renders the as_of literal whole-second, T-separated, CAST to DATETIME2(0)
-on mssql — locale-independent and precision-safe, same as the main pass).
+on mssql — locale-independent and precision-safe, same as the main pass;
+v8 normalizes timezone-aware cutoffs to their UTC instant and rejects NaT).
 Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
@@ -55,13 +56,14 @@ from metricprobe.extract.canonical import (
     _staged_row_count,
     _table_clause,
     _target_reads_from,
+    normalize_watermark,
     verify_scan_budget,
     verify_scratch_budget,
     verify_spool_budget,
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 7
+DUAL_SCHEMA_VERSION = 8
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -240,9 +242,9 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
 def dual_staging_sql(table: TableConfig, dialect: str, as_of=None) -> str:
     select = build_dual_staging_select(table, dialect)
     if as_of is not None:
-        # floored to whole seconds for legacy DATETIME/SMALLDATETIME columns,
-        # same as the main pass (see canonical.staging_sql)
-        select = select.params(as_of=pd.Timestamp(as_of).floor("s"))
+        # the watermark normal form, same as the main pass (see
+        # canonical.staging_sql): valid, naive-UTC, whole-second
+        select = select.params(as_of=normalize_watermark(as_of))
         compiled = str(
             select.compile(
                 dialect=_dialect_instance(dialect), compile_kwargs={"literal_binds": True}

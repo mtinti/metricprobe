@@ -18,6 +18,11 @@ from metricprobe.config import CONFIG_SCHEMA_VERSION
 from metricprobe.publish import PUBLISHED_MARKER
 from metricprobe.store import ParquetStore
 
+# kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
+# as a 300s timeout): every module that renders figures shares one xdist
+# group, so --dist loadgroup serializes them onto a single worker
+pytestmark = pytest.mark.xdist_group("kaleido-chrome")
+
 AS_OF = "2025-07-02"
 
 HEALTHY = g.TableSpec(

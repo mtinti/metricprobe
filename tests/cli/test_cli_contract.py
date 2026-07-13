@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import duckdb
+import pandas as pd
 import pytest
 import yaml
 from tests.synth import generator as g
@@ -15,6 +16,11 @@ from tests.synth import generator as g
 from metricprobe.cli import main
 from metricprobe.config import CONFIG_SCHEMA_VERSION
 from metricprobe.store import STAMP_COLUMNS, ParquetStore
+
+# kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
+# as a 300s timeout): every module that renders figures shares one xdist
+# group, so --dist loadgroup serializes them onto a single worker
+pytestmark = pytest.mark.xdist_group("kaleido-chrome")
 
 # just after the last synthetic load: freshness stays GREEN while the
 # first 18 months are mature under the 365d horizon
@@ -604,3 +610,79 @@ def test_resume_accepts_the_identical_microsecond_as_of(tmp_path, demo_db, monke
         m for m in ParquetStore(tmp_path / "store").list_runs() if m["run_id"] == "r-old"
     )
     assert manifest["as_of"] == "2025-07-02T07:49:08"  # floored on adoption
+
+
+def test_nat_as_of_is_a_usage_error(tmp_path, demo_db):
+    """--as-of NaT must exit 1 (usage error) on BOTH the dry-run and real
+    paths — it used to dry-run 'successfully' with window=NaT..NaT and then
+    fail during analysis with CAST('NaT' AS DATETIME2(0))."""
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", "NaT", "--dry-run") == 1
+    assert run_cli("--config", config, "--as-of", "NaT") == 1
+
+
+def test_resume_upgrades_a_stale_registration_to_the_current_schema(
+    tmp_path, demo_db, monkeypatch
+):
+    """Resuming a pre-current registration must not write contradictory
+    versions: the manifest's schema_version describes THIS writer's rows
+    (like git_sha/tool_version), and the window bounds are normalized with
+    the same normal form as as_of."""
+    import json
+
+    import metricprobe.cli as cli
+    from metricprobe.store import SNAPSHOT_SCHEMA_VERSION
+
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("injected analysis failure")
+
+    monkeypatch.setattr(cli, "assess_volume", explode)
+    assert run_cli("--config", config, "--as-of", "2025-07-02",
+                   "--run-id", "r-v4") == 1
+    monkeypatch.undo()
+    # forge the v0.1.4-era registration: stale schema version, microsecond
+    # as_of AND window bounds (window_end was the unfloored as_of back then)
+    store = ParquetStore(tmp_path / "store")
+    registration_path = store._registration("r-v4")
+    recorded = json.loads(registration_path.read_text(encoding="utf-8"))
+    recorded["schema_version"] = 4
+    recorded["as_of"] = "2025-07-02T07:49:08.085711"
+    recorded["window_start"] = "2023-07-02T07:49:08.085711"
+    recorded["window_end"] = "2025-07-02T07:49:08.085711"
+    registration_path.write_text(json.dumps(recorded), encoding="utf-8")
+
+    assert run_cli("--config", config, "--resume-from", "analysis",
+                   "--run-id", "r-v4") == 0
+    (manifest,) = ParquetStore(tmp_path / "store").list_runs()
+    assert manifest["schema_version"] == SNAPSHOT_SCHEMA_VERSION  # the writer's
+    assert manifest["as_of"] == "2025-07-02T07:49:08"
+    assert manifest["window_start"] == "2023-07-02T07:49:08"
+    assert manifest["window_end"] == "2025-07-02T07:49:08"
+    # every persisted row agrees with the manifest
+    frame = pd.read_parquet(
+        tmp_path / "store" / "runs" / "r-v4" / "probe_runs.parquet"
+    )
+    assert set(frame["schema_version"]) == {SNAPSHOT_SCHEMA_VERSION}
+    assert set(frame["as_of"]) == {"2025-07-02T07:49:08"}
+
+
+def test_staged_row_count_round_trips_through_the_store(tmp_path, demo_db):
+    """probe_runs.n_staged_rows must survive the store round-trip with the
+    physical staging size (tempdb observability is a persisted fact, not a
+    doc claim)."""
+    import duckdb as ddb
+
+    config = write_config(tmp_path, demo_db, [table_entry("events", "orders_main")])
+    assert run_cli("--config", config, "--as-of", AS_OF, "--run-id", "r-staged") == 0
+    con = ddb.connect(str(demo_db), read_only=True)
+    expected = con.execute(
+        f"SELECT COUNT(*) FROM events WHERE load_time <= TIMESTAMP '{AS_OF}T00:00:00'"
+        " OR load_time IS NULL"
+    ).fetchone()[0]
+    con.close()
+    frame = pd.read_parquet(
+        tmp_path / "store" / "runs" / "r-staged" / "probe_runs.parquet"
+    )
+    assert int(frame.iloc[0]["n_staged_rows"]) == expected

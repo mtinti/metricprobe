@@ -363,6 +363,12 @@ precision, because a bare string degrades to the column's type and
 SMALLDATETIME would round a latter-half-minute cutoff UP, admitting rows
 loaded after the recorded as_of. This changes the admitted population versus
 unfloored or untyped cutoffs, hence the version bump.
+v8 (both passes): the watermark normal form additionally converts
+timezone-aware cutoffs to their UTC instant before rendering (an aware
+timestamp's naive isoformat is its LOCAL clock face; SQL Server silently
+discarded the offset, shifting the watermark by the offset for direct
+builder callers — the CLI already normalized) and rejects NaT loudly
+instead of emitting the string 'NaT' into SQL.
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,
@@ -372,21 +378,29 @@ than their own staging projection it is unsatisfiable by ANY architecture
 that materializes derived columns.
 
 Tempdb CAPACITY (distinct from the read ledgers): the staging step
-(`SELECT ... INTO #mp_probe`) materializes one row per STAGED row — every
-probed row, plus one guard artifact per unreferenced lookup row on via
-probes. The fixed derived columns are ~60 bytes; batch_id, alt_value and
-key_hash are staged at their actual string widths on top, so the per-row
-size is configuration-dependent and 60 bytes is a FLOOR, not a bound: a
-500M-row table starts around 30 GB of transient tempdb and grows with the
-configured string columns (probes run sequentially; the temp table drops
-with the connection). This is the deliberate design trade: staging feeds
-every grouping set AND the () distinct-count branch from ONE scan of the
+(`SELECT ... INTO #mp_probe`) materializes one row per STAGED row. Staged
+rows are: every probed row, plus one guard artifact per unreferenced lookup
+row on via probes — and, in the WORST case, base x duplicate-match fanout
+when the lookup side violates uniqueness: the FULL OUTER join stages every
+match BEFORE the uniqueness guard aborts, so a lookup key matching k rows
+stages each referencing base row k times. The abort protects the metrics,
+not the staging cost. The fixed derived columns are ~60 bytes per row;
+batch_id, alt_value and key_hash are staged at their actual string widths
+on top, so the per-row size is configuration-dependent and 60 bytes is a
+FLOOR, not a bound — as an order of magnitude, every 100M staged rows
+starts around 6 GB of transient tempdb and grows with the configured
+string columns (probes run sequentially; the temp table drops with the
+connection). This is the deliberate design trade: staging feeds every
+grouping set AND the () distinct-count branch from ONE scan of the
 production table, where direct GROUPING SETS aggregation was measured to
 spool the distinct count per row (~150x one scan) — the read budget forbids
 that. The physical staged-row count is persisted per probe as
-`n_staged_rows` in the probe_runs snapshot table (snapshot schema v5);
-operators sizing a deployment should check tempdb free space against the
-largest probed table before the first full-scale run.
+`n_staged_rows` in the probe_runs snapshot table (snapshot schema v5) —
+including on the join-uniqueness abort, where the measured fanout is
+exactly the number worth having; aborts that fire before staging is
+measured (budget, cell cap) persist it as NULL. Operators sizing a
+deployment should check tempdb free space against the largest probed table
+before the first full-scale run.
 The as_of watermark is rendered as a whole-second literal (floored at CLI
 entry and again in the builders): a microsecond literal fails conversion
 against legacy DATETIME/SMALLDATETIME load columns (Msg 241), and the

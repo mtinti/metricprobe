@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "metricprobe"
-version = "0.1.6"
+version = "0.1.7"
 description = "Data arrival latency & completeness probes for database tables."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -60,7 +60,7 @@ select = ["E", "F", "W", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # timeout: a wedged renderer (kaleido Chrome) must FAIL loudly, never hang
-addopts = "-ra --timeout=300"
+addopts = "-ra --timeout=300 --dist loadgroup"
 pythonpath = ["."]
 markers = [
     "equivalence: compares DuckDB and SQL Server results; needs METRICPROBE_MSSQL_URL",

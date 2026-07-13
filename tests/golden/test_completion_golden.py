@@ -273,6 +273,11 @@ def test_via_non_unique_lookup_fails_loudly():
     assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE
     # ambiguous base rows are counted and reported in the abort detail
     assert "5 base rows are ambiguous" in excinfo.value.detail
+    # the abort MEASURES the fanout it cost: 5 duplicated keys join their
+    # base rows twice, so staging exceeds the base row count — persisted so
+    # the worst tempdb case is observable, not just documented
+    assert excinfo.value.staged_rows is not None
+    assert excinfo.value.staged_rows > len(base)
 
 
 def test_via_lookup_duplicates_abort_even_when_unreferenced():

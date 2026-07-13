@@ -91,7 +91,10 @@ from metricprobe.status import ReasonCode
 # the column type; SMALLDATETIME would round a latter-half-minute cutoff UP,
 # admitting rows loaded after the recorded as_of). Changes the admitted
 # population versus unfloored/untyped cutoffs.
-CANONICAL_SCHEMA_VERSION = 7
+# v8: the watermark normal form also converts timezone-aware cutoffs to
+# their UTC instant (an aware isoformat rendered the LOCAL clock face and
+# SQL Server silently discarded the offset) and rejects NaT loudly.
+CANONICAL_SCHEMA_VERSION = 8
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -169,6 +172,20 @@ RESULT_COLUMNS = (
 
 
 
+def normalize_watermark(value) -> pd.Timestamp:
+    """The watermark's NORMAL FORM: a valid, NAIVE-UTC, whole-second instant.
+    Rejects NaT/invalid values loudly (a NaT literal would reach SQL as the
+    string 'NaT'); converts timezone-aware inputs to their UTC instant (the
+    naive isoformat of an aware timestamp would render the LOCAL clock time
+    and SQL Server would silently discard the offset)."""
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        raise ValueError(f"as_of is not a valid timestamp: {value!r}")
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts.floor("s")
+
+
 class AsOfLiteral(sa.types.TypeDecorator):
     """The as_of watermark literal, rendered LOCALE-INDEPENDENTLY and typed.
 
@@ -188,7 +205,7 @@ class AsOfLiteral(sa.types.TypeDecorator):
 
     def literal_processor(self, dialect):
         def process(value):
-            iso = pd.Timestamp(value).isoformat(sep="T", timespec="seconds")
+            iso = normalize_watermark(value).isoformat(sep="T", timespec="seconds")
             if dialect.name == "mssql":
                 return f"CAST('{iso}' AS DATETIME2(0))"
             return f"TIMESTAMP '{iso}'"
@@ -197,11 +214,16 @@ class AsOfLiteral(sa.types.TypeDecorator):
 
 
 class ProbeAborted(Exception):
-    """The probe refuses to produce results (budget/cap/join violations)."""
+    """The probe refuses to produce results (budget/cap/join violations).
+    `staged_rows` carries the physical staging size when the abort happened
+    AFTER staging was measured (the join-uniqueness abort — the duplicate
+    fanout case is exactly the one worth sizing); None for aborts that fire
+    before the count exists."""
 
-    def __init__(self, reason: ReasonCode, detail: str):
+    def __init__(self, reason: ReasonCode, detail: str, staged_rows: int | None = None):
         self.reason = reason
         self.detail = detail
+        self.staged_rows = staged_rows
         super().__init__(f"{reason.value}: {detail}")
 
 
@@ -587,14 +609,15 @@ def staging_sql(
     bindparam form is kept (the snapshot form)."""
     select = build_staging_select(table, dialect, key_types=key_types)
     if as_of is not None:
-        # the literal is floored to WHOLE SECONDS: a microsecond literal
-        # ('...08.085711') fails Msg 241 against legacy DATETIME(3) and
-        # SMALLDATETIME load columns, and only the mssql literal form can
-        # feed SELECT INTO #temp (a parameterized statement runs in a
-        # prepared scope where the temp table does not survive). The CLI
-        # floors as_of at entry, so stamped == queried; this is the
-        # defense for direct callers.
-        select = select.params(as_of=pd.Timestamp(as_of).floor("s"))
+        # the literal takes the watermark NORMAL FORM (valid, naive-UTC,
+        # whole-second): microseconds fail Msg 241 against legacy
+        # DATETIME(3)/SMALLDATETIME, an aware timestamp would render its
+        # local clock face with the offset silently discarded, and only the
+        # mssql literal form can feed SELECT INTO #temp (a parameterized
+        # statement runs in a prepared scope where the temp table does not
+        # survive). The CLI normalizes at entry, so stamped == queried;
+        # this is the defense for direct callers.
+        select = select.params(as_of=normalize_watermark(as_of))
         compiled = str(
             select.compile(
                 dialect=_dialect_instance(dialect), compile_kwargs={"literal_binds": True}
@@ -1124,5 +1147,6 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                 f"probe {table.probe_name!r}: lookup side of event_time_via is not "
                 f"unique on the join key (worst key matches {int(max_dup)} rows; "
                 f"{ambiguous} base rows are ambiguous)",
+                staged_rows=result.staged_row_count,
             )
     return result
