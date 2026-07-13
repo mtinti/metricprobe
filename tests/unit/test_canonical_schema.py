@@ -388,3 +388,40 @@ def test_statistics_io_attribution_is_case_insensitive():
     assert _target_reads_from(messages, {"orders"}) == 120
     assert _target_reads_from(messages, {"unrelated"}) is None
     assert _scratch_reads_from(messages, "#mp_probe") == 47
+
+
+def test_as_of_literal_is_whole_second_in_every_staging_statement():
+    """A microsecond as_of literal fails Msg 241 against legacy DATETIME(3)
+    and SMALLDATETIME load columns (datetime2 masks it — a real production
+    failure). The builders floor the literal to whole seconds on BOTH
+    dialects and BOTH passes; the CLI floors the stamped as_of to match."""
+    import pandas as pd
+
+    from metricprobe.extract.canonical import staging_sql
+    from metricprobe.extract.dual import dual_staging_sql
+
+    table = _config_batch_alt_keys()
+    dual_table = TableConfig.model_validate(
+        {
+            "probe_name": "orders_dual",
+            "database": "demo_retail",
+            "schema": "dbo",
+            "table": "orders",
+            "event_time": "order_date",
+            "load_time": "loaded_at",
+            "source_insert_time": "source_ts",
+            "resolution": {"order_date": "date", "loaded_at": "datetime",
+                           "source_ts": "datetime"},
+        }
+    )
+    as_of = pd.Timestamp("2026-07-13 07:49:08.085711")
+    key_types = {"settlement_id": "BIGINT", "leg": "INT"}
+    statements = [
+        staging_sql(table, "mssql", as_of=as_of, key_types=key_types),
+        staging_sql(table, "duckdb", as_of=as_of, key_types=key_types),
+        dual_staging_sql(dual_table, "mssql", as_of=as_of),
+        dual_staging_sql(dual_table, "duckdb", as_of=as_of),
+    ]
+    for sql in statements:
+        assert "2026-07-13 07:49:08" in sql  # the floored watermark IS there
+        assert ".085" not in sql and "085711" not in sql, sql[-200:]

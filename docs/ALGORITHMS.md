@@ -361,3 +361,20 @@ and now measured and enforced rather than assumed. A single combined
 "3x target pages" ledger cannot honestly include scratch: for tables narrower
 than their own staging projection it is unsatisfiable by ANY architecture
 that materializes derived columns.
+
+Tempdb CAPACITY (distinct from the read ledgers): the staging step
+(`SELECT ... INTO #mp_probe`) materializes one narrow row per probed row —
+around 60–100 bytes across the derived columns, so roughly 30–50 GB of
+tempdb for a 500M-row table, transient per probe (probes run sequentially;
+the temp table drops with the connection). This is the deliberate design
+trade: staging feeds every grouping set AND the () distinct-count branch
+from ONE scan of the production table, where direct GROUPING SETS
+aggregation was measured to spool the distinct count per row (~150x one
+scan) — the read budget forbids that. The physical `n_staged_rows` count is
+in every snapshot; operators sizing a deployment should check tempdb free
+space against the largest probed table before the first full-scale run.
+The as_of watermark is rendered as a whole-second literal (floored at CLI
+entry and again in the builders): a microsecond literal fails conversion
+against legacy DATETIME/SMALLDATETIME load columns (Msg 241), and the
+literal form is required because a parameterized `SELECT INTO #temp` runs
+in a prepared-statement scope where the temp table does not survive.

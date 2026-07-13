@@ -663,3 +663,36 @@ def test_mssql_store_sweeps_are_isolated_and_types_are_frozen(mssql_engine):
             {"v": str(SNAPSHOT_SCHEMA_VERSION)},
         )
     store.prune(keep=0)  # clean up
+
+
+def test_legacy_datetime_columns_accept_a_microsecond_as_of(duckdb_engine, mssql_engine):
+    """Type-precision regression (found in production, B3): a microsecond
+    as_of used to be inlined as a six-fractional-digit literal, which legacy
+    DATETIME (3 digits max) and SMALLDATETIME reject with Msg 241 — while
+    datetime2 parses it, so a datetime2-only harness never sees the bug. The
+    literal is now floored to whole seconds; this case pins BOTH legacy
+    types AND that the numbers still match DuckDB exactly."""
+    from sqlalchemy.dialects import mssql as mssql_types
+
+    df = _dataset()
+    # whole-minute timestamps: SMALLDATETIME rounds to the minute, and the
+    # comparison is exact only when rounding cannot move any row
+    for column in ("event_time", "load_time"):
+        df[column] = df[column].dt.floor("min")
+    g.load_via_sqlalchemy(df, duckdb_engine, "events")
+    g.load_via_sqlalchemy(
+        df,
+        mssql_engine,
+        "events",
+        dtype={
+            "event_time": mssql_types.DATETIME(),      # legacy, 3 fractional digits
+            "load_time": mssql_types.SMALLDATETIME(),  # minute precision
+        },
+    )
+
+    microsecond_as_of = pd.Timestamp("2026-07-01 07:49:08.085711")
+    duck = run_canonical(duckdb_engine, _config("memory", "main"), microsecond_as_of)
+    mssql = run_canonical(mssql_engine, _config("tempdb", "dbo"), microsecond_as_of)
+    pd.testing.assert_frame_equal(
+        _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
+    )

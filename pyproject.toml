@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "metricprobe"
-version = "0.1.4"
+version = "0.1.5"
 description = "Data arrival latency & completeness probes for database tables."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -31,6 +31,7 @@ export = ["kaleido>=1.0"]
 dev = [
     "pytest>=8.2",
     "pytest-xdist>=3.6",
+    "pytest-timeout>=2.3",
     "ruff>=0.5",
     # EXACT pins: the committed demo dashboard (reports/) is byte-diffed in
     # CI, and SVG output depends on the plotly/kaleido/chromium versions
@@ -58,7 +59,8 @@ select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# timeout: a wedged renderer (kaleido Chrome) must FAIL loudly, never hang
+addopts = "-ra --timeout=300"
 pythonpath = ["."]
 markers = [
     "equivalence: compares DuckDB and SQL Server results; needs METRICPROBE_MSSQL_URL",

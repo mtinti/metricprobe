@@ -237,7 +237,9 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
 def dual_staging_sql(table: TableConfig, dialect: str, as_of=None) -> str:
     select = build_dual_staging_select(table, dialect)
     if as_of is not None:
-        select = select.params(as_of=as_of)
+        # floored to whole seconds for legacy DATETIME/SMALLDATETIME columns,
+        # same as the main pass (see canonical.staging_sql)
+        select = select.params(as_of=pd.Timestamp(as_of).floor("s"))
         compiled = str(
             select.compile(
                 dialect=_dialect_instance(dialect), compile_kwargs={"literal_binds": True}

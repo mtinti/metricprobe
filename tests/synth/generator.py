@@ -407,7 +407,9 @@ def load_into_duckdb(df: pd.DataFrame, con, table: str = "events") -> None:
     con.unregister("__synth_df")
 
 
-def load_via_sqlalchemy(df: pd.DataFrame, engine, table: str = "events") -> None:
+def load_via_sqlalchemy(df: pd.DataFrame, engine, table: str = "events", dtype=None) -> None:
     """Load through any SQLAlchemy engine — the mssql path for equivalence tests
-    (mssql+pymssql) uses this same loader from Step 3 on."""
-    df.to_sql(table, engine, if_exists="replace", index=False, chunksize=5_000)
+    (mssql+pymssql) uses this same loader from Step 3 on. `dtype` (column ->
+    SQLAlchemy type) forces specific column types, e.g. the LEGACY mssql
+    DATETIME/SMALLDATETIME the type-precision equivalence case needs."""
+    df.to_sql(table, engine, if_exists="replace", index=False, chunksize=5_000, dtype=dtype)

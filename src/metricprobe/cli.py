@@ -843,6 +843,12 @@ def cmd_run(args) -> int:
         as_of = pd.Timestamp(args.as_of) if args.as_of else run_at
         if as_of.tzinfo is not None:
             as_of = as_of.tz_convert("UTC").tz_localize(None)
+        # the frozen cutoff is WHOLE-SECOND: sub-second precision is
+        # meaningless for an analysis watermark, and a microsecond literal
+        # does not parse against legacy DATETIME(3) columns (extraction
+        # floors again defensively, but the STAMPED as_of must equal the
+        # queried one)
+        as_of = as_of.floor("s")
         window_start, window_end = _parse_window(args, as_of)
     except (ConfigError, ValueError) as error:
         print(f"metricprobe: {error}", file=sys.stderr)

@@ -553,7 +553,14 @@ def staging_sql(
     bindparam form is kept (the snapshot form)."""
     select = build_staging_select(table, dialect, key_types=key_types)
     if as_of is not None:
-        select = select.params(as_of=as_of)
+        # the literal is floored to WHOLE SECONDS: a microsecond literal
+        # ('...08.085711') fails Msg 241 against legacy DATETIME(3) and
+        # SMALLDATETIME load columns, and only the mssql literal form can
+        # feed SELECT INTO #temp (a parameterized statement runs in a
+        # prepared scope where the temp table does not survive). The CLI
+        # floors as_of at entry, so stamped == queried; this is the
+        # defense for direct callers.
+        select = select.params(as_of=pd.Timestamp(as_of).floor("s"))
         compiled = str(
             select.compile(
                 dialect=_dialect_instance(dialect), compile_kwargs={"literal_binds": True}
