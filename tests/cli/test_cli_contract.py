@@ -17,11 +17,6 @@ from metricprobe.cli import main
 from metricprobe.config import CONFIG_SCHEMA_VERSION
 from metricprobe.store import STAMP_COLUMNS, ParquetStore
 
-# kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
-# as a 300s timeout): every module that renders figures shares one xdist
-# group, so --dist loadgroup serializes them onto a single worker
-pytestmark = pytest.mark.xdist_group("kaleido-chrome")
-
 # just after the last synthetic load: freshness stays GREEN while the
 # first 18 months are mature under the 365d horizon
 AS_OF = "2025-07-02"

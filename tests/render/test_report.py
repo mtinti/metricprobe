@@ -27,7 +27,7 @@ _CDN_SCRIPT = re.compile(r"""<script[^>]*(?:cdn\.plot\.ly|unpkg\.com|cdnjs)""", 
 # kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
 # as a 300s timeout): every module that renders figures shares one xdist
 # group, so --dist loadgroup serializes them onto a single worker
-pytestmark = pytest.mark.xdist_group("kaleido-chrome")
+pytestmark = pytest.mark.xdist_group("kaleido-chrome-report")
 
 
 @pytest.fixture(scope="module")

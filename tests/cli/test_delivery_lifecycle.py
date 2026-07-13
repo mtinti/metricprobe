@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -17,11 +18,6 @@ from metricprobe.cli import main
 from metricprobe.config import CONFIG_SCHEMA_VERSION
 from metricprobe.publish import PUBLISHED_MARKER
 from metricprobe.store import ParquetStore
-
-# kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
-# as a 300s timeout): every module that renders figures shares one xdist
-# group, so --dist loadgroup serializes them onto a single worker
-pytestmark = pytest.mark.xdist_group("kaleido-chrome")
 
 AS_OF = "2025-07-02"
 
@@ -37,6 +33,27 @@ def _git(cwd, *args) -> str:
         cwd=cwd, capture_output=True, text=True, check=True,
     )
     return result.stdout
+
+
+@pytest.fixture(autouse=True)
+def stub_static_export(monkeypatch):
+    """Lifecycle tests exercise the orchestration state machine (stages,
+    atomicity, rollback) — not the renderer, which the render smoke tests
+    own with a REAL Chrome. Stubbing image export here removes ~40 browser
+    launches from this module: files are still written (existence and
+    delivery are asserted), only the bytes are fake."""
+    import plotly.io as pio
+
+    fake_svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
+    fake_png = b"\x89PNG\r\n\x1a\n" + b"0" * 16
+
+    def fake_write_images(fig, file, format=None, **kwargs):
+        payload = fake_svg if format == "svg" else fake_png
+        for path in file:
+            Path(path).write_bytes(payload)
+
+    monkeypatch.setattr(pio, "write_images", fake_write_images)
+    monkeypatch.setattr(pio, "to_image", lambda *args, **kwargs: fake_png)
 
 
 @pytest.fixture()
