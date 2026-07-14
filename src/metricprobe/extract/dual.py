@@ -477,9 +477,27 @@ def _derive_dual_global_row(rows: list[tuple], keys) -> tuple:
 def dual_direct_eligible(table: TableConfig) -> bool:
     """Direct mode for the dual pass: no via (no join-validation artifacts).
     The dual aggregation has no distinct-count, so every non-via dual probe
-    qualifies — three grouping sets, same measured plan shape as the main
-    pass's direct mode."""
+    qualifies STRUCTURALLY — whether it actually runs direct also depends on
+    the measured budget headroom (dual_mode_for)."""
     return table.event_time_via is None
+
+
+def dual_mode_for(prior_target_reads: int | None, pages: int | None) -> str:
+    """The dual pass's mode, chosen from the MEASURED budget headroom the
+    main pass left (production finding: direct costs up to TWO target scans
+    per pass and the 3x budget is CUMULATIVE — main-direct 2 scans +
+    dual-direct 2 scans = 4x, an abort AFTER the reads were spent; the plan
+    is optimizer-dependent, so the decision must use measured numbers, not
+    hope). Direct only when the worst case (2 more scans) fits under 3x
+    with a 2% headroom; otherwise the staged path's guaranteed single scan
+    keeps the probe inside the budget. Unknown pages (duckdb: no ledger)
+    defaults to direct."""
+    if pages is None:
+        return "direct"
+    margin = max(64, pages // 50)
+    if (prior_target_reads or 0) + 2 * pages <= 3 * pages - margin:
+        return "direct"
+    return "staged"
 
 
 def _run_dual_direct(
@@ -550,9 +568,14 @@ def run_dual_lag(
     prior_target_reads so main + dual together are verified against 3x one
     full scan. Scratch reads carry their own fail-closed ledger. Non-via
     probes run DIRECT (no staging, no tempdb)."""
-    if dual_direct_eligible(table):
-        return _run_dual_direct(engine, table, as_of, prior_target_reads)
     dialect = engine.dialect.name
+    if dual_direct_eligible(table):
+        pages = None
+        if dialect == "mssql":
+            with engine.connect() as conn:
+                pages = _mssql_target_pages(conn, table)
+        if dual_mode_for(prior_target_reads, pages) == "direct":
+            return _run_dual_direct(engine, table, as_of, prior_target_reads)
     cap = table.analysis.result_cell_cap
     rows = []
     target_reads = budget = scratch_reads = scratch_budget = spool_reads = None

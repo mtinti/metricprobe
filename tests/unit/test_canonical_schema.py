@@ -540,3 +540,23 @@ def test_direct_and_bounded_sql_snapshots(dialect):
             f"compiled SQL for {name} ({dialect}) changed; if intentional, "
             "regenerate with UPDATE_SNAPSHOTS=1 and review the diff"
         )
+
+
+def test_dual_mode_decision_respects_the_cumulative_budget():
+    """Production finding (SMR02-class): direct costs up to TWO scans per
+    pass and the 3x budget is cumulative — the dual pass must choose its
+    mode from the MEASURED headroom, never from optimism about the plan."""
+    from metricprobe.extract.dual import dual_mode_for
+
+    pages = 100_000
+    # main ran direct and its plan rescanned (~2x): dual MUST stage
+    assert dual_mode_for(2 * pages, pages) == "staged"
+    # main ran direct with a single-scan spool plan (~1x): 1x + 2x = 3x
+    # exactly — inside the margin, still staged (no 24-read gambles)
+    assert dual_mode_for(pages, pages) == "staged"
+    # plenty of headroom (tiny prior): direct
+    assert dual_mode_for(pages // 2, pages) == "direct"
+    assert dual_mode_for(0, pages) == "direct"
+    assert dual_mode_for(None, pages) == "direct"
+    # no ledger (duckdb): direct
+    assert dual_mode_for(123, None) == "direct"

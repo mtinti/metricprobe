@@ -405,6 +405,15 @@ gets the same mode for non-via probes, with the same derived () row; its
 STAGED aggregation now realizes the global row as an ungrouped UNION ALL
 branch too (its former inline () silently lost the row on empty mssql
 tables — a latent bug this work surfaced).
+CUMULATIVE-BUDGET MODE DECISION (production finding): direct costs up to
+TWO target scans per pass and the plan is optimizer-dependent (measured:
+some tables get a 1-scan spool plan, others rescan), while the 3x budget
+is cumulative across passes — main-direct + dual-direct can reach 4x and
+abort AFTER the reads were spent. The dual pass therefore chooses its
+mode from the MEASURED headroom the main pass left (dual_mode_for):
+direct only when two more worst-case scans fit under 3x with a 2%
+headroom, else the staged path's guaranteed single scan. Main-direct
+(<=2x) + dual-staged (1x) <= 3x always holds.
 
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,
