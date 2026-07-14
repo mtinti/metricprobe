@@ -13,7 +13,12 @@ v5 watermarks the base BEFORE the join and adds the physical n_staged_rows;
 v6 drops guard-artifact-only cells from the grouped branch;
 v7 renders the as_of literal whole-second, T-separated, CAST to DATETIME2(0)
 on mssql — locale-independent and precision-safe, same as the main pass;
-v8 normalizes timezone-aware cutoffs to their UTC instant and rejects NaT).
+v8 normalizes timezone-aware cutoffs to their UTC instant and rejects NaT;
+v9 adds the optional extraction_months event bound, the DIRECT mode for
+non-via probes — same query over the inlined staging select, no tempdb —
+and realizes the () global row as an ungrouped UNION ALL branch like the
+main pass: SQL Server returns no rows for GROUPING SETS incl. () over an
+EMPTY population, so the inline form lost the global row on empty tables).
 Grouping columns and GROUPING() weights:
     event_month (4), lag_day (2), delta_day (1)
 
@@ -56,6 +61,7 @@ from metricprobe.extract.canonical import (
     _staged_row_count,
     _table_clause,
     _target_reads_from,
+    extraction_start,
     normalize_watermark,
     verify_scan_budget,
     verify_scratch_budget,
@@ -63,7 +69,7 @@ from metricprobe.extract.canonical import (
 )
 from metricprobe.status import ReasonCode
 
-DUAL_SCHEMA_VERSION = 8
+DUAL_SCHEMA_VERSION = 9
 
 DUAL_GROUPING_WEIGHTS = {"event_month": 4, "lag_day": 2, "delta_day": 1}
 
@@ -236,6 +242,16 @@ def build_dual_staging_select(table: TableConfig, dialect: str) -> sa.Select:
         select = select.where(
             sa.or_(load <= sa.bindparam("as_of", type_=AsOfLiteral()), load.is_(None))
         )
+    if analysis.extraction_months is not None:
+        # same event bound as the main pass: NULL events and via guard rows
+        # stay admitted (see canonical.build_staging_select)
+        bound = sa.bindparam("extraction_start", type_=AsOfLiteral())
+        if via is None:
+            select = select.where(sa.or_(event >= bound, event.is_(None)))
+        else:
+            select = select.where(
+                sa.or_(sa.not_(is_probe), event >= bound, event.is_(None))
+            )
     return select
 
 
@@ -244,7 +260,12 @@ def dual_staging_sql(table: TableConfig, dialect: str, as_of=None) -> str:
     if as_of is not None:
         # the watermark normal form, same as the main pass (see
         # canonical.staging_sql): valid, naive-UTC, whole-second
-        select = select.params(as_of=normalize_watermark(as_of))
+        params = {"as_of": normalize_watermark(as_of)}
+        if table.analysis.extraction_months is not None:
+            params["extraction_start"] = extraction_start(
+                as_of, table.analysis.extraction_months
+            )
+        select = select.params(**params)
         compiled = str(
             select.compile(
                 dialect=_dialect_instance(dialect), compile_kwargs={"literal_binds": True}
@@ -261,12 +282,18 @@ def dual_staging_sql(table: TableConfig, dialect: str, as_of=None) -> str:
     )
 
 
-def build_dual_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
-    staging = _dual_staging_clause(dialect)
+def build_dual_aggregation_query(
+    table: TableConfig, dialect: str, source=None
+) -> sa.Select:
+    """Aggregation over the staging TEMP TABLE by default; pass `source`
+    (the staging select as a subquery) for the DIRECT mode — the dual pass
+    has no distinct-count, so its () set is already inline and the direct
+    shape is literally the same query over a different relation."""
+    staging = source if source is not None else _dual_staging_clause(dialect)
     month_key = staging.c.event_month
     lag_key = staging.c.lag_day
     delta_key = staging.c.delta_day
-    sets = [[month_key, lag_key], [delta_key], []]
+    sets = [[month_key, lag_key], [delta_key]]
     grouping_id = (
         sa.func.grouping(month_key) * DUAL_GROUPING_WEIGHTS["event_month"]
         + sa.func.grouping(lag_key) * DUAL_GROUPING_WEIGHTS["lag_day"]
@@ -276,37 +303,56 @@ def build_dual_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
     def total(col):
         return sa.func.coalesce(sa.func.sum(col), 0)
 
-    return (
+    def measures():
+        return [
+            total(staging.c.is_probe_row).label("row_count"),
+            total(staging.c.is_source_eligible).label("n_source_eligible"),
+            total(staging.c.is_null_event_time).label("n_null_event_time"),
+            total(staging.c.is_null_source_only).label("n_null_source_only"),
+            total(staging.c.is_negative_clipped).label("n_negative_clipped"),
+            total(staging.c.is_negative_lag_excluded).label(
+                "n_negative_lag_excluded"
+            ),
+            total(staging.c.is_overflow).label("n_overflow"),
+            total(staging.c.is_delta_row).label("n_delta_rows"),
+            sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
+            sa.func.count().label("n_staged_rows"),
+        ]
+
+    grouped = (
         sa.select(
             grouping_id.label("grouping_id"),
             month_key.label("event_month"),
             lag_key.label("lag_day"),
             delta_key.label("delta_day"),
             # probe-table rows only, exactly like the main pass
-            total(staging.c.is_probe_row).label("row_count"),
-            total(staging.c.is_source_eligible).label("n_source_eligible"),
-            total(staging.c.is_null_event_time).label("n_null_event_time"),
-            total(staging.c.is_null_source_only).label("n_null_source_only"),
-            total(staging.c.is_negative_clipped).label("n_negative_clipped"),
-            total(staging.c.is_negative_lag_excluded).label("n_negative_lag_excluded"),
-            total(staging.c.is_overflow).label("n_overflow"),
-            total(staging.c.is_delta_row).label("n_delta_rows"),
-            sa.func.max(staging.c.lookup_dup).label("max_lookup_dup"),
-            sa.func.count().label("n_staged_rows"),
+            *measures(),
         )
         .select_from(staging)
         .group_by(GroupingSetsClause(sets))
         # guard-artifact-only cells are not data (v6), same as the main pass
-        # — but the () GLOBAL row is exempt: it must exist even when the base
-        # is empty (it carries max_lookup_dup, the uniqueness guard's answer
-        # for exactly that degenerate case)
-        .having(
-            sa.or_(
-                sa.func.coalesce(sa.func.sum(staging.c.is_probe_row), 0) > 0,
-                grouping_id == DUAL_GROUPING_SET_IDS["global"],
-            )
-        )
-        .limit(table.analysis.result_cell_cap * len(sets) + 1)
+        .having(sa.func.coalesce(sa.func.sum(staging.c.is_probe_row), 0) > 0)
+    )
+    # the () GLOBAL row is an ungrouped UNION ALL branch, exactly like the
+    # main pass (v9): it must exist even over an EMPTY population — measured,
+    # SQL Server returns NO rows for GROUPING SETS incl. () over empty input
+    # while DuckDB returns the () row; an ungrouped aggregate returns exactly
+    # one row on both — and it carries max_lookup_dup, the uniqueness guard's
+    # answer for exactly that degenerate case
+    global_row = sa.select(
+        sa.literal(DUAL_GROUPING_SET_IDS["global"]).label("grouping_id"),
+        sa.cast(sa.null(), sa.Date()).label("event_month"),
+        sa.cast(sa.null(), sa.Integer()).label("lag_day"),
+        sa.cast(sa.null(), sa.Integer()).label("delta_day"),
+        *measures(),
+    ).select_from(staging)
+    compound = grouped.union_all(global_row).subquery("dual_canonical")
+    return (
+        sa.select(*[compound.c[name] for name in DUAL_RESULT_COLUMNS])
+        .order_by(compound.c.grouping_id)
+        # server-side bound, wrapped so mssql renders the row limit (it
+        # silently drops .limit() on a compound select)
+        .limit(table.analysis.result_cell_cap * (len(sets) + 1) + 1)
     )
 
 
@@ -323,6 +369,7 @@ class DualLagResult:
     scratch_logical_reads: int | None = None
     scratch_budget_reads: int | None = None
     staging_spool_reads: int | None = None
+    execution_mode: str = "staged"  # "direct" for non-via probes
 
     @property
     def staged_row_count(self) -> int | None:
@@ -351,16 +398,162 @@ class DualLagResult:
         return rows.iloc[0]
 
 
+DUAL_SUM_GLOBAL_COLUMNS = (
+    "row_count",
+    "n_source_eligible",
+    "n_null_event_time",
+    "n_null_source_only",
+    "n_negative_clipped",
+    "n_negative_lag_excluded",
+    "n_overflow",
+    "n_delta_rows",
+    "n_staged_rows",
+)
+
+
+def build_dual_direct_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
+    """DIRECT dual shape: the two dimensional sets straight over the inlined
+    staging select — the () row is DERIVED by the runner from the complete
+    (month, lag) set, exactly like the main pass (a UNION ALL global branch
+    costs a third target scan against a 3x budget shared with the main
+    pass)."""
+    inner = build_dual_staging_select(table, dialect).subquery("s")
+    month_key = inner.c.event_month
+    lag_key = inner.c.lag_day
+    delta_key = inner.c.delta_day
+    sets = [[month_key, lag_key], [delta_key]]
+    grouping_id = (
+        sa.func.grouping(month_key) * DUAL_GROUPING_WEIGHTS["event_month"]
+        + sa.func.grouping(lag_key) * DUAL_GROUPING_WEIGHTS["lag_day"]
+        + sa.func.grouping(delta_key) * DUAL_GROUPING_WEIGHTS["delta_day"]
+    )
+
+    def total(col):
+        return sa.func.coalesce(sa.func.sum(col), 0)
+
+    return (
+        sa.select(
+            grouping_id.label("grouping_id"),
+            month_key.label("event_month"),
+            lag_key.label("lag_day"),
+            delta_key.label("delta_day"),
+            total(inner.c.is_probe_row).label("row_count"),
+            total(inner.c.is_source_eligible).label("n_source_eligible"),
+            total(inner.c.is_null_event_time).label("n_null_event_time"),
+            total(inner.c.is_null_source_only).label("n_null_source_only"),
+            total(inner.c.is_negative_clipped).label("n_negative_clipped"),
+            total(inner.c.is_negative_lag_excluded).label("n_negative_lag_excluded"),
+            total(inner.c.is_overflow).label("n_overflow"),
+            total(inner.c.is_delta_row).label("n_delta_rows"),
+            sa.func.max(inner.c.lookup_dup).label("max_lookup_dup"),
+            sa.func.count().label("n_staged_rows"),
+        )
+        .select_from(inner)
+        .group_by(GroupingSetsClause(sets))
+        .limit(table.analysis.result_cell_cap * len(sets) + 1)
+    )
+
+
+def _derive_dual_global_row(rows: list[tuple], keys) -> tuple:
+    """The dual () row from the complete (month, lag) set — same exact
+    arithmetic as the main pass (see canonical._derive_global_row)."""
+    key_list = list(keys)
+    index = {name: key_list.index(name) for name in key_list}
+    source = [
+        row
+        for row in rows
+        if row[index["grouping_id"]] == DUAL_GROUPING_SET_IDS["month_src_lag"]
+    ]
+    values: dict[str, object] = dict.fromkeys(key_list)
+    values["grouping_id"] = DUAL_GROUPING_SET_IDS["global"]
+    for name in DUAL_SUM_GLOBAL_COLUMNS:
+        values[name] = sum(int(row[index[name]] or 0) for row in source)
+    dups = [row[index["max_lookup_dup"]] for row in source
+            if row[index["max_lookup_dup"]] is not None]
+    values["max_lookup_dup"] = max(dups) if dups else None
+    return tuple(values[name] for name in key_list)
+
+
+def dual_direct_eligible(table: TableConfig) -> bool:
+    """Direct mode for the dual pass: no via (no join-validation artifacts).
+    The dual aggregation has no distinct-count, so every non-via dual probe
+    qualifies — three grouping sets, same measured plan shape as the main
+    pass's direct mode."""
+    return table.event_time_via is None
+
+
+def _run_dual_direct(
+    engine, table: TableConfig, as_of, prior_target_reads: int | None
+) -> DualLagResult:
+    """One statement over the base table; no staging, no tempdb (see the
+    main pass's _run_canonical_direct for the benchmark)."""
+    from metricprobe.extract.canonical import _cap_counted
+
+    dialect = engine.dialect.name
+    target_reads = budget = scratch_reads = scratch_budget = None
+    with engine.connect() as conn:
+        messages: list[str] = []
+        pages = None
+        if dialect == "mssql":
+            pages = _mssql_target_pages(conn, table)
+            _install_message_capture(conn, messages)
+            conn.exec_driver_sql("SET STATISTICS IO ON")
+        query = build_dual_direct_aggregation_query(table, dialect)
+        params = {"as_of": normalize_watermark(as_of)}
+        if table.analysis.extraction_months is not None:
+            params["extraction_start"] = extraction_start(
+                as_of, table.analysis.extraction_months
+            )
+        direct_sql = str(
+            query.params(**params).compile(
+                dialect=_dialect_instance(dialect),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+        keys, fetched = _exec_with_messages(conn, direct_sql, messages)
+        rows = _cap_counted(
+            fetched, keys, table.analysis.result_cell_cap, table.probe_name, "dual "
+        )
+        rows.append(_derive_dual_global_row(rows, keys))
+        if dialect == "mssql":
+            own_reads = _target_reads_from(messages, {table.table})
+            cumulative = None if own_reads is None else own_reads + (prior_target_reads or 0)
+            staged = _staged_row_count(rows, keys, DUAL_GROUPING_SET_IDS["global"])
+            target_reads, budget = verify_scan_budget(
+                cumulative, pages, table.probe_name, staged_rows=staged
+            )
+            scratch_reads, scratch_budget = verify_spool_budget(
+                _scratch_reads_from(messages, dual_staging_table_name(dialect)),
+                0,  # no staging table: purely row-linear worktable bound
+                staged,
+                table.probe_name,
+            )
+    frame = pd.DataFrame(rows, columns=list(keys))[list(DUAL_RESULT_COLUMNS)]
+    frame["event_month"] = pd.to_datetime(frame["event_month"]).astype("datetime64[ns]")
+    result = DualLagResult(
+        frame=frame,
+        target_logical_reads=target_reads,
+        scan_budget_reads=budget,
+        scratch_logical_reads=scratch_reads,
+        scratch_budget_reads=scratch_budget,
+        staging_spool_reads=None,
+        execution_mode="direct",
+    )
+    return result
+
+
 def run_dual_lag(
     engine, table: TableConfig, as_of, prior_target_reads: int | None = None
 ) -> DualLagResult:
     """Stage -> aggregate -> drop for the dual pass. The <=3x target budget is
     per PROBE, cumulative: pass the main pass's measured target reads as
     prior_target_reads so main + dual together are verified against 3x one
-    full scan. Scratch reads carry their own fail-closed ledger."""
+    full scan. Scratch reads carry their own fail-closed ledger. Non-via
+    probes run DIRECT (no staging, no tempdb)."""
+    if dual_direct_eligible(table):
+        return _run_dual_direct(engine, table, as_of, prior_target_reads)
     dialect = engine.dialect.name
     cap = table.analysis.result_cell_cap
-    counts: dict[int, int] = {}
     rows = []
     target_reads = budget = scratch_reads = scratch_budget = spool_reads = None
     with engine.connect() as conn:
@@ -384,17 +577,9 @@ def run_dual_lag(
                 )
             )
             keys, fetched = _exec_with_messages(conn, aggregation_sql, messages)
-            gid_index = keys.index("grouping_id")
-            for row in fetched:
-                gid = row[gid_index]
-                counts[gid] = counts.get(gid, 0) + 1
-                if counts[gid] > cap:
-                    raise ProbeAborted(
-                        ReasonCode.RESULT_CELL_CAP_EXCEEDED,
-                        f"probe {table.probe_name!r}: dual grouping set {gid} exceeded "
-                        f"result_cell_cap={cap}",
-                    )
-                rows.append(tuple(row))
+            from metricprobe.extract.canonical import _cap_counted
+
+            rows = _cap_counted(fetched, keys, cap, table.probe_name, "dual ")
         finally:
             # the drop also flushes the aggregation's pending STATISTICS IO;
             # guarded like the main pass: cleanup must never mask the cause

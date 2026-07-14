@@ -884,3 +884,72 @@ def test_pyodbc_captures_statistics_io_and_verifies_the_budget(
     pd.testing.assert_frame_equal(
         _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
     )
+
+
+def test_direct_mode_matches_staged_and_duckdb(duckdb_engine, mssql_engine, monkeypatch):
+    """The DIRECT execution mode (simple probes, benchmarked ~20x faster
+    with zero tempdb) must yield the staged path's frozen result schema row
+    for row on REAL SQL Server — main and dual passes — with the scan
+    budget measured and verified, and DuckDB agreeing throughout."""
+    import metricprobe.extract.canonical as canonical_module
+    import metricprobe.extract.dual as dual_module
+    from metricprobe.extract.dual import run_dual_lag
+
+    df = _dataset()
+    df["source_insert_time"] = df["event_time"] + pd.Timedelta(days=1)
+    g.load_via_sqlalchemy(df, duckdb_engine, "events")
+    g.load_via_sqlalchemy(df, mssql_engine, "events")
+    simple = {"key_cols": None, "load_batch_col": None,
+              "source_insert_time": "source_insert_time"}
+
+    duck = run_canonical(duckdb_engine, _config("memory", "main", **simple), AS_OF)
+    direct = run_canonical(mssql_engine, _config("tempdb", "dbo", **simple), AS_OF)
+    assert duck.execution_mode == direct.execution_mode == "direct"
+    assert direct.target_logical_reads is not None  # budget measured + verified
+    assert direct.target_logical_reads <= direct.scan_budget_reads
+    monkeypatch.setattr(canonical_module, "direct_eligible", lambda table: False)
+    staged = run_canonical(mssql_engine, _config("tempdb", "dbo", **simple), AS_OF)
+    assert staged.execution_mode == "staged"
+    pd.testing.assert_frame_equal(
+        _normalized(direct.frame), _normalized(staged.frame), check_dtype=False
+    )
+    pd.testing.assert_frame_equal(
+        _normalized(duck.frame), _normalized(direct.frame), check_dtype=False
+    )
+
+    # the dual pass: same identity, same budget discipline
+    def _dual_sorted(frame):
+        out = frame.copy()
+        out["event_month"] = pd.to_datetime(out["event_month"]).astype("datetime64[ns]")
+        keys = ["grouping_id", "event_month", "lag_day", "delta_day"]
+        return out.sort_values(keys, na_position="first").reset_index(drop=True)
+
+    dual_direct = run_dual_lag(
+        mssql_engine, _config("tempdb", "dbo", **simple), AS_OF, prior_target_reads=0
+    )
+    assert dual_direct.execution_mode == "direct"
+    monkeypatch.setattr(dual_module, "dual_direct_eligible", lambda table: False)
+    dual_staged = run_dual_lag(
+        mssql_engine, _config("tempdb", "dbo", **simple), AS_OF, prior_target_reads=0
+    )
+    assert dual_staged.execution_mode == "staged"
+    pd.testing.assert_frame_equal(
+        _dual_sorted(dual_direct.frame), _dual_sorted(dual_staged.frame),
+        check_dtype=False,
+    )
+
+
+def test_extraction_bound_matches_between_dialects(duckdb_engine, mssql_engine):
+    """extraction_months against the container: the bounded frames must
+    equal DuckDB's exactly (month-aligned start, NULL events kept), through
+    the DIRECT mode both engines now take for this simple probe."""
+    df = _dataset()
+    g.load_via_sqlalchemy(df, duckdb_engine, "events")
+    g.load_via_sqlalchemy(df, mssql_engine, "events")
+    bounded = {"key_cols": None, "load_batch_col": None,
+               "analysis": {"extraction_months": 24, "result_cell_cap": 100000}}
+    duck = run_canonical(duckdb_engine, _config("memory", "main", **bounded), AS_OF)
+    mssql = run_canonical(mssql_engine, _config("tempdb", "dbo", **bounded), AS_OF)
+    pd.testing.assert_frame_equal(
+        _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
+    )

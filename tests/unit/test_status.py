@@ -150,9 +150,9 @@ def test_component_versions_are_pinned():
     from metricprobe.cli import COMPONENT_VERSIONS
 
     assert COMPONENT_VERSIONS == {
-        "config": 3,  # v3: compare resolution, dialect whitelist, finite params
+        "config": 4,  # v4: optional extraction_months bound
         "status": 2,  # v2: PROBE check + Step 3-7 reason codes joined the wire
-        "canonical": 8,  # v8: watermark normal form (UTC instant, NaT rejected)
-        "dual": 8,  # v8: same watermark normal form as the main pass
-        "snapshot": 5,  # v4: mature summary refused below min_mature_months
+        "canonical": 9,  # v9: extraction_months bound + DIRECT mode
+        "dual": 9,  # v9: same bound + direct mode for non-via probes
+        "snapshot": 6,  # v4: mature summary refused below min_mature_months
     }

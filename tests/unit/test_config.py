@@ -478,6 +478,7 @@ def test_analysis_defaults_are_frozen_v1():
     assert AnalysisParams().model_dump() == {
         "training_cutoff_days": 365,
         "lag_cap_days": 365,
+        "extraction_months": None,  # full history by default (v4 field)
         "clock_skew_tolerance_days": 1.0,
         "negative_lag_red_fraction": 0.001,
         "min_mature_months": 6,

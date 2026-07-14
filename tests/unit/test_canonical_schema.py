@@ -28,11 +28,12 @@ def test_schema_version_is_pinned():
     # pre-join watermark for via probes + physical n_staged_rows; v6:
     # guard-artifact-only cells dropped from the grouped branch; v7:
     # whole-second locale-independent typed as_of literal; v8: watermark
-    # normal form (tz-aware -> UTC instant, NaT rejected);
+    # normal form (tz-aware -> UTC instant, NaT rejected); v9:
+    # extraction_months bound + DIRECT mode for simple probes;
     # changing any frozen formula must bump this deliberately
     from metricprobe.extract.canonical import CANONICAL_SCHEMA_VERSION
 
-    assert CANONICAL_SCHEMA_VERSION == 8
+    assert CANONICAL_SCHEMA_VERSION == 9
 
 
 def test_grouping_ids_are_frozen():
@@ -499,3 +500,43 @@ def test_budget_aborts_carry_the_staged_row_count():
     with pt.raises(ProbeAborted) as excinfo:
         verify_spool_budget(None, 10, 42, "p")
     assert excinfo.value.staged_rows == 42
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "mssql"])
+def test_direct_and_bounded_sql_snapshots(dialect):
+    """The v9 shapes are review-visible: the DIRECT aggregation for a simple
+    probe and a BOUNDED staging select each get a compiled-SQL snapshot."""
+    from metricprobe.extract.canonical import build_direct_aggregation_query
+
+    shapes = {
+        "canonical_direct_aggregation": str(
+            build_direct_aggregation_query(_config_basic(), dialect).compile(
+                dialect=_dialect(dialect)
+            )
+        ),
+        "canonical_bounded_staging": staging_sql(
+            TableConfig.model_validate(
+                {
+                    "probe_name": "orders_bounded",
+                    "database": "demo_retail",
+                    "schema": "dbo",
+                    "table": "orders",
+                    "event_time": "order_date",
+                    "load_time": "loaded_at",
+                    "resolution": {"order_date": "date", "loaded_at": "datetime"},
+                    "analysis": {"extraction_months": 36},
+                }
+            ),
+            dialect,
+        ),
+    }
+    for name, compiled in shapes.items():
+        path = SNAPSHOT_DIR / f"{name}_{dialect}.sql"
+        if os.environ.get("UPDATE_SNAPSHOTS"):
+            SNAPSHOT_DIR.mkdir(exist_ok=True)
+            path.write_text(compiled + "\n")
+        assert path.exists(), f"snapshot missing: run UPDATE_SNAPSHOTS=1 pytest {__name__}"
+        assert compiled + "\n" == path.read_text(), (
+            f"compiled SQL for {name} ({dialect}) changed; if intentional, "
+            "regenerate with UPDATE_SNAPSHOTS=1 and review the diff"
+        )

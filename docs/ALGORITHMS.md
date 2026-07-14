@@ -370,6 +370,42 @@ discarded the offset, shifting the watermark by the offset for direct
 builder callers — the CLI already normalized) and rejects NaT loudly
 instead of emitting the string 'NaT' into SQL.
 
+v9 (both passes): (a) the optional `extraction_months` bound — the staging
+projection admits only events on or after `extraction_start` = the first
+day of the calendar month (as_of month − extraction_months + 1). MONTH
+ALIGNMENT is load-bearing: a mid-month cut would make the oldest admitted
+month a partial count and a phantom volume outlier on every run. NULL
+events stay admitted (the null-event pathology bucket must survive; they
+cannot be month-bounded), and via guard-only rows stay admitted (the
+lookup-uniqueness contract covers the whole lookup table). Config
+validation (config schema v4) rejects bounds too small for the training
+cohort. On unindexed columns the bound does NOT reduce scan reads — it
+bounds staged rows, result cells and snapshot size.
+(b) the DIRECT execution mode: probes needing neither the distinct-count
+guard (no key_cols) nor join validation (no via) nor extra sets (no
+batch/alt) skip staging entirely — one GROUPING SETS ((month, lag),
+(epoch)) statement over the base table. The () global row is NOT in the
+SQL: an inline () loses the row over an EMPTY population on SQL Server
+(measured: GROUPING SETS incl. () over empty input returns no rows there,
+one row on DuckDB), and a UNION ALL global branch costs a THIRD target
+scan (measured 75,270 reads against a 75,294 budget — a 24-read margin).
+Instead the runner DERIVES the () row by exact integer aggregation of the
+complete (month, lag) set, which PARTITIONS every staged row for a simple
+probe (no via ⇒ no guard artifacts; NULL keys form their own cell) —
+arithmetic over aggregates already fetched, no new information, proven
+row-identical to the staged path's engine-computed row by goldens and
+container equivalence, empty tables included.
+Benchmark, synthetic 7M-row unindexed heap (SQL Server 2022 container):
+staged 66–69 s elapsed, 1 target scan + 511 MB tempdb staging + ~196k
+scratch reads; shipping direct 1.7–1.8 s elapsed, 2 target scans (50,180
+of a 75,294 budget), ZERO worktables, ZERO tempdb. The scan budget stays
+fail-closed; the direct mode's scratch ledger bounds the statement's
+worktable reads row-linearly (there is no staging table). The dual pass
+gets the same mode for non-via probes, with the same derived () row; its
+STAGED aggregation now realizes the global row as an ungrouped UNION ALL
+branch too (its former inline () silently lost the row on empty mssql
+tables — a latent bug this work surfaced).
+
 Rationale: the hard rule's "3x one full scan" bounds pressure on the
 PRODUCTION table; the scratch work is tempdb-local, bounded by construction,
 and now measured and enforced rather than assumed. A single combined

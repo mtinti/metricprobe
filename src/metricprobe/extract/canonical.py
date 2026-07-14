@@ -94,7 +94,13 @@ from metricprobe.status import ReasonCode
 # v8: the watermark normal form also converts timezone-aware cutoffs to
 # their UTC instant (an aware isoformat rendered the LOCAL clock face and
 # SQL Server silently discarded the offset) and rejects NaT loudly.
-CANONICAL_SCHEMA_VERSION = 8
+# v9: (a) optional extraction_months bound — the staging select admits only
+# events >= extraction_start (month-aligned; NULL events and via guard rows
+# stay admitted); (b) DIRECT execution mode for simple probes (no keys/via/
+# batch/alt): one GROUPING SETS statement over the base table, () set
+# inline (no distinct-count to spool), identical frozen result schema —
+# benchmarked ~20x faster with zero tempdb at 2 target scans.
+CANONICAL_SCHEMA_VERSION = 9
 
 # frozen lag_day sentinel for negative-excluded rows: they carry their event
 # month (parity's watermarked population) but never enter curves or volumes
@@ -170,6 +176,15 @@ RESULT_COLUMNS = (
 # query also carries a server-side row limit of cap x set-count + 1 so the
 # database never returns unbounded rows even before the client counts them.
 
+
+
+def extraction_start(as_of, months: int) -> pd.Timestamp:
+    """The extraction bound's normal form: the FIRST DAY of the calendar
+    month `months - 1` months before as_of's month — month-aligned, so the
+    oldest admitted month is complete (a mid-month cut would make that
+    month's volume a partial count and a phantom outlier every run)."""
+    ts = normalize_watermark(as_of)
+    return (ts.normalize().replace(day=1) - pd.DateOffset(months=months - 1)).floor("s")
 
 
 def normalize_watermark(value) -> pd.Timestamp:
@@ -595,6 +610,19 @@ def build_staging_select(
         select = select.where(
             sa.or_(load <= sa.bindparam("as_of", type_=AsOfLiteral()), load.is_(None))
         )
+    if analysis.extraction_months is not None:
+        # the event-time bound. NULL events stay admitted (they cannot be
+        # month-bounded and the null-event pathology bucket must survive);
+        # via guard-only rows stay admitted (the lookup-uniqueness contract
+        # covers the WHOLE lookup table — a duplicated key with old events
+        # must still abort)
+        bound = sa.bindparam("extraction_start", type_=AsOfLiteral())
+        if via is None:
+            select = select.where(sa.or_(event >= bound, event.is_(None)))
+        else:
+            select = select.where(
+                sa.or_(sa.not_(is_probe), event >= bound, event.is_(None))
+            )
     return select
 
 
@@ -617,7 +645,12 @@ def staging_sql(
         # statement runs in a prepared scope where the temp table does not
         # survive). The CLI normalizes at entry, so stamped == queried;
         # this is the defense for direct callers.
-        select = select.params(as_of=normalize_watermark(as_of))
+        params = {"as_of": normalize_watermark(as_of)}
+        if table.analysis.extraction_months is not None:
+            params["extraction_start"] = extraction_start(
+                as_of, table.analysis.extraction_months
+            )
+        select = select.params(**params)
         compiled = str(
             select.compile(
                 dialect=_dialect_instance(dialect), compile_kwargs={"literal_binds": True}
@@ -671,14 +704,20 @@ def _bucket_sums(staging):
     ]
 
 
-def build_aggregation_query(table: TableConfig, dialect: str):
+def build_aggregation_query(table: TableConfig, dialect: str, source=None):
     """ONE statement over the staging table (the target table is touched ZERO
     times): the dimensional grouping sets UNION ALL the () global row, which
     carries COUNT(*) vs COUNT(DISTINCT key_hash) — the canonical result's
     empty grouping set holds the uniqueness scalars, per the frozen contract.
     (Computing the DISTINCT inside the GROUPING SETS plan would spool per row;
-    the union branch is a plain single-pass aggregate.)"""
-    staging = _staging_clause(dialect)
+    the union branch is a plain single-pass aggregate. The UNION ALL global
+    branch is ALSO what guarantees the () row over an EMPTY population:
+    measured, SQL Server returns no rows for GROUPING SETS incl. () over
+    empty input while DuckDB returns the () row — an ungrouped aggregate
+    returns exactly one row on both.)
+    `source` (DIRECT mode) aggregates over the inlined staging select
+    instead of the temp table — same statement, different relation."""
+    staging = source if source is not None else _staging_clause(dialect)
     month_key = staging.c.event_month
     lag_key = staging.c.lag_day
     epoch_key = staging.c.load_epoch_day
@@ -955,6 +994,101 @@ def _mssql_staging_pages(conn, staging_name: str) -> int | None:
 # ---------------------------------------------------------------------- runner
 
 
+def direct_eligible(table: TableConfig) -> bool:
+    """The DIRECT execution mode applies to SIMPLE probes: no key_cols (no
+    distinct-count guard — the one aggregate whose in-plan form was measured
+    to spool ~150x), no via (no join-validation artifacts), no batch/alt
+    (three grouping sets keep the measured plan at TWO target scans, inside
+    the 3x budget). Everything else keeps the staging path."""
+    return (
+        table.key_cols is None
+        and table.event_time_via is None
+        and table.load_batch_col is None
+        and table.group_by_alt is None
+    )
+
+
+def build_direct_aggregation_query(table: TableConfig, dialect: str) -> sa.Select:
+    """The DIRECT shape (benchmarked, synthetic 7M-row unindexed heap):
+    GROUPING SETS ((month, lag), (epoch)) straight over the inlined staging
+    select — TWO target scans (a UNION ALL global branch was measured at
+    THREE: 75,270 reads against a 75,294 budget, a 24-read margin no
+    production table should gamble on). The () global row is NOT in the
+    SQL: the (month, lag) set PARTITIONS every staged row for a simple
+    probe (no via, so no guard artifacts; NULL keys form their own cell),
+    and the runner derives the global row by exact integer aggregation of
+    that complete set — proven row-identical to the staged path's
+    engine-computed row by goldens and container equivalence, empty tables
+    included."""
+    inner = build_staging_select(table, dialect).subquery("s")
+    month_key = inner.c.event_month
+    lag_key = inner.c.lag_day
+    epoch_key = inner.c.load_epoch_day
+    grouping_id = (
+        sa.func.grouping(month_key) * GROUPING_WEIGHTS["event_month"]
+        + sa.func.grouping(lag_key) * GROUPING_WEIGHTS["lag_day"]
+        + sa.func.grouping(epoch_key) * GROUPING_WEIGHTS["load_epoch_day"]
+        + GROUPING_WEIGHTS["batch_id"]  # unconfigured: constant, as staged
+        + GROUPING_WEIGHTS["alt_value"]
+    )
+    sets = [[month_key, lag_key], [epoch_key]]
+    return (
+        sa.select(
+            grouping_id.label("grouping_id"),
+            month_key.label("event_month"),
+            lag_key.label("lag_day"),
+            epoch_key.label("load_epoch_day"),
+            sa.func.max(inner.c.batch_id).label("batch_id"),
+            sa.func.max(inner.c.alt_value).label("alt_value"),
+            *_bucket_sums(inner),
+            sa.cast(sa.null(), sa.BigInteger()).label("distinct_keys"),
+            sa.func.min(inner.c.load_time).label("min_load_time"),
+        )
+        .select_from(inner)
+        .group_by(GroupingSetsClause(sets))
+        .limit(table.analysis.result_cell_cap * len(sets) + 1)
+    )
+
+
+_SUM_GLOBAL_COLUMNS = (
+    "row_count",
+    "n_curve_eligible",
+    "n_null_event_time",
+    "n_null_load_time_only",
+    "n_negative_clipped",
+    "n_negative_lag_excluded",
+    "n_overflow",
+    "n_join_unmatched",
+    "n_other_exclusions",
+    "n_base_rows",
+    "n_ambiguous_base_rows",
+    "n_compare_mismatch",
+    "n_staged_rows",
+)
+
+
+def _derive_global_row(rows: list[tuple], keys) -> tuple:
+    """The direct mode's () row, by EXACT integer aggregation of the
+    complete (month, lag) set — which partitions every staged row of a
+    simple probe. Not new information: arithmetic over aggregates already
+    fetched. Empty input yields the same zero row the staged UNION ALL
+    branch computes."""
+    key_list = list(keys)
+    index = {name: key_list.index(name) for name in key_list}
+    source = [row for row in rows if row[index["grouping_id"]] == GROUPING_SET_IDS["month_lag"]]
+    values: dict[str, object] = dict.fromkeys(key_list)
+    values["grouping_id"] = GROUPING_SET_IDS["global"]
+    for name in _SUM_GLOBAL_COLUMNS:
+        values[name] = sum(int(row[index[name]] or 0) for row in source)
+    dups = [row[index["max_lookup_dup"]] for row in source
+            if row[index["max_lookup_dup"]] is not None]
+    values["max_lookup_dup"] = max(dups) if dups else None
+    loads = [row[index["min_load_time"]] for row in source
+             if row[index["min_load_time"]] is not None]
+    values["min_load_time"] = min(loads) if loads else None
+    return tuple(values[name] for name in key_list)
+
+
 def aggregation_branch_count(table: TableConfig) -> int:
     """Scans of the staging table by construction: one per grouping set in the
     grouped branch (month_lag, epoch [, month_batch][, alt]) plus the () branch
@@ -972,6 +1106,7 @@ class CanonicalResult:
     scratch_logical_reads: int | None = None  # aggregation reads incl. the guard
     scratch_budget_reads: int | None = None  # (branches + 1) x staging pages
     staging_spool_reads: int | None = None  # staging stmt worktables (via window spool)
+    execution_mode: str = "staged"  # "direct" for simple probes (no staging)
 
     @property
     def staged_row_count(self) -> int | None:
@@ -1108,12 +1243,94 @@ def _staged_row_count(rows: list[tuple], keys, global_id: int) -> int:
     return 0
 
 
+def _cap_counted(fetched, keys, cap: int, probe_name: str, label: str = ""):
+    """Enforce result_cell_cap per grouping set while collecting rows."""
+    counts: dict[int, int] = {}
+    rows = []
+    gid_index = keys.index("grouping_id")
+    for row in fetched:
+        gid = row[gid_index]
+        counts[gid] = counts.get(gid, 0) + 1
+        if counts[gid] > cap:
+            raise ProbeAborted(
+                ReasonCode.RESULT_CELL_CAP_EXCEEDED,
+                f"probe {probe_name!r}: {label}grouping set {gid} exceeded "
+                f"result_cell_cap={cap}",
+            )
+        rows.append(tuple(row))
+    return rows
+
+
+def _run_canonical_direct(engine, table: TableConfig, as_of) -> CanonicalResult:
+    """The DIRECT mode for simple probes: ONE statement, no staging.
+    Benchmarked (7M-row unindexed heap): ~20x faster elapsed, 2 target
+    scans (inside the 3x budget), zero worktables, zero tempdb versus a
+    511 MB staging materialization. The scan budget stays fail-closed; the
+    scratch ledger's object is the WORKTABLE reads of the one statement
+    (there is no staging table), bounded row-linearly like the staged
+    path's spool."""
+    dialect = engine.dialect.name
+    target_reads = budget = scratch_reads = scratch_budget = None
+    with engine.connect() as conn:
+        messages: list[str] = []
+        pages = None
+        if dialect == "mssql":
+            pages = _mssql_target_pages(conn, table)
+            _install_message_capture(conn, messages)
+            conn.exec_driver_sql("SET STATISTICS IO ON")
+        query = build_direct_aggregation_query(table, dialect)
+        params = {"as_of": normalize_watermark(as_of)}
+        if table.analysis.extraction_months is not None:
+            params["extraction_start"] = extraction_start(
+                as_of, table.analysis.extraction_months
+            )
+        direct_sql = str(
+            query.params(**params).compile(
+                dialect=_dialect_instance(dialect),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+        keys, fetched = _exec_with_messages(conn, direct_sql, messages)
+        rows = _cap_counted(
+            fetched, keys, table.analysis.result_cell_cap, table.probe_name
+        )
+        rows.append(_derive_global_row(rows, keys))
+        if dialect == "mssql":
+            staged = _staged_row_count(rows, keys, GROUPING_SET_IDS["global"])
+            target_reads, budget = verify_scan_budget(
+                _target_reads_from(messages, {table.table}),
+                pages,
+                table.probe_name,
+                staged_rows=staged,
+            )
+            scratch_reads, scratch_budget = verify_spool_budget(
+                _scratch_reads_from(messages, staging_table_name(dialect)),
+                0,  # no staging table: the bound is purely row-linear
+                staged,
+                table.probe_name,
+            )
+    frame = pd.DataFrame(rows, columns=list(keys))[list(RESULT_COLUMNS)]
+    frame["event_month"] = pd.to_datetime(frame["event_month"]).astype("datetime64[ns]")
+    return CanonicalResult(
+        frame=frame,
+        target_logical_reads=target_reads,
+        scan_budget_reads=budget,
+        scratch_logical_reads=scratch_reads,
+        scratch_budget_reads=scratch_budget,
+        staging_spool_reads=None,
+        execution_mode="direct",
+    )
+
+
 def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
     """Execute stage -> aggregate (incl. the () uniqueness row) -> drop on one
-    connection; abort on scan-budget, cell-cap or join-uniqueness violations."""
+    connection; abort on scan-budget, cell-cap or join-uniqueness violations.
+    SIMPLE probes (direct_eligible) skip staging entirely and aggregate in
+    one statement over the base table."""
+    if direct_eligible(table):
+        return _run_canonical_direct(engine, table, as_of)
     dialect = engine.dialect.name
     cap = table.analysis.result_cell_cap
-    counts: dict[int, int] = {}
     rows = []
     target_reads = budget = scratch_reads = scratch_budget = None
     with engine.connect() as conn:
@@ -1141,17 +1358,7 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                 )
             )
             keys, fetched = _exec_with_messages(conn, aggregation_sql, messages)
-            gid_index = keys.index("grouping_id")
-            for row in fetched:
-                gid = row[gid_index]
-                counts[gid] = counts.get(gid, 0) + 1
-                if counts[gid] > cap:
-                    raise ProbeAborted(
-                        ReasonCode.RESULT_CELL_CAP_EXCEEDED,
-                        f"probe {table.probe_name!r}: grouping set {gid} exceeded "
-                        f"result_cell_cap={cap}",
-                    )
-                rows.append(tuple(row))
+            rows = _cap_counted(fetched, keys, cap, table.probe_name)
         finally:
             # pymssql flushes a statement's STATISTICS IO tokens only when the
             # NEXT statement runs, so the drop both cleans up AND completes the

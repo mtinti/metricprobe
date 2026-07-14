@@ -17,9 +17,12 @@ are relative to the CONFIGURED stages:
 
 Windowing: --window/--year bound the REPORTED completion results (per-month
 percentiles, dual percentiles, compare side-stat) to the probe window. Volume
-history is full-history BY CONTRACT (CLAUDE.md metric 1), and the learned
-wait's training cohort always uses full history — both are stamped with the
-window so readers know the analysis frame.
+history covers full history BY DEFAULT (CLAUDE.md metric 1) — a per-probe
+analysis.extraction_months bound trades that long memory for bounded
+extraction, month-aligned and stamped per probe (execution_mode /
+extraction_start in probe_runs) — and the learned wait's training cohort
+uses everything admitted; both are stamped with the window so readers know
+the analysis frame.
 
 Probes execute SEQUENTIALLY, never in parallel (assume every probe is a full
 scan of a possibly unindexed production table); each probe's wall-clock
@@ -57,6 +60,8 @@ from metricprobe.discover import DEFAULT_ROLE_CANDIDATES, draft_config
 from metricprobe.extract.canonical import (
     CANONICAL_SCHEMA_VERSION,
     ProbeAborted,
+    direct_eligible,
+    extraction_start,
     run_canonical,
 )
 from metricprobe.extract.dual import DUAL_SCHEMA_VERSION, run_dual_lag
@@ -462,6 +467,9 @@ TYPED_COLUMNS: dict[str, dict[str, str]] = {
         "duration_seconds": "Float64",
         "extraction_started": "string",
         "extraction_finished": "string",
+        "execution_mode": "string",  # staged | direct (v6)
+        "extraction_months": "Int64",  # the configured bound, None = full history
+        "extraction_start": "string",  # first admitted event month (ISO date)
         **dict.fromkeys(READ_COLUMNS, "Int64"),
     },
     "population_buckets": {
@@ -600,6 +608,18 @@ def _stage_analysis(
                     statuses: list[Status] = []
                     extraction = (None, None)
                     reads = dict.fromkeys(READ_COLUMNS)
+                    months = table.analysis.extraction_months
+                    mode_facts = {
+                        "execution_mode": (
+                            "direct" if direct_eligible(table) else "staged"
+                        ),
+                        "extraction_months": months,
+                        "extraction_start": (
+                            extraction_start(as_of, months).date().isoformat()
+                            if months
+                            else None
+                        ),
+                    }
                     if not _table_exists(engine, table):
                         severity = Severity.SKIPPED if table.optional else Severity.RED
                         reason = (
@@ -654,6 +674,7 @@ def _stage_analysis(
                             if extraction[1] is not None
                             else None,
                             "duration_seconds": round((finished - started).total_seconds(), 3),
+                            **mode_facts,
                             **reads,
                         }
                     )

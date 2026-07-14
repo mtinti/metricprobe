@@ -114,7 +114,15 @@ as Plotly figures via a static HTML/PNG report and a Streamlit app.
   encoding with a distinct NULL sentinel** (delimiter concatenation is ambiguous:
   'a|b','c' and 'a','b|c' collide before hashing), and the check is documented as
   probabilistic (SHA-256 collision odds negligible; encoding ambiguity was the real
-  risk). NEVER 32-bit CHECKSUM. Numeric budgets: logical reads on the PROBED
+  risk). NEVER 32-bit CHECKSUM. SIMPLE probes (no key_cols, no via, no
+  batch/alt) run a DIRECT mode instead: one GROUPING SETS statement over the
+  base table — there is no distinct-count to spool — with the () row DERIVED
+  by exact integer aggregation of the complete (month, lag) set (which
+  partitions every staged row; an inline () loses the empty-population row
+  on SQL Server and a UNION ALL branch costs a third scan); benchmarked at
+  2 target scans with zero tempdb versus the staged path's N-row
+  materialization; identical frozen result schema, proven by goldens and
+  container equivalence. Numeric budgets: logical reads on the PROBED
   tables <= 3x one full scan per probe, cumulative across passes; the
   aggregation/distinct-count guard and any join-validation spool run against the
   probe's own tempdb staging and carry their own enforced fail-closed bounds

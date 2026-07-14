@@ -55,8 +55,11 @@ from sqlalchemy.engine import make_url
 # v3: compare_event_time joined the required-resolution set, connection_url
 # restricted to the supported dialects (mssql/duckdb), non-finite analysis
 # thresholds rejected, mssql_url validated — v2 configs can be rejected under
-# these rules, so the version moved with them
-CONFIG_SCHEMA_VERSION = 3
+# these rules, so the version moved with them.
+# v4: AnalysisParams.extraction_months (optional per-probe event-time bound,
+# month-aligned; validated against training_cutoff/min_mature/evaluation so a
+# bound can never construct an always-insufficient probe)
+CONFIG_SCHEMA_VERSION = 4
 
 
 class ConfigError(Exception):
@@ -133,6 +136,11 @@ class AnalysisParams(_Model):
     # tolerance or MAD multiplier would silently disable a required verdict
     training_cutoff_days: int = Field(default=365, gt=0)
     lag_cap_days: int = Field(default=365, gt=0)
+    # None = full history (the default contract). A configured bound admits
+    # only the last N calendar months of EVENT time (month-aligned so the
+    # oldest admitted month is complete): it trades long-memory volume
+    # baselines for bounded staging/cells, and is labelled on outputs.
+    extraction_months: int | None = Field(default=None, gt=0)
     clock_skew_tolerance_days: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     negative_lag_red_fraction: float = Field(
         default=0.001, gt=0, le=1, allow_inf_nan=False
@@ -154,6 +162,23 @@ class AnalysisParams(_Model):
 
     @model_validator(mode="after")
     def _cross_checks(self) -> AnalysisParams:
+        if self.extraction_months is not None:
+            # the bound must leave a usable training cohort: cutoff months
+            # + the minimum mature months + the open month, else every probe
+            # would land in insufficient_history by construction
+            floor = (
+                int(self.training_cutoff_days / 30.4375)
+                + self.min_mature_months
+                + self.evaluation_window_months
+                + 1
+            )
+            if self.extraction_months < floor:
+                raise ValueError(
+                    f"extraction_months ({self.extraction_months}) is too small: "
+                    f"training_cutoff_days={self.training_cutoff_days} plus "
+                    f"min_mature_months={self.min_mature_months} plus the "
+                    f"evaluation window needs at least {floor} months"
+                )
         if self.training_cutoff_days < self.lag_cap_days:
             raise ValueError(
                 f"training_cutoff_days ({self.training_cutoff_days}) must be >= "

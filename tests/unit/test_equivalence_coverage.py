@@ -131,6 +131,14 @@ COVERAGE: dict[str, str] = {
         "test_mssql_store_shares_the_run_contract",
     "dialect_branch:extract.canonical._exec_with_messages":
         "test_pyodbc_captures_statistics_io_and_verifies_the_budget",
+    "dialect_branch:extract.canonical._run_canonical_direct":
+        "test_direct_mode_matches_staged_and_duckdb",
+    "dialect_branch:extract.dual._run_dual_direct":
+        "test_direct_mode_matches_staged_and_duckdb",
+    "dialect_branch:extract.dual.build_dual_aggregation_query":
+        "test_direct_mode_matches_staged_and_duckdb",
+    "dialect_branch:store.MssqlStore._migrate_v5_to_v6":
+        "test_mssql_store_migrates_a_v4_marker_in_place",
     "dialect_branch:extract.canonical.AsOfLiteral.literal_processor":
         "test_legacy_datetime_columns_accept_a_microsecond_as_of",
     "dialect_branch:extract.canonical.CanonicalResult.staged_row_count":

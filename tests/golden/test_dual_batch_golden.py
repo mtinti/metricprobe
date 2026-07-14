@@ -384,3 +384,22 @@ def test_batch_canonical_timestamp_includes_null_event_arrivals():
     june_after = {m.month: m for m in assessment.months}[pd.Period("2024-06", freq="M")]
     # the same batch now dates from its EARLIER (null-event) arrival wave
     assert june_after.days_to[50] == 1
+
+
+def test_dual_empty_table_still_yields_the_global_row():
+    """The dual () row must exist over an EMPTY population (it carries
+    max_lookup_dup and the zero buckets). SQL Server returns NO rows for
+    GROUPING SETS including () over empty input, so the global row is an
+    ungrouped UNION ALL branch (v9) — this pins the duckdb half; container
+    equivalence pins the mssql half."""
+    empty = pd.DataFrame(
+        {
+            "event_time": pd.Series([], dtype="datetime64[ns]"),
+            "load_time": pd.Series([], dtype="datetime64[ns]"),
+            "source_insert_time": pd.Series([], dtype="datetime64[ns]"),
+        }
+    )
+    result = probe_dual(empty, _dual_config(), "2026-07-01")
+    row = result.global_row
+    assert int(row["row_count"]) == 0
+    assert int(row["n_staged_rows"]) == 0

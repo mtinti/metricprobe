@@ -448,3 +448,101 @@ def test_cleanup_never_masks_the_real_exception(monkeypatch):
     config = _via_config([{"base_col": "referral_id", "lookup_col": "id"}])
     with pytest.raises(RuntimeError, match="the real cause"):
         _probe_via(base, lookup, config)
+
+
+def _sorted_cells(frame: pd.DataFrame) -> pd.DataFrame:
+    keys = ["grouping_id", "event_month", "lag_day", "load_epoch_day"]
+    return frame.sort_values(keys, na_position="first").reset_index(drop=True)
+
+
+def test_direct_mode_is_row_identical_to_the_staged_path(monkeypatch):
+    """The DIRECT mode (simple probes: no keys/via/batch/alt) must produce
+    the staged path's frozen result schema ROW FOR ROW — same cells, same
+    buckets, same () scalars. Staging is forced via the eligibility gate to
+    compare both modes on the identical table."""
+    import metricprobe.extract.canonical as canonical_module
+
+    df = g.generate(
+        g.TableSpec(name="events", start_month="2024-01", n_months=8,
+                    rows_per_month=900,
+                    lag_model=g.LognormalLag(mu=1.4, sigma=0.7), seed=411)
+    )
+    df = g.inject_null_event_time(df, 0.02, seed=1)
+    df = g.inject_null_load_time(df, 0.02, seed=2)
+    df = g.inject_negative_lags(df, 0.02, skew_days=5.0, seed=3)
+    config = table_config()  # simple: no keys, no via, no batch, no alt
+    as_of = "2026-07-01"
+
+    direct = probe(df, config, as_of)
+    assert direct.execution_mode == "direct"
+    monkeypatch.setattr(canonical_module, "direct_eligible", lambda table: False)
+    staged = probe(df, config, as_of)
+    assert staged.execution_mode == "staged"
+
+    left = _sorted_cells(direct.frame)
+    right = _sorted_cells(staged.frame)
+    pd.testing.assert_frame_equal(left, right, check_dtype=False)
+
+
+def test_extraction_months_bounds_the_admitted_population():
+    """A 36-month bound over 60 months of history: exactly the last 36
+    event months are admitted, the OLDEST admitted month is complete
+    (month alignment — a partial month would be a phantom volume outlier),
+    and NULL-event rows stay admitted (their pathology bucket survives)."""
+    spec = g.TableSpec(name="events", start_month="2021-08", n_months=60,
+                       rows_per_month=400,
+                       lag_model=g.LognormalLag(mu=1.2, sigma=0.6), seed=511)
+    df = g.generate(spec)
+    df = g.inject_null_event_time(df, 0.02, seed=4)
+    as_of = "2026-07-15"
+
+    unbounded = probe(df, table_config(), as_of)
+    bounded = probe(df, table_config(analysis={"extraction_months": 36}), as_of)
+
+    full_months = unbounded.rows_for("month_lag")["event_month"].dt.to_period("M")
+    kept_months = bounded.rows_for("month_lag")["event_month"].dt.to_period("M")
+    assert kept_months.nunique() == 36
+    assert kept_months.min() == pd.Period("2023-08", "M")  # month-ALIGNED start
+    assert full_months.nunique() > 36
+
+    # the oldest admitted month is COMPLETE: identical count in both runs
+    def month_total(result, period):
+        cells = result.rows_for("month_lag")
+        mine = cells[cells["event_month"].dt.to_period("M") == period]
+        return int(mine["row_count"].sum())
+
+    assert month_total(bounded, pd.Period("2023-08", "M")) == month_total(
+        unbounded, pd.Period("2023-08", "M")
+    )
+    # NULL-event rows survive the bound
+    assert int(bounded.global_row["n_null_event_time"]) == int(
+        unbounded.global_row["n_null_event_time"]
+    )
+    # reconciliation holds over the ADMITTED population
+    row = bounded.global_row
+    assert int(row["row_count"]) == (
+        int(row["n_curve_eligible"]) + int(row["n_null_event_time"])
+        + int(row["n_null_load_time_only"]) + int(row["n_negative_lag_excluded"])
+        + int(row["n_join_unmatched"]) + int(row["n_other_exclusions"])
+    )
+
+
+def test_extraction_bound_keeps_via_guard_rows():
+    """The bound must not delete lookup-only guard artifacts: a duplicated
+    lookup key whose events predate the bound still aborts the probe (the
+    uniqueness contract covers the whole lookup table)."""
+    _, base, lookup = _via_frames()
+    old_dup = pd.DataFrame(
+        {
+            "id": [-5, -5],  # duplicated, unreferenced, and OLD
+            "site": [0, 0],
+            "referral_date": [pd.Timestamp("2015-01-01")] * 2,
+        }
+    )
+    config = _via_config(
+        [{"base_col": "referral_id", "lookup_col": "id"}],
+        analysis={"extraction_months": 24},
+    )
+    with pytest.raises(ProbeAborted) as excinfo:
+        _probe_via(base, pd.concat([lookup, old_dup], ignore_index=True), config)
+    assert excinfo.value.reason is ReasonCode.JOIN_NOT_UNIQUE

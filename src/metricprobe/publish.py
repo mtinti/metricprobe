@@ -450,6 +450,13 @@ def _status_rows(frames: dict[str, pd.DataFrame], configs: list[ProbeConfig]) ->
     rows = []
     for table in (table for config in configs for table in config.tables):
         probe = table.probe_name
+        # a bounded probe is LABELLED: the dashboard must say when the
+        # analysis deliberately covers only the last N event months
+        label = (
+            f"{probe} (≤{table.analysis.extraction_months}m)"
+            if table.analysis.extraction_months
+            else probe
+        )
         mine = statuses[statuses["probe"] == probe] if not statuses.empty else statuses
         healthy = _worst(list(mine["severity"])) if not mine.empty else None
         fresh = mine[mine["check"] == "freshness"] if not mine.empty else mine
@@ -467,6 +474,7 @@ def _status_rows(frames: dict[str, pd.DataFrame], configs: list[ProbeConfig]) ->
                 "database": table.database,
                 "table": f"{table.table_schema}.{table.table}",
                 "probe": probe,
+                "probe_label": label,
                 "healthy": _badge(healthy),
                 "updating": _badge(updating),
                 "back_to": back_to,
@@ -554,7 +562,7 @@ def emit_dashboard(
             if row["database"] != database:
                 continue
             lines.append(
-                f"| {row['table']} | {row['probe']} | "
+                f"| {row['table']} | {row['probe_label']} | "
                 f"{row['healthy']} | {row['updating']} | {row['back_to']} | "
                 f"{row['p95_days']} | {row['p95_months']} |"
             )

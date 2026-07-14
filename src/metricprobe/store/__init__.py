@@ -38,8 +38,10 @@ from metricprobe.config import StoreConfig, expand_env
 # _std) is REFUSED below min_mature_months — the same stored columns now
 # carry None where v3 stored a low-evidence mean (ALGORITHMS.md section 3).
 # v5: probe_runs carries n_staged_rows (the main pass's physical staging
-# size — the tempdb sizing observable, ALGORITHMS.md section 15)
-SNAPSHOT_SCHEMA_VERSION = 5
+# size — the tempdb sizing observable, ALGORITHMS.md section 15).
+# v6: probe_runs carries execution_mode (staged | direct) and the
+# extraction bound (extraction_months + extraction_start) when configured
+SNAPSHOT_SCHEMA_VERSION = 6
 
 STAMP_COLUMNS = (
     "run_id",
@@ -421,7 +423,38 @@ class MssqlStore:
                 f"ALTER TABLE {self.schema}.{physical} ADD n_staged_rows BIGINT NULL"
             )
 
-    _MIGRATIONS = {4: _migrate_v4_to_v5}
+    def _migrate_v5_to_v6(self, conn) -> None:
+        """v6 added three nullable probe_runs columns: execution_mode,
+        extraction_months, extraction_start."""
+        physical = "mp_probe_runs"
+        exists = conn.execute(
+            sa.text(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t"
+            ),
+            {"s": self.schema, "t": physical},
+        ).scalar_one()
+        if not exists:
+            return
+        for column, sql_type in (
+            ("execution_mode", "NVARCHAR(16)"),
+            ("extraction_months", "BIGINT"),
+            ("extraction_start", "NVARCHAR(32)"),
+        ):
+            present = conn.execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA = :s AND TABLE_NAME = :t "
+                    "AND COLUMN_NAME = :c"
+                ),
+                {"s": self.schema, "t": physical, "c": column},
+            ).scalar_one()
+            if not present:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {self.schema}.{physical} ADD {column} {sql_type} NULL"
+                )
+
+    _MIGRATIONS = {4: _migrate_v4_to_v5, 5: _migrate_v5_to_v6}
 
     def register_run(self, meta: RunMeta) -> None:
         """Same durable pre-stage record as the parquet store (upserted: a
