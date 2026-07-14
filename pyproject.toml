@@ -59,8 +59,10 @@ select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# timeout: a wedged renderer (kaleido Chrome) must FAIL loudly, never hang
-addopts = "-ra --timeout=300 --dist loadgroup"
+# timeout: a wedged renderer (kaleido Chrome) must FAIL loudly, never hang.
+# -n 8 is the SUPPORTED parallelism: measured reliable and ~50s locally;
+# -n auto on many-core machines oversubscribes (intermittent worker errors)
+addopts = "-ra --timeout=300 --dist loadgroup -n 8"
 pythonpath = ["."]
 markers = [
     "equivalence: compares DuckDB and SQL Server results; needs METRICPROBE_MSSQL_URL",

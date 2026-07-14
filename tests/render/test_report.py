@@ -24,10 +24,11 @@ _EXTERNAL_RESOURCE = re.compile(
 _CDN_SCRIPT = re.compile(r"""<script[^>]*(?:cdn\.plot\.ly|unpkg\.com|cdnjs)""", re.IGNORECASE)
 
 
-# kaleido's Chrome wedges under CONCURRENT launches (load-dependent, surfaces
-# as a 300s timeout): every module that renders figures shares one xdist
-# group, so --dist loadgroup serializes them onto a single worker
-pytestmark = pytest.mark.xdist_group("kaleido-chrome-report")
+# kaleido's Chrome wedges under CONCURRENT launches — measured: even TWO
+# concurrent instances hang (each module alone passes in <30s; both
+# together exceed 100s). ALL real-Chrome modules therefore share ONE
+# xdist group: --dist loadgroup serializes them onto a single worker
+pytestmark = pytest.mark.xdist_group("kaleido-chrome")
 
 
 @pytest.fixture(scope="module")

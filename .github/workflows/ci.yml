@@ -23,7 +23,7 @@ jobs:
         env:
           METRICPROBE_LEAK_MARKERS: ${{ secrets.METRICPROBE_LEAK_MARKERS }}
       - run: .venv/bin/python -m ruff check .
-      - run: .venv/bin/python -m pytest -m "not equivalence" -n auto
+      - run: .venv/bin/python -m pytest -m "not equivalence"  # -n 8 via addopts
       # the committed demo dashboard must match a fresh fixed-seed build
       # (byte-stable: frozen clock/run id/git, canonicalized SVGs, pinned
       # plotly/kaleido and kaleido's pinned Chrome build)
