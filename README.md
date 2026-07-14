@@ -22,7 +22,7 @@ default, or a SQL Server schema behind a config flag.
 ```
 python3 -m venv .venv
 # the supported install path is the release tag (PyPI is phase 2):
-.venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/mtinti/metricprobe@v0.1.10"
+.venv/bin/python -m pip install "metricprobe[export] @ git+https://github.com/mtinti/metricprobe@v0.1.11"
 # (or, from a checkout: pip install -e ".[export]")
 .venv/bin/metricprobe discover --url "$DB_URL" --database MyDb --out probe.yaml
 # review the draft: confirm the event/load column guesses, then
@@ -59,7 +59,7 @@ Rendering figures to PNG/SVG uses Plotly's **kaleido**, which requires an
 installed **Chrome or Chromium**:
 
 ```
-pip install "metricprobe[export] @ git+https://github.com/mtinti/metricprobe@v0.1.10"
+pip install "metricprobe[export] @ git+https://github.com/mtinti/metricprobe@v0.1.11"
 ```
 
 - Linux/macOS/Windows with Chrome already installed: nothing else to do.

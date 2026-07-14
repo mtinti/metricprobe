@@ -1087,6 +1087,17 @@ def cmd_run(args) -> int:
                 return 1
         store.register_run(meta)
         statuses = _stage_analysis(configs, meta, store, as_of, (window_start, window_end))
+    except KeyboardInterrupt:
+        # Ctrl-C mid-analysis: sources were only read, staging temp tables
+        # die with their connections, and NOTHING partial was committed —
+        # say so instead of surfacing a driver teardown error
+        print(
+            f"metricprobe: run {run_id!r} interrupted — no partial results "
+            "were committed (the registration survives); retry with "
+            f"--resume-from analysis --run-id {run_id}",
+            file=sys.stderr,
+        )
+        return 1
     except Exception as error:  # a configured stage failed -> exit 1
         print(f"metricprobe: analysis stage failed: {error}", file=sys.stderr)
         return 1

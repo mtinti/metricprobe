@@ -90,7 +90,7 @@ def _sortable(frame: pd.DataFrame) -> pd.DataFrame:
     keys = ["grouping_id", "event_month", "lag_day", "load_epoch_day", "batch_id", "alt_value"]
     out = frame.copy()
     for column in ("event_month", "load_epoch_day", "min_load_time"):
-        out[column] = pd.to_datetime(out[column])
+        out[column] = pd.to_datetime(out[column]).astype("datetime64[ns]")
     return out.sort_values(keys, na_position="first").reset_index(drop=True)
 
 

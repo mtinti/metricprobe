@@ -87,7 +87,7 @@ def _config(database: str, schema: str, **overrides) -> TableConfig:
 def _normalized(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     for col in ("event_month", "load_epoch_day", "min_load_time"):
-        out[col] = pd.to_datetime(out[col])
+        out[col] = pd.to_datetime(out[col]).astype("datetime64[ns]")
     for col in INT_COLUMNS:
         out[col] = out[col].astype("Int64")
     keys = ["grouping_id", "event_month", "lag_day", "load_epoch_day", "batch_id", "alt_value"]
@@ -860,3 +860,27 @@ def test_mssql_store_migrates_a_v4_marker_in_place(mssql_engine):
                     f"DROP TABLE {schema}.{table}"
                 )
             conn.exec_driver_sql(f"DROP SCHEMA {schema}")
+
+
+def test_pyodbc_captures_statistics_io_and_verifies_the_budget(
+    duckdb_engine, mssql_pyodbc_engine
+):
+    """Production regression (B3, ISD_SMR): with pyodbc, STATISTICS IO
+    messages were read from a cursor SQLAlchemy had already closed — every
+    message was lost, and each probe aborted scan_budget_unverifiable AFTER
+    paying its full scan. mssql statements now run on a raw cursor whose
+    messages are harvested before close: the budget must VERIFY (measured
+    reads present), and the numbers must match DuckDB exactly."""
+    df = _dataset()
+    g.load_via_sqlalchemy(df, duckdb_engine, "events")
+    g.load_via_sqlalchemy(df, mssql_pyodbc_engine, "events")
+
+    duck = run_canonical(duckdb_engine, _config("memory", "main"), AS_OF)
+    mssql = run_canonical(mssql_pyodbc_engine, _config("tempdb", "dbo"), AS_OF)
+    # the whole point: the ledgers were MEASURED, not lost
+    assert mssql.target_logical_reads is not None
+    assert mssql.scan_budget_reads is not None
+    assert mssql.scratch_logical_reads is not None
+    pd.testing.assert_frame_equal(
+        _normalized(duck.frame), _normalized(mssql.frame), check_dtype=False
+    )

@@ -48,7 +48,7 @@ from metricprobe.extract.canonical import (
     MonthFloor,
     ProbeAborted,
     _dialect_instance,
-    _harvest_cursor_messages,
+    _exec_with_messages,
     _install_message_capture,
     _mssql_staging_pages,
     _mssql_target_pages,
@@ -370,18 +370,23 @@ def run_dual_lag(
             pages = _mssql_target_pages(conn, table)
             _install_message_capture(conn, messages)
             conn.exec_driver_sql("SET STATISTICS IO ON")
-        staging_result = conn.exec_driver_sql(
-            dual_staging_sql(table, dialect, as_of=pd.Timestamp(as_of))
+        _exec_with_messages(
+            conn, dual_staging_sql(table, dialect, as_of=pd.Timestamp(as_of)), messages
         )
-        _harvest_cursor_messages(staging_result, messages)
         staging_message_count = len(messages)
         try:
             if dialect == "mssql":
                 staging_pages = _mssql_staging_pages(conn, dual_staging_table_name(dialect))
-            result = conn.execute(build_dual_aggregation_query(table, dialect))
-            keys = result.keys()
-            for row in result:
-                gid = row.grouping_id
+            aggregation_sql = str(
+                build_dual_aggregation_query(table, dialect).compile(
+                    dialect=_dialect_instance(dialect),
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+            keys, fetched = _exec_with_messages(conn, aggregation_sql, messages)
+            gid_index = keys.index("grouping_id")
+            for row in fetched:
+                gid = row[gid_index]
                 counts[gid] = counts.get(gid, 0) + 1
                 if counts[gid] > cap:
                     raise ProbeAborted(
@@ -390,10 +395,13 @@ def run_dual_lag(
                         f"result_cell_cap={cap}",
                     )
                 rows.append(tuple(row))
-            _harvest_cursor_messages(result, messages)
         finally:
-            # the drop also flushes the aggregation's pending STATISTICS IO
-            conn.exec_driver_sql(drop_dual_staging_sql(dialect))
+            # the drop also flushes the aggregation's pending STATISTICS IO;
+            # guarded like the main pass: cleanup must never mask the cause
+            try:
+                conn.exec_driver_sql(drop_dual_staging_sql(dialect))
+            except Exception:  # noqa: BLE001
+                pass
         if dialect == "mssql":
             target_tables = {table.table}
             if table.event_time_via is not None:
@@ -424,7 +432,10 @@ def run_dual_lag(
                 table.probe_name,
             )
     frame = pd.DataFrame(rows, columns=list(keys))
-    frame["event_month"] = pd.to_datetime(frame["event_month"])
+    # normalized to ns: raw-cursor values arrive as date OR datetime objects
+    # depending on driver/dialect, and pandas 2 would otherwise pick
+    # different datetime64 units per side
+    frame["event_month"] = pd.to_datetime(frame["event_month"]).astype("datetime64[ns]")
     result = DualLagResult(
         frame=frame,
         target_logical_reads=target_reads,

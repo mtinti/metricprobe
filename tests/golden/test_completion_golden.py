@@ -421,3 +421,30 @@ def test_lookup_only_guard_rows_create_no_alt_cells():
     # the raw frame carries no guard-artifact alt cell either
     raw_alt = result.frame[result.frame["grouping_id"] == 30]
     assert not raw_alt["alt_value"].isna().any()
+
+
+def test_cleanup_never_masks_the_real_exception(monkeypatch):
+    """Production incident: Ctrl-C mid-probe invalidated the connection, and
+    the finally-block DROP then raised its own error, REPLACING the real
+    cause on the console. The drop is now guarded: whatever interrupted the
+    probe is what the caller sees (the temp table dies with the connection
+    anyway)."""
+    import metricprobe.extract.canonical as canonical_module
+
+    df, base, lookup = _via_frames()
+
+    def exploding_aggregation(table, dialect):
+        raise RuntimeError("the real cause")
+
+    monkeypatch.setattr(
+        canonical_module, "build_aggregation_query", exploding_aggregation
+    )
+    # make the cleanup itself hostile, like a torn-down connection would be
+    monkeypatch.setattr(
+        canonical_module,
+        "drop_staging_sql",
+        lambda dialect: "DROP TABLE definitely_not_a_table_xyz",
+    )
+    config = _via_config([{"base_col": "referral_id", "lookup_col": "id"}])
+    with pytest.raises(RuntimeError, match="the real cause"):
+        _probe_via(base, lookup, config)

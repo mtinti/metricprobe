@@ -56,9 +56,13 @@ jobs:
           - 1433:1433
     env:
       METRICPROBE_MSSQL_URL: "mssql+pymssql://sa:Metricprobe1!@localhost:1433/tempdb"
+      # the PRODUCTION driver path (pyodbc + ODBC Driver 18); pymssql alone
+      # let a driver-specific STATISTICS IO loss reach production
+      METRICPROBE_MSSQL_PYODBC_URL: "mssql+pyodbc://sa:Metricprobe1!@127.0.0.1:1433/tempdb?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes&Encrypt=no"
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/assert_runner_arch.py
+      - run: sudo python3 scripts/install_msodbcsql.py
       - run: python3 -m venv .venv
       - run: .venv/bin/python -m pip install --upgrade pip
       - run: .venv/bin/python -m pip install -e ".[dev]"

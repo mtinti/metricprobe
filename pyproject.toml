@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "metricprobe"
-version = "0.1.10"
+version = "0.1.11"
 description = "Data arrival latency & completeness probes for database tables."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,6 +32,10 @@ dev = [
     "pytest>=8.2",
     "pytest-xdist>=3.6",
     "pytest-timeout>=2.3",
+    # the PRODUCTION mssql driver: the equivalence suite exercises pyodbc
+    # (ODBC Driver 18) alongside pymssql — a pymssql-only harness let a
+    # driver-specific STATISTICS IO loss reach production
+    "pyodbc>=5.1",
     "ruff>=0.5",
     # EXACT pins: the committed demo dashboard (reports/) is byte-diffed in
     # CI, and SVG output depends on the plotly/kaleido/chromium versions

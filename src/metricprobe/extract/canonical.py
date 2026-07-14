@@ -857,11 +857,50 @@ def _install_message_capture(conn, messages: list[str]) -> bool:
     return False
 
 
-def _harvest_cursor_messages(result, messages: list[str]) -> None:
-    """pyodbc exposes info messages on cursor.messages instead."""
-    cursor_messages = getattr(getattr(result, "cursor", None), "messages", None)
-    for entry in cursor_messages or []:
-        messages.append(str(entry[-1] if isinstance(entry, tuple) else entry))
+def _exec_with_messages(conn, sql: str, messages: list[str]):
+    """Execute ONE statement on a raw DBAPI cursor and capture its server
+    info messages reliably on BOTH production drivers (found in production:
+    pyodbc lost every STATISTICS IO message because SQLAlchemy had already
+    closed/cleared the cursor, and each probe then failed closed as
+    scan_budget_unverifiable AFTER paying the full scan).
+
+    pymssql: the connection-level handler (installed once) receives all
+    messages; its cursor has no `.messages`. pyodbc: info messages live on
+    the raw cursor — harvested here after draining trailing result sets
+    (late tokens flush on nextset) and BEFORE close. duckdb: no messages,
+    same code path. Returns (keys, rows) for result-producing statements,
+    (None, None) otherwise; rows are fully fetched — every caller's result
+    is server-side bounded (the aggregation carries its own row LIMIT)."""
+    cursor = conn.connection.driver_connection.cursor()
+    keys = rows = None
+
+    def harvest() -> None:
+        # pyodbc CLEARS cursor.messages on every cursor method call, and
+        # STATISTICS IO arrives as a TRAILING set only exposed by nextset()
+        # (measured: nextset #1 returns True and delivers the messages;
+        # nextset #2 returns False and WIPES them) — so harvest after every
+        # driver call, never once at the end
+        for entry in getattr(cursor, "messages", None) or []:
+            messages.append(str(entry[-1] if isinstance(entry, tuple) else entry))
+
+    try:
+        cursor.execute(sql)
+        harvest()
+        if cursor.description is not None:
+            keys = [column[0] for column in cursor.description]
+            rows = cursor.fetchall()
+            harvest()
+        while True:
+            try:
+                more = cursor.nextset()
+            except Exception:  # noqa: BLE001 — drivers without nextset (duckdb)
+                break
+            harvest()
+            if not more:
+                break
+    finally:
+        cursor.close()
+    return keys, rows
 
 
 def _reads_by_table(messages: list[str]) -> dict[str, int]:
@@ -1085,19 +1124,26 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
             pages = _mssql_target_pages(conn, table)
             _install_message_capture(conn, messages)
             conn.exec_driver_sql("SET STATISTICS IO ON")
-        staging_result = conn.exec_driver_sql(
-            staging_sql(table, dialect, as_of=pd.Timestamp(as_of), key_types=key_types)
+        _exec_with_messages(
+            conn,
+            staging_sql(table, dialect, as_of=pd.Timestamp(as_of), key_types=key_types),
+            messages,
         )
-        _harvest_cursor_messages(staging_result, messages)
         staging_message_count = len(messages)
         spool_reads = None
         try:
             if dialect == "mssql":
                 staging_pages = _mssql_staging_pages(conn, staging_table_name(dialect))
-            result = conn.execute(build_aggregation_query(table, dialect))
-            keys = result.keys()
-            for row in result:
-                gid = row.grouping_id
+            aggregation_sql = str(
+                build_aggregation_query(table, dialect).compile(
+                    dialect=_dialect_instance(dialect),
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+            keys, fetched = _exec_with_messages(conn, aggregation_sql, messages)
+            gid_index = keys.index("grouping_id")
+            for row in fetched:
+                gid = row[gid_index]
                 counts[gid] = counts.get(gid, 0) + 1
                 if counts[gid] > cap:
                     raise ProbeAborted(
@@ -1106,12 +1152,19 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                         f"result_cell_cap={cap}",
                     )
                 rows.append(tuple(row))
-            _harvest_cursor_messages(result, messages)
         finally:
             # pymssql flushes a statement's STATISTICS IO tokens only when the
             # NEXT statement runs, so the drop both cleans up AND completes the
-            # aggregation's message stream — ledgers are computed after it
-            conn.exec_driver_sql(drop_staging_sql(dialect))
+            # aggregation's message stream — ledgers are computed after it.
+            # GUARDED: after an interrupt the connection may hold an invalid
+            # transaction, and a failing DROP must never mask the real
+            # exception (the temp table dies with the connection anyway; on
+            # the success path a failed drop surfaces as an unverifiable
+            # budget, fail-closed, not as silence)
+            try:
+                conn.exec_driver_sql(drop_staging_sql(dialect))
+            except Exception:  # noqa: BLE001 — cleanup must not mask the cause
+                pass
         if dialect == "mssql":
             # TWO fail-closed ledgers (ALGORITHMS.md section 15): target
             # pressure <= 3x one full scan over ALL statements, and the
@@ -1147,7 +1200,10 @@ def run_canonical(engine, table: TableConfig, as_of) -> CanonicalResult:
                 table.probe_name,
             )
     frame = pd.DataFrame(rows, columns=list(keys))
-    frame["event_month"] = pd.to_datetime(frame["event_month"])
+    # normalized to ns: raw-cursor values arrive as date OR datetime objects
+    # depending on driver/dialect, and pandas 2 would otherwise pick
+    # different datetime64 units per side
+    frame["event_month"] = pd.to_datetime(frame["event_month"]).astype("datetime64[ns]")
     result = CanonicalResult(
         frame=frame,
         target_logical_reads=target_reads,
